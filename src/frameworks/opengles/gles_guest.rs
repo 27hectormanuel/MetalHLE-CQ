@@ -12,6 +12,7 @@ use crate::gles::{gles11_raw as gles11, GLES};
 use crate::mem::{ConstPtr, ConstVoidPtr, GuestISize, GuestUSize, Mem, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::nil;
 use crate::Environment;
+use std::collections::HashMap;
 use std::slice::from_raw_parts;
 use touchHLE_gl_bindings::gles11::{
     ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER_BINDING, WRITE_ONLY_OES,
@@ -3254,7 +3255,13 @@ fn glCreateProgram(env: &mut Environment) -> GLuint {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.CreateProgram() })
 }
 fn glCreateShader(env: &mut Environment, type_: GLenum) -> GLuint {
-    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.CreateShader(type_) })
+    with_ctx_and_mem(env, |gles, _mem| unsafe {
+        let shader = gles.CreateShader(type_);
+        if shader != 0 {
+            record_shader_type(shader, type_);
+        }
+        shader
+    })
 }
 fn glBindAttribLocation(
     env: &mut Environment,
@@ -3353,11 +3360,15 @@ fn glUseProgram(env: &mut Environment, program: GLuint) {
 fn glDeleteProgram(env: &mut Environment, program: GLuint) {
     with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
         shadow.guest_bound_attribs.remove(&program);
+        record_program_deleted(program);
         gles.DeleteProgram(program)
     });
 }
 fn glDeleteShader(env: &mut Environment, shader: GLuint) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.DeleteShader(shader) });
+    with_ctx_and_mem(env, |gles, _mem| unsafe {
+        record_shader_deleted(shader);
+        gles.DeleteShader(shader)
+    });
 }
 fn glCompileShader(env: &mut Environment, shader: GLuint) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
@@ -3409,12 +3420,14 @@ fn glGetShaderPrecisionFormat(
 }
 fn glAttachShader(env: &mut Environment, program: GLuint, shader: GLuint) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.AttachShader(program, shader)
+        gles.AttachShader(program, shader);
+        record_shader_attach(program, shader);
     });
 }
 fn glDetachShader(env: &mut Environment, program: GLuint, shader: GLuint) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.DetachShader(program, shader)
+        gles.DetachShader(program, shader);
+        record_shader_detach(program, shader);
     });
 }
 fn glLinkProgram(env: &mut Environment, program: GLuint) {
@@ -3985,18 +3998,72 @@ fn parse_varying_declarations(source: &str) -> Vec<(String, String)> {
     out
 }
 
-/// Read back the source the host driver stored for a shader object.
-unsafe fn host_shader_source(gles: &mut dyn GLES, shader: GLuint) -> String {
-    let mut len: GLint = 0;
-    gles.GetShaderiv(shader, 0x8B88 /* GL_SHADER_SOURCE_LENGTH */, &mut len);
-    if len <= 0 {
-        return String::new();
-    }
-    let mut buf = vec![0u8; len as usize + 1];
-    let mut actual: GLsizei = 0;
-    gles.GetShaderSource(shader, len + 1, &mut actual, buf.as_mut_ptr() as *mut _);
-    buf.truncate(actual.max(0) as usize);
-    String::from_utf8_lossy(&buf).into_owned()
+/// Guest-side bookkeeping of the ES 2.0 shader/program graph: which type each
+/// shader object has, the (normalized) source last submitted for it, and
+/// which shaders are attached to each program. Populated by the
+/// `glCreateShader` / `glShaderSource` / `glAttachShader` / `glDetachShader` /
+/// `glDeleteShader` / `glDeleteProgram` hooks below. `fix_fragment_only_varyings`
+/// reads this instead of calling `glGetAttachedShaders` / `glGetShaderSource`
+/// on the host backend — those entry points are optional and some backends
+/// (notably `GLES2Native`, whose `GetAttachedShaders` default panics) do not
+/// implement them.
+#[derive(Default)]
+struct ShaderBookkeeping {
+    shader_types: HashMap<GLuint, GLuint>,
+    shader_sources: HashMap<GLuint, String>,
+    program_attachments: HashMap<GLuint, Vec<GLuint>>,
+}
+static SHADER_BOOKKEEPING: std::sync::Mutex<Option<ShaderBookkeeping>> =
+    std::sync::Mutex::new(None);
+
+fn with_shader_bookkeeping<R>(f: impl FnOnce(&mut ShaderBookkeeping) -> R) -> R {
+    let mut guard = SHADER_BOOKKEEPING.lock().unwrap();
+    f(guard.get_or_insert_with(ShaderBookkeeping::default))
+}
+
+fn record_shader_type(shader: GLuint, type_: GLuint) {
+    with_shader_bookkeeping(|bk| {
+        bk.shader_types.insert(shader, type_);
+    });
+}
+
+fn record_shader_source(shader: GLuint, source: String) {
+    with_shader_bookkeeping(|bk| {
+        bk.shader_sources.insert(shader, source);
+    });
+}
+
+fn record_shader_attach(program: GLuint, shader: GLuint) {
+    with_shader_bookkeeping(|bk| {
+        let list = bk.program_attachments.entry(program).or_default();
+        if !list.contains(&shader) {
+            list.push(shader);
+        }
+    });
+}
+
+fn record_shader_detach(program: GLuint, shader: GLuint) {
+    with_shader_bookkeeping(|bk| {
+        if let Some(list) = bk.program_attachments.get_mut(&program) {
+            list.retain(|s| *s != shader);
+        }
+    });
+}
+
+fn record_shader_deleted(shader: GLuint) {
+    with_shader_bookkeeping(|bk| {
+        bk.shader_types.remove(&shader);
+        bk.shader_sources.remove(&shader);
+        for list in bk.program_attachments.values_mut() {
+            list.retain(|s| *s != shader);
+        }
+    });
+}
+
+fn record_program_deleted(program: GLuint) {
+    with_shader_bookkeeping(|bk| {
+        bk.program_attachments.remove(&program);
+    });
 }
 
 /// Some apps (e.g. Gangstar) declare `varying` variables in the fragment
@@ -4008,35 +4075,40 @@ unsafe fn host_shader_source(gles: &mut dyn GLES, shader: GLuint) -> String {
 /// (magenta) geometry. Fix it generically: re-declare the fragment-only
 /// varyings at the end of the vertex shader source (top-level declarations
 /// are legal after `main()`), swap in a recompiled vertex shader, and let the
-/// link proceed.
+/// link proceed. Shader/program relationships come from the guest-side
+/// [ShaderBookkeeping], never from optional backend entry points.
 unsafe fn fix_fragment_only_varyings(gles: &mut dyn GLES, program: GLuint) {
-    const ATTACHED_SHADERS: GLenum = 0x8B85;
-    const SHADER_TYPE: GLenum = 0x8B4F;
-    const VERTEX_SHADER: GLenum = 0x8B31;
-    const FRAGMENT_SHADER: GLenum = 0x8B30;
+    const VERTEX_SHADER: GLuint = 0x8B31;
+    const FRAGMENT_SHADER: GLuint = 0x8B30;
     const COMPILE_STATUS: GLenum = 0x8B81;
 
-    let mut count: GLint = 0;
-    gles.GetProgramiv(program, ATTACHED_SHADERS, &mut count);
-    if count < 2 || count > 16 {
-        return;
-    }
-    let mut shaders = [0 as GLuint; 16];
-    let mut actual: GLsizei = 0;
-    gles.GetAttachedShaders(program, 16, &mut actual, shaders.as_mut_ptr());
-    let mut vertex: Option<(GLuint, String)> = None;
-    let mut fragment_src: Option<String> = None;
-    for &shader in shaders.iter().take(actual.max(0) as usize) {
-        let mut ty: GLint = 0;
-        gles.GetShaderiv(shader, SHADER_TYPE, &mut ty);
-        let src = host_shader_source(gles, shader);
-        match ty as GLenum {
-            VERTEX_SHADER => vertex = Some((shader, src)),
-            FRAGMENT_SHADER => fragment_src = Some(src),
-            _ => {}
+    let Some((vertex_shader, vertex_src, fragment_src)) = with_shader_bookkeeping(|bk| {
+        let attached = bk.program_attachments.get(&program)?.clone();
+        if attached.len() < 2 {
+            return None;
         }
-    }
-    let (Some((vertex_shader, vertex_src)), Some(fragment_src)) = (vertex, fragment_src) else {
+        let mut vertex: Option<(GLuint, String)> = None;
+        let mut fragment_src: Option<String> = None;
+        for shader in attached {
+            match bk.shader_types.get(&shader).copied() {
+                Some(VERTEX_SHADER) => {
+                    if let Some(src) = bk.shader_sources.get(&shader) {
+                        vertex = Some((shader, src.clone()));
+                    }
+                }
+                Some(FRAGMENT_SHADER) => {
+                    if let Some(src) = bk.shader_sources.get(&shader) {
+                        fragment_src = Some(src.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        match (vertex, fragment_src) {
+            (Some(vertex), Some(fragment_src)) => Some((vertex.0, vertex.1, fragment_src)),
+            _ => None,
+        }
+    }) else {
         return;
     };
     let vertex_varyings = parse_varying_declarations(&vertex_src);
@@ -4064,10 +4136,10 @@ unsafe fn fix_fragment_only_varyings(gles: &mut dyn GLES, program: GLuint) {
     for (ty, name) in &missing {
         patched.push_str(&format!("varying {} {};\n", ty, name));
     }
-    let Ok(csrc) = std::ffi::CString::new(patched) else {
+    let Ok(csrc) = std::ffi::CString::new(patched.clone()) else {
         return;
     };
-    let new_shader = gles.CreateShader(VERTEX_SHADER);
+    let new_shader = gles.CreateShader(VERTEX_SHADER as GLenum);
     if new_shader == 0 {
         return;
     }
@@ -4082,6 +4154,21 @@ unsafe fn fix_fragment_only_varyings(gles: &mut dyn GLES, program: GLuint) {
     }
     gles.DetachShader(program, vertex_shader);
     gles.AttachShader(program, new_shader);
+    // Keep the guest-side bookkeeping in sync (the Attach/Detach calls above
+    // go straight to the backend, bypassing the glAttachShader hook).
+    with_shader_bookkeeping(|bk| {
+        if let Some(list) = bk.program_attachments.get_mut(&program) {
+            if let Some(slot) = list.iter_mut().find(|s| **s == vertex_shader) {
+                *slot = new_shader;
+            } else {
+                list.push(new_shader);
+            }
+        }
+        bk.shader_types.insert(new_shader, VERTEX_SHADER);
+        bk.shader_sources.insert(new_shader, patched);
+        // The old vertex shader's type/source entries stay in the maps until
+        // the guest deletes it — it may still be attached to other programs.
+    });
     log!(
         "Program {}: injected {} fragment-only varying declaration(s) ({}) \
          into the vertex shader so strict linkers accept the program",
@@ -4167,6 +4254,14 @@ fn glShaderSource(
 
     let cs = std::ffi::CString::new(bytes_vec).unwrap_or_default();
     let ptr = cs.as_ptr();
+    // Remember what we submitted so `fix_fragment_only_varyings` can rewrite
+    // the vertex shader at link time without depending on optional backend
+    // entry points (GetShaderSource / GetAttachedShaders are unimplemented
+    // on some backends, e.g. GLES2Native's GetAttachedShaders panics).
+    record_shader_source(
+        shader,
+        String::from_utf8_lossy(cs.as_bytes()).into_owned(),
+    );
     if crate::env_flag_cached!("TOUCHHLE_DUMP_SHADER_SOURCE") {
         let _ = std::fs::write(format!("/tmp/a8run/shader_{}.glsl", shader), cs.as_bytes());
     }
