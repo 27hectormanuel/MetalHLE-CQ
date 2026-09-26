@@ -219,6 +219,14 @@ pub struct Options {
     /// Log every GLES call made by the guest (via the LoggingGLES wrapper).
     /// Much noisier than `trace_gl_errors`. Diagnostic only.
     pub verbose_gles: bool,
+    /// Prefer the vendor's native OpenGL ES driver over the bundled ANGLE
+    /// libraries on Android. Defaults to `true` ("GLES Native" quick option
+    /// ON): the native driver behaves closest to real iPhone-era hardware
+    /// (lenient GLSL ES linking etc.) and avoids ANGLE's stricter validation
+    /// that breaks some apps' shaders (e.g. Gangstar's fragment-only
+    /// varyings). Disable (`--no-gles-native`, quick option OFF) to force the
+    /// bundled ANGLE backend. Only meaningful on Android; ignored elsewhere.
+    pub gles_native: bool,
     /// After a `glTexImage2D(level=0, …)` upload, if the bound texture's
     /// `GL_TEXTURE_MIN_FILTER` is still the ES 1.1 default
     /// `GL_NEAREST_MIPMAP_LINEAR` (which makes the texture incomplete
@@ -300,6 +308,7 @@ impl Default for Options {
             ignore_gl_errors: false,
             trace_gl_errors: false,
             verbose_gles: false,
+            gles_native: true,
             // On Android the host GLES driver is essentially always
             // ARM Mali / Qualcomm Adreno / something equally strict,
             // and apps shipped for iOS overwhelmingly upload PVRTC and
@@ -561,6 +570,10 @@ impl Options {
             self.trace_gl_errors = true;
         } else if arg == "--verbose-gles" {
             self.verbose_gles = true;
+        } else if arg == "--gles-native" {
+            self.gles_native = true;
+        } else if arg == "--no-gles-native" {
+            self.gles_native = false;
         } else if arg == "--fix-texture-min-filter" {
             self.fix_texture_min_filter = true;
             // GLES1Native reads this as its source of truth (it has no

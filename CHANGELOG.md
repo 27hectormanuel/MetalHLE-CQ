@@ -17,6 +17,8 @@ Changes are categorised as follows:
 
 Compatibility:
 
+- Android: the app picker's quick options now have a "GLES Native" switch (ON by default) replacing the old "Verbose GLES" one: ON uses the vendor's native OpenGL ES driver (Adreno/Mali) instead of the bundled ANGLE libraries, OFF forces ANGLE (`--gles-native` / `--no-gles-native` on the command line). ANGLE's stricter GLSL ES validation broke some apps' shaders — most visibly Gangstar Vegas rendering as magenta garbage — because its programs link fragment shaders that declare varyings the vertex shader never declares, and ship `#extension` directives after code. Independently of the driver choice, guest shader sources now get their `#extension` directives hoisted above all code before compiling, and before `glLinkProgram` any fragment-only varyings are re-declared in the vertex shader, so strict linkers (ANGLE et al.) accept programs that real iPhone-era PowerVR drivers tolerated. (@KlugKlugTG)
+
 - `realpath()` no longer aborts the guest when the app passes `NULL` as the resolved-path buffer (a valid POSIX usage that mallocs the result); it now allocates the buffer instead. It also sets `errno`/returns `NULL` on unreadable paths instead of failing the whole call. `dirname(3)` is now implemented, along with `getpwuid_r(3)` (a single stub `root`/`mobile` user with the app-container home directory) and `sysconf(_SC_GETPW_R_SIZE_MAX)`. Together these fix Unity's startup path (`rvmStartup` → `getenv("HOME")` fallback chain) for Unity games such as Deep Town. (@KlugKlugTG)
 
 - Plants vs. Zombies 2 now uses an iPhone 4 profile because its bundle requires a front-facing camera; this change reaches the title/loading screen, but menu/gameplay support remains incomplete. (@j92580498-max)
