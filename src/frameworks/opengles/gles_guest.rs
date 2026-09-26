@@ -3500,6 +3500,13 @@ fn glLinkProgram(env: &mut Environment, program: GLuint) {
                 }
             }
         }
+        if gles.is_es2() {
+            // Strict linkers (ANGLE) reject programs whose fragment shader
+            // declares varyings the vertex shader doesn't (legal-but-undefined
+            // on real iPhone-era hardware). Patch the vertex shader first so
+            // the link below succeeds; see `fix_fragment_only_varyings`.
+            fix_fragment_only_varyings(gles, program);
+        }
         gles.LinkProgram(program);
         let mut ok: GLint = 0;
         gles.GetProgramiv(program, 0x8B82 /* GL_LINK_STATUS */, &mut ok);
@@ -3853,6 +3860,241 @@ fn normalize_asphalt8_shader_source(source: &str) -> String {
         .replace("vec4(0.5, 0.5, 0.5, 1)", "vec4(0.5, 0.5, 0.5, 1.0)")
 }
 
+/// Move every `#extension` directive to the top of the shader source (right
+/// after the `#version` line, if any). GLSL ES requires extension directives
+/// to appear before any non-preprocessor tokens; strict compilers (ANGLE,
+/// Adreno, Mali) reject shaders that violate this — e.g. Gangstar's fragment
+/// shaders, which the lenient PowerVR drivers of real iPhone-era hardware
+/// accepted. Also normalizes whitespace between `#` and the directive name
+/// (`#  extension` → `#extension`) so such lines are recognized. Lines that
+/// merely contain the word "extension" as part of a longer identifier are
+/// left alone.
+fn hoist_shader_extension_directives(source: &str) -> String {
+    let mut version_line: Option<&str> = None;
+    let mut extension_lines: Vec<String> = Vec::new();
+    let mut body_lines: Vec<&str> = Vec::new();
+    for line in source.split('\n') {
+        let trimmed = line.trim_start();
+        // Recognize `#extension` even with whitespace after `#`.
+        let normalized: Option<String> = trimmed.strip_prefix('#').and_then(|after_hash| {
+            let dir = after_hash.trim_start();
+            if dir.starts_with("extension") {
+                let after_kw = &dir["extension".len()..];
+                if after_kw.is_empty()
+                    || !after_kw
+                        .chars()
+                        .next()
+                        .map_or(false, |c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    Some(format!("#extension{}", after_kw))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+        if let Some(norm) = normalized {
+            extension_lines.push(norm);
+            continue;
+        }
+        if version_line.is_none() && trimmed.starts_with("#version") {
+            version_line = Some(line);
+        } else if trimmed.starts_with("#extension") {
+            extension_lines.push(line.to_string());
+        } else {
+            body_lines.push(line);
+        }
+    }
+    if extension_lines.is_empty() {
+        return source.to_string();
+    }
+    let mut out = String::with_capacity(source.len() + 32);
+    if let Some(v) = version_line {
+        out.push_str(v);
+        out.push('\n');
+    }
+    for ext in &extension_lines {
+        out.push_str(ext);
+        out.push('\n');
+    }
+    for (i, line) in body_lines.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    if source.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Parse top-level `varying` declarations from a GLSL ES 1.00 / desktop GLSL
+/// 1.20 shader source, returning `(type, name)` pairs. Handles precision
+/// qualifiers and comma-separated declarator lists (`varying vec2 a, b;`).
+fn parse_varying_declarations(source: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for raw_line in source.lines() {
+        let line = match raw_line.find("//") {
+            Some(i) => &raw_line[..i],
+            None => raw_line,
+        }
+        .trim();
+        let Some(rest) = line.strip_prefix("varying") else {
+            continue;
+        };
+        match rest.chars().next() {
+            None => continue,
+            // `varyingFoo` is an identifier, not the keyword.
+            Some(c) if c.is_ascii_alphanumeric() || c == '_' => continue,
+            _ => {}
+        }
+        let mut rest = rest.trim_start();
+        for qual in ["highp", "mediump", "lowp"] {
+            if let Some(r) = rest.strip_prefix(qual) {
+                if !r.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+                    rest = r.trim_start();
+                }
+            }
+        }
+        let type_end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        let ty = &rest[..type_end];
+        if ty.is_empty() {
+            continue;
+        }
+        let mut declarators = rest[type_end..].trim_start();
+        loop {
+            let name_end = declarators
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(declarators.len());
+            let name = &declarators[..name_end];
+            if !name.is_empty() {
+                out.push((ty.to_string(), name.to_string()));
+            }
+            let after = declarators[name_end..].trim_start();
+            if let Some(more) = after.strip_prefix(',') {
+                declarators = more.trim_start();
+            } else {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Read back the source the host driver stored for a shader object.
+unsafe fn host_shader_source(gles: &mut dyn GLES, shader: GLuint) -> String {
+    let mut len: GLint = 0;
+    gles.GetShaderiv(shader, 0x8B88 /* GL_SHADER_SOURCE_LENGTH */, &mut len);
+    if len <= 0 {
+        return String::new();
+    }
+    let mut buf = vec![0u8; len as usize + 1];
+    let mut actual: GLsizei = 0;
+    gles.GetShaderSource(shader, len + 1, &mut actual, buf.as_mut_ptr() as *mut _);
+    buf.truncate(actual.max(0) as usize);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Some apps (e.g. Gangstar) declare `varying` variables in the fragment
+/// shader that the vertex shader never declares. GLSL ES 1.00 tolerates this
+/// (the varying gets an undefined value), and so did the PowerVR drivers of
+/// real devices, but strict linkers — notably ANGLE's — fail the whole
+/// program link with "FRAGMENT varying X does not match any VERTEX varying",
+/// leaving the app drawing with a stale program and producing garbage
+/// (magenta) geometry. Fix it generically: re-declare the fragment-only
+/// varyings at the end of the vertex shader source (top-level declarations
+/// are legal after `main()`), swap in a recompiled vertex shader, and let the
+/// link proceed.
+unsafe fn fix_fragment_only_varyings(gles: &mut dyn GLES, program: GLuint) {
+    const ATTACHED_SHADERS: GLenum = 0x8B85;
+    const SHADER_TYPE: GLenum = 0x8B4F;
+    const VERTEX_SHADER: GLenum = 0x8B31;
+    const FRAGMENT_SHADER: GLenum = 0x8B30;
+    const COMPILE_STATUS: GLenum = 0x8B81;
+
+    let mut count: GLint = 0;
+    gles.GetProgramiv(program, ATTACHED_SHADERS, &mut count);
+    if count < 2 || count > 16 {
+        return;
+    }
+    let mut shaders = [0 as GLuint; 16];
+    let mut actual: GLsizei = 0;
+    gles.GetAttachedShaders(program, 16, &mut actual, shaders.as_mut_ptr());
+    let mut vertex: Option<(GLuint, String)> = None;
+    let mut fragment_src: Option<String> = None;
+    for &shader in shaders.iter().take(actual.max(0) as usize) {
+        let mut ty: GLint = 0;
+        gles.GetShaderiv(shader, SHADER_TYPE, &mut ty);
+        let src = host_shader_source(gles, shader);
+        match ty as GLenum {
+            VERTEX_SHADER => vertex = Some((shader, src)),
+            FRAGMENT_SHADER => fragment_src = Some(src),
+            _ => {}
+        }
+    }
+    let (Some((vertex_shader, vertex_src)), Some(fragment_src)) = (vertex, fragment_src) else {
+        return;
+    };
+    let vertex_varyings = parse_varying_declarations(&vertex_src);
+    let fragment_varyings = parse_varying_declarations(&fragment_src);
+    if fragment_varyings.is_empty() {
+        return;
+    }
+    let mut missing: Vec<(String, String)> = Vec::new();
+    for (ty, name) in fragment_varyings {
+        if vertex_varyings.iter().any(|(_, n)| n == &name) {
+            continue;
+        }
+        if missing.iter().any(|(_, n)| n == &name) {
+            continue;
+        }
+        missing.push((ty, name));
+    }
+    if missing.is_empty() {
+        return;
+    }
+    let mut patched = vertex_src.clone();
+    if !patched.ends_with('\n') {
+        patched.push('\n');
+    }
+    for (ty, name) in &missing {
+        patched.push_str(&format!("varying {} {};\n", ty, name));
+    }
+    let Ok(csrc) = std::ffi::CString::new(patched) else {
+        return;
+    };
+    let new_shader = gles.CreateShader(VERTEX_SHADER);
+    if new_shader == 0 {
+        return;
+    }
+    let ptr = csrc.as_ptr();
+    gles.ShaderSource(new_shader, 1, &ptr, std::ptr::null());
+    gles.CompileShader(new_shader);
+    let mut ok: GLint = 0;
+    gles.GetShaderiv(new_shader, COMPILE_STATUS, &mut ok);
+    if ok == 0 {
+        gles.DeleteShader(new_shader);
+        return;
+    }
+    gles.DetachShader(program, vertex_shader);
+    gles.AttachShader(program, new_shader);
+    log!(
+        "Program {}: injected {} fragment-only varying declaration(s) ({}) \
+         into the vertex shader so strict linkers accept the program",
+        program,
+        missing.len(),
+        missing
+            .iter()
+            .map(|(_, n)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+}
+
 fn glShaderSource(
     env: &mut Environment,
     shader: GLuint,
@@ -3917,6 +4159,10 @@ fn glShaderSource(
     let src = String::from_utf8_lossy(&raw_source);
     let src = normalize_shader_preprocessor_whitespace(&src);
     let src = normalize_asphalt8_shader_source(&src);
+    // 3. Hoist `#extension` directives to the top — strict compilers (ANGLE
+    //    etc.) reject them after non-preprocessor tokens; see
+    //    `hoist_shader_extension_directives`.
+    let src = hoist_shader_extension_directives(&src);
     let bytes_vec = strip_captain_tomato_shader_precision(&src).into_bytes();
 
     let cs = std::ffi::CString::new(bytes_vec).unwrap_or_default();
@@ -6367,5 +6613,73 @@ mod shader_preprocessor_normalization_tests {
         let out = normalize_shader_preprocessor_whitespace(&joined);
         assert!(out.contains("#endif //trailing comment"));
         assert!(!out.contains("#endif//trailing comment"));
+    }
+}
+
+#[cfg(test)]
+mod shader_extension_hoisting_tests {
+    use super::hoist_shader_extension_directives;
+
+    #[test]
+    fn hoists_late_extension_before_code() {
+        // Mirrors the Gangstar shader layout that fails on ANGLE with
+        // "extension directive must occur before any non-preprocessor tokens".
+        let src = "precision mediump float;\nuniform sampler2D t;\n#extension GL_OES_texture_3D : enable\nvarying vec2 vUV;\nvoid main() {}\n";
+        let out = hoist_shader_extension_directives(src);
+        assert!(
+            out.starts_with("#extension GL_OES_texture_3D : enable\n"),
+            "hoisted source must start with the extension directive, got: {out}"
+        );
+        assert!(out.find("#extension").unwrap() < out.find("precision").unwrap());
+    }
+
+    #[test]
+    fn keeps_version_first_and_normalizes_whitespace() {
+        let src = "#version 100\nvoid main() {}\n#  extension GL_OES_standard_derivatives : enable\n";
+        let out = hoist_shader_extension_directives(src);
+        assert!(
+            out.starts_with("#version 100\n#extension GL_OES_standard_derivatives : enable\n"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn leaves_sources_without_extensions_untouched() {
+        let src = "void main() { gl_FragColor = vec4(1.0); }\n";
+        assert_eq!(hoist_shader_extension_directives(src), src);
+    }
+
+    #[test]
+    fn does_not_misfire_on_extension_identifiers() {
+        let src = "float extensionFlag = 1.0;\nvoid main() {}\n";
+        assert_eq!(hoist_shader_extension_directives(src), src);
+    }
+}
+
+#[cfg(test)]
+mod varying_declaration_parsing_tests {
+    use super::parse_varying_declarations;
+
+    #[test]
+    fn parses_precision_and_declarator_lists() {
+        let frag = "precision mediump float;\nvarying lowp vec4 vAlpha;\nvarying vec2 vUV, vUV2;\nvarying highp vec3 vNormal; // lit\nvoid main() {}\n";
+        let v = parse_varying_declarations(frag);
+        assert!(v.contains(&("vec4".to_string(), "vAlpha".to_string())));
+        assert!(v.contains(&("vec2".to_string(), "vUV".to_string())));
+        assert!(v.contains(&("vec2".to_string(), "vUV2".to_string())));
+        assert!(v.contains(&("vec3".to_string(), "vNormal".to_string())));
+        assert_eq!(v.len(), 4);
+    }
+
+    #[test]
+    fn fragment_only_varyings_detected_as_missing() {
+        // The Gangstar case: fragment declares vAlpha, vertex does not.
+        let vert = parse_varying_declarations("varying vec2 vUV;\nvoid main() {}\n");
+        let frag = parse_varying_declarations("varying vec4 vAlpha;\nvarying vec2 vUV;\nvoid main() {}\n");
+        let missing: Vec<_> = frag
+            .into_iter()
+            .filter(|(_, n)| !vert.iter().any(|(_, vn)| vn == n))
+            .collect();
+        assert_eq!(missing, vec![("vec4".to_string(), "vAlpha".to_string())]);
     }
 }

@@ -589,14 +589,25 @@ pub fn host_screen_size() -> Option<(u32, u32)> {
     }
 }
 
-/// Configure SDL to use the bundled ANGLE libraries on Android.
+/// Configure the host OpenGL ES driver on Android.
 ///
 /// This is done before creating an SDL window/context, because SDL loads EGL
-/// and GLES at context-creation time. Android builds always prefer the same
-/// bundled ANGLE backend; app imports and GPU-model heuristics do not select a
-/// different host driver. If ANGLE is not loadable, SDL uses the system driver.
+/// and GLES at context-creation time. With `use_angle == false` (the default,
+/// "GLES Native" ON) the bundled ANGLE override is cleared so SDL uses the
+/// vendor's native OpenGL ES driver (Adreno/Mali), which is the closest match
+/// to real-device behaviour and avoids ANGLE's stricter shader validation.
+/// With `use_angle == true` the bundled ANGLE libraries are preferred; if
+/// ANGLE is not loadable, SDL falls back to the system driver.
 #[cfg(target_os = "android")]
-fn configure_android_angle_driver() {
+fn configure_android_angle_driver(use_angle: bool) {
+    if !use_angle {
+        // Do not leave a stale or user-provided override pointing at the
+        // bundled ANGLE; SDL will use Android's system OpenGL ES driver.
+        env::remove_var("SDL_VIDEO_EGL_DRIVER");
+        env::remove_var("SDL_VIDEO_GL_DRIVER");
+        log!("GLES Native requested; using the Android system OpenGL ES driver.");
+        return;
+    }
     const CANDIDATES: &[(&str, &str, &str)] = &[
         (
             "libEGL_angle.so",
@@ -750,7 +761,7 @@ impl Window {
         options: &Options,
     ) -> Window {
         #[cfg(target_os = "android")]
-        configure_android_angle_driver();
+        configure_android_angle_driver(!options.gles_native);
 
         let sdl_ctx = sdl2::init().unwrap();
         let video_ctx = sdl_ctx.video().unwrap();
