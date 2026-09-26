@@ -45,6 +45,49 @@ fn trace_potatogold_render() -> bool {
     crate::env_flag_cached!("TOUCHHLE_TRACE_POTATOGOLD_RENDER")
 }
 
+const TEXTURE_CUBE_MAP: GLenum = 0x8513;
+const TEXTURE_BINDING_CUBE_MAP: GLenum = 0x8514;
+const TEXTURE_CUBE_MAP_POSITIVE_X: GLenum = 0x8515;
+const TEXTURE_CUBE_MAP_NEGATIVE_Z: GLenum = 0x851A;
+
+fn texture_binding_pname(target: GLenum) -> Option<GLenum> {
+    if target == gles11::TEXTURE_2D {
+        Some(gles11::TEXTURE_BINDING_2D)
+    } else if target == TEXTURE_CUBE_MAP
+        || (TEXTURE_CUBE_MAP_POSITIVE_X..=TEXTURE_CUBE_MAP_NEGATIVE_Z).contains(&target)
+    {
+        Some(TEXTURE_BINDING_CUBE_MAP)
+    } else {
+        None
+    }
+}
+
+unsafe fn current_bound_texture(gles: &mut dyn GLES, target: GLenum) -> Option<GLuint> {
+    let pname = texture_binding_pname(target)?;
+    let mut texture = 0;
+    gles.GetIntegerv(pname, &mut texture);
+    GLuint::try_from(texture).ok()
+}
+
+fn pvrtc_subimage_matches_level(
+    texture_level: Option<(GLsizei, GLsizei, GLenum)>,
+    xoffset: GLint,
+    yoffset: GLint,
+    width: GLsizei,
+    height: GLsizei,
+    format: GLenum,
+) -> bool {
+    matches!(
+        texture_level,
+        Some((stored_width, stored_height, stored_format))
+            if xoffset == 0
+                && yoffset == 0
+                && width == stored_width
+                && height == stored_height
+                && format == stored_format
+    )
+}
+
 #[track_caller]
 fn with_ctx_and_mem<T, U: Default>(env: &mut Environment, f: T) -> U
 where
@@ -1188,10 +1231,72 @@ fn glCompressedTexSubImage2D(
     image_size: GLsizei,
     data: ConstVoidPtr,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let data = mem
-            .ptr_at(data.cast::<u8>(), image_size.try_into().unwrap())
-            .cast();
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let image_size_usize = match usize::try_from(image_size) {
+            Ok(size) => size,
+            Err(_) => {
+                gles.CompressedTexSubImage2D(
+                    target,
+                    level,
+                    xoffset,
+                    yoffset,
+                    width,
+                    height,
+                    format,
+                    image_size,
+                    std::ptr::null(),
+                );
+                return;
+            }
+        };
+        let bound_texture = current_bound_texture(gles, target);
+        let texture_level = bound_texture
+            .and_then(|texture| shadow.pvrtc_texture_level(target, texture, level));
+        if pvrtc_subimage_matches_level(
+            texture_level,
+            xoffset,
+            yoffset,
+            width,
+            height,
+            format,
+        ) && !data.is_null()
+            && crate::gles::util::pvrtc_payload_size(format, width, height)
+                == Some(image_size_usize)
+        {
+            if let Some((is_2bit, is_opaque)) = crate::gles::util::pvrtc_format_properties(format) {
+                let data = mem.ptr_at(data.cast::<u8>(), image_size_usize as GuestUSize);
+                let payload = std::slice::from_raw_parts(data, image_size_usize);
+                let pixels = crate::image::decode_pvrtc_with_alpha(
+                    payload,
+                    is_2bit,
+                    width as u32,
+                    height as u32,
+                    is_opaque,
+                );
+                // PVRTC compressed subimages may only replace a complete level.
+                gles.TexSubImage2D(
+                    target,
+                    level,
+                    xoffset,
+                    yoffset,
+                    width,
+                    height,
+                    gles11::RGBA,
+                    gles11::UNSIGNED_BYTE,
+                    pixels.as_ptr().cast(),
+                );
+                log_once!(
+                    "Software-decoded a full PVRTC glCompressedTexSubImage2D update into RGBA storage"
+                );
+                return;
+            }
+        }
+        let data = if data.is_null() {
+            std::ptr::null()
+        } else {
+            mem.ptr_at(data.cast::<u8>(), image_size_usize as GuestUSize)
+                .cast()
+        };
         gles.CompressedTexSubImage2D(
             target, level, xoffset, yoffset, width, height, format, image_size, data,
         )
@@ -2059,10 +2164,18 @@ fn glGenTextures(env: &mut Environment, n: GLsizei, textures: MutPtr<GLuint>) {
     })
 }
 fn glDeleteTextures(env: &mut Environment, n: GLsizei, textures: ConstPtr<GLuint>) {
-    with_ctx_and_mem(env, |gles, mem| {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| {
         let n_usize: GuestUSize = n.try_into().unwrap();
         let textures = mem.ptr_at(textures, n_usize);
-        unsafe { gles.DeleteTextures(n, textures) }
+        let deleted = if n_usize == 0 {
+            Vec::new()
+        } else {
+            unsafe { from_raw_parts(textures, n_usize as usize) }.to_vec()
+        };
+        unsafe { gles.DeleteTextures(n, textures) };
+        for texture in deleted {
+            shadow.forget_pvrtc_texture(texture);
+        }
     })
 }
 fn glActiveTexture(env: &mut Environment, texture: GLenum) {
@@ -2383,7 +2496,8 @@ fn glTexImage2D(
     }
     let guest_pixels = pixels;
     let fix_filter = env.options.fix_texture_min_filter && level == 0;
-    with_ctx_and_mem(env, |gles, mem| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let bound_texture = current_bound_texture(gles, target);
         let pixels = if pixels.is_null() {
             std::ptr::null()
         } else {
@@ -2402,6 +2516,9 @@ fn glTexImage2D(
             type_,
             pixels,
         );
+        if let Some(texture) = bound_texture {
+            shadow.forget_pvrtc_texture_level(target, texture, level);
+        }
         if crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
             static TEX_DUMP_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = TEX_DUMP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2491,7 +2608,11 @@ fn glCompressedTexImage2D(
         }
     }
     let fix_filter = env.options.fix_texture_min_filter && level == 0;
-    with_ctx_and_mem(env, |gles, mem| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let bound_texture = current_bound_texture(gles, target);
+        if let Some(texture) = bound_texture {
+            shadow.forget_pvrtc_texture_level(target, texture, level);
+        }
         // Pre-flight: drain any sticky GL error left by the previous call
         // (e.g. an oversized RGBA8 glTexImage2D on a strict Mali driver),
         // so when we check post-upload below we can attribute a fresh error
@@ -2541,6 +2662,23 @@ fn glCompressedTexImage2D(
                 border,
                 payload,
             ) {
+                if border == 0
+                    && width > 0
+                    && height > 0
+                    && crate::gles::util::pvrtc_payload_size(internalformat, width, height)
+                        == Some(image_size_usize)
+                {
+                    if let Some(texture) = bound_texture {
+                        shadow.record_pvrtc_texture_level(
+                            target,
+                            texture,
+                            level,
+                            width,
+                            height,
+                            internalformat,
+                        );
+                    }
+                }
                 if fix_filter {
                     gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
                 }
@@ -2624,8 +2762,12 @@ fn glCopyTexImage2D(
     height: GLsizei,
     border: GLint,
 ) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.CopyTexImage2D(target, level, internalformat, x, y, width, height, border)
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        let bound_texture = current_bound_texture(gles, target);
+        gles.CopyTexImage2D(target, level, internalformat, x, y, width, height, border);
+        if let Some(texture) = bound_texture {
+            shadow.forget_pvrtc_texture_level(target, texture, level);
+        }
     })
 }
 fn glCopyTexSubImage2D(
@@ -4919,8 +5061,12 @@ fn glTexStorage2D(
     width: GLsizei,
     height: GLsizei,
 ) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.TexStorage2D(target, levels, internalformat, width, height)
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        let bound_texture = current_bound_texture(gles, target);
+        gles.TexStorage2D(target, levels, internalformat, width, height);
+        if let Some(texture) = bound_texture {
+            shadow.forget_pvrtc_texture(texture);
+        }
     });
 }
 
@@ -6292,6 +6438,57 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(glLabelObjectEXT(_, _, _, _)),
     export_c_func!(glGetObjectLabelEXT(_, _, _, _, _)),
 ];
+
+#[cfg(test)]
+mod pvrtc_subimage_matching_tests {
+    use super::pvrtc_subimage_matches_level;
+    use crate::gles::gles11_raw as gles11;
+
+    #[test]
+    fn accepts_only_a_full_update_of_the_tracked_pvrtc_level() {
+        let level = Some((2048, 2048, gles11::COMPRESSED_RGBA_PVRTC_4BPPV1_IMG));
+        assert!(pvrtc_subimage_matches_level(
+            level,
+            0,
+            0,
+            2048,
+            2048,
+            gles11::COMPRESSED_RGBA_PVRTC_4BPPV1_IMG,
+        ));
+        assert!(!pvrtc_subimage_matches_level(
+            level,
+            0,
+            0,
+            1024,
+            2048,
+            gles11::COMPRESSED_RGBA_PVRTC_4BPPV1_IMG,
+        ));
+        assert!(!pvrtc_subimage_matches_level(
+            level,
+            4,
+            0,
+            2048,
+            2048,
+            gles11::COMPRESSED_RGBA_PVRTC_4BPPV1_IMG,
+        ));
+        assert!(!pvrtc_subimage_matches_level(
+            level,
+            0,
+            0,
+            2048,
+            2048,
+            gles11::COMPRESSED_RGB_PVRTC_4BPPV1_IMG,
+        ));
+        assert!(!pvrtc_subimage_matches_level(
+            None,
+            0,
+            0,
+            2048,
+            2048,
+            gles11::COMPRESSED_RGBA_PVRTC_4BPPV1_IMG,
+        ));
+    }
+}
 
 #[cfg(test)]
 mod shader_preprocessor_normalization_tests {
