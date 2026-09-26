@@ -3532,7 +3532,23 @@ fn glLinkProgram(env: &mut Environment, program: GLuint) {
                 len as usize,
             ))
             .unwrap_or("?");
-            log!("Program {} link failed: {}", program, s);
+            // Last resort: the pre-link pass may have missed a fragment-only
+            // varying (e.g. exotic source layout). Use the names the driver
+            // itself reported and retry the link once.
+            if gles.is_es2() && inject_driver_reported_varyings(gles, program, s) {
+                gles.LinkProgram(program);
+                gles.GetProgramiv(program, 0x8B82 /* GL_LINK_STATUS */, &mut ok);
+                if ok != 0 {
+                    log!(
+                        "Program {} linked successfully after injecting \
+                         driver-reported fragment-only varyings",
+                        program
+                    );
+                }
+            }
+            if ok == 0 {
+                log!("Program {} link failed: {}", program, s);
+            }
         }
     });
 }
@@ -3943,57 +3959,130 @@ fn hoist_shader_extension_directives(source: &str) -> String {
     out
 }
 
-/// Parse top-level `varying` declarations from a GLSL ES 1.00 / desktop GLSL
-/// 1.20 shader source, returning `(type, name)` pairs. Handles precision
-/// qualifiers and comma-separated declarator lists (`varying vec2 a, b;`).
-fn parse_varying_declarations(source: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for raw_line in source.lines() {
-        let line = match raw_line.find("//") {
-            Some(i) => &raw_line[..i],
-            None => raw_line,
-        }
-        .trim();
-        let Some(rest) = line.strip_prefix("varying") else {
+/// Strip `//` and `/* */` comments from GLSL source so declaration scanning
+/// never sees commented-out code (Gameloft's shader generator emits the full
+/// varying block in both stages but comments unused entries out — a
+/// comment-blind parser would treat `/* varying float vAlpha; */` in the
+/// vertex shader as a real declaration and skip the fix-up).
+fn strip_glsl_comments(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    while let Some(c) = chars.next() {
+        if in_line_comment {
+            if c == '\n' {
+                in_line_comment = false;
+                out.push('\n');
+            }
             continue;
-        };
-        match rest.chars().next() {
-            None => continue,
-            // `varyingFoo` is an identifier, not the keyword.
-            Some(c) if c.is_ascii_alphanumeric() || c == '_' => continue,
-            _ => {}
         }
-        let mut rest = rest.trim_start();
-        for qual in ["highp", "mediump", "lowp"] {
-            if let Some(r) = rest.strip_prefix(qual) {
-                if !r.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
-                    rest = r.trim_start();
+        if in_block_comment {
+            if c == '*' && matches!(chars.peek(), Some('/')) {
+                chars.next();
+                in_block_comment = false;
+                out.push(' ');
+            }
+            continue;
+        }
+        if c == '/' {
+            if matches!(chars.peek(), Some('/')) {
+                chars.next();
+                in_line_comment = true;
+                continue;
+            }
+            if matches!(chars.peek(), Some('*')) {
+                chars.next();
+                in_block_comment = true;
+                out.push(' ');
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Parse top-level `varying` declarations from a GLSL ES 1.00 / desktop GLSL
+/// 1.20 shader source, returning `(type, name)` pairs. Comments are stripped
+/// first; the whole source is scanned token-wise, so declarations anywhere on
+/// a line and several declarations per line (`varying vec2 a, b; varying
+/// float c;`) are all found. Handles precision qualifiers and (by skipping
+/// bracketed parts) array declarators.
+fn parse_varying_declarations(source: &str) -> Vec<(String, String)> {
+    let src = strip_glsl_comments(source);
+    let bytes = src.as_bytes();
+    let mut out = Vec::new();
+    let mut search_start = 0usize;
+    while let Some(rel) = src[search_start..].find("varying") {
+        let start = search_start + rel;
+        let end = start + "varying".len();
+        let before_ok = start == 0 || {
+            let b = bytes[start - 1];
+            !(b.is_ascii_alphanumeric() || b == b'_')
+        };
+        let after_ok = end >= src.len() || {
+            let b = bytes[end];
+            !(b.is_ascii_alphanumeric() || b == b'_')
+        };
+        if !before_ok || !after_ok {
+            search_start = end;
+            continue;
+        }
+        // Scan tokens up to the first ';' (declarations after it will be
+        // picked up by the next outer-loop iteration).
+        let rest = &src[end..];
+        let semi = rest.find(';').unwrap_or(rest.len());
+        let body = &rest[..semi];
+        let mut items: Vec<(String, bool)> = Vec::new(); // (token, comma-followed)
+        let mut cur = String::new();
+        let mut comma = false;
+        let mut in_brackets = false;
+        for ch in body.chars() {
+            if ch == '[' {
+                in_brackets = true;
+            } else if ch == ']' {
+                in_brackets = false;
+            }
+            if in_brackets {
+                continue;
+            }
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                cur.push(ch);
+            } else {
+                if !cur.is_empty() {
+                    items.push((cur.clone(), comma));
+                    cur.clear();
+                    comma = false;
+                }
+                if ch == ',' {
+                    comma = true;
                 }
             }
         }
-        let type_end = rest
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .unwrap_or(rest.len());
-        let ty = &rest[..type_end];
-        if ty.is_empty() {
-            continue;
+        if !cur.is_empty() {
+            items.push((cur, comma));
         }
-        let mut declarators = rest[type_end..].trim_start();
-        loop {
-            let name_end = declarators
-                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .unwrap_or(declarators.len());
-            let name = &declarators[..name_end];
-            if !name.is_empty() {
-                out.push((ty.to_string(), name.to_string()));
+        if !items.is_empty() {
+            let mut idx = 0usize;
+            if matches!(items[0].0.as_str(), "highp" | "mediump" | "lowp") && items.len() >= 2 {
+                idx = 1;
             }
-            let after = declarators[name_end..].trim_start();
-            if let Some(more) = after.strip_prefix(',') {
-                declarators = more.trim_start();
-            } else {
-                break;
+            let ty = items[idx].0.clone();
+            let mut k = idx + 1;
+            while k < items.len() {
+                let name = items[k].0.clone();
+                let had_comma = items[k].1;
+                if !name.is_empty() {
+                    out.push((ty.clone(), name));
+                }
+                k += 1;
+                if !had_comma {
+                    break;
+                }
             }
         }
+        search_start = end;
     }
     out
 }
@@ -4080,7 +4169,6 @@ fn record_program_deleted(program: GLuint) {
 unsafe fn fix_fragment_only_varyings(gles: &mut dyn GLES, program: GLuint) {
     const VERTEX_SHADER: GLuint = 0x8B31;
     const FRAGMENT_SHADER: GLuint = 0x8B30;
-    const COMPILE_STATUS: GLenum = 0x8B81;
 
     let Some((vertex_shader, vertex_src, fragment_src)) = with_shader_bookkeeping(|bk| {
         let attached = bk.program_attachments.get(&program)?.clone();
@@ -4129,19 +4217,48 @@ unsafe fn fix_fragment_only_varyings(gles: &mut dyn GLES, program: GLuint) {
     if missing.is_empty() {
         return;
     }
-    let mut patched = vertex_src.clone();
+    if swap_in_patched_vertex_shader(gles, program, vertex_shader, &vertex_src, &missing) {
+        log!(
+            "Program {}: injected {} fragment-only varying declaration(s) ({}) \
+             into the vertex shader so strict linkers accept the program",
+            program,
+            missing.len(),
+            missing
+                .iter()
+                .map(|(_, n)| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+}
+
+/// Append `missing` varying declarations to the program's current vertex
+/// shader source, compile the result and swap it in (updating the guest-side
+/// bookkeeping). Returns `false` (leaving everything as-is) if the patched
+/// shader fails to compile.
+unsafe fn swap_in_patched_vertex_shader(
+    gles: &mut dyn GLES,
+    program: GLuint,
+    vertex_shader: GLuint,
+    vertex_src: &str,
+    missing: &[(String, String)],
+) -> bool {
+    const VERTEX_SHADER: GLuint = 0x8B31;
+    const COMPILE_STATUS: GLenum = 0x8B81;
+
+    let mut patched = vertex_src.to_string();
     if !patched.ends_with('\n') {
         patched.push('\n');
     }
-    for (ty, name) in &missing {
+    for (ty, name) in missing {
         patched.push_str(&format!("varying {} {};\n", ty, name));
     }
     let Ok(csrc) = std::ffi::CString::new(patched.clone()) else {
-        return;
+        return false;
     };
     let new_shader = gles.CreateShader(VERTEX_SHADER as GLenum);
     if new_shader == 0 {
-        return;
+        return false;
     }
     let ptr = csrc.as_ptr();
     gles.ShaderSource(new_shader, 1, &ptr, std::ptr::null());
@@ -4150,7 +4267,7 @@ unsafe fn fix_fragment_only_varyings(gles: &mut dyn GLES, program: GLuint) {
     gles.GetShaderiv(new_shader, COMPILE_STATUS, &mut ok);
     if ok == 0 {
         gles.DeleteShader(new_shader);
-        return;
+        return false;
     }
     gles.DetachShader(program, vertex_shader);
     gles.AttachShader(program, new_shader);
@@ -4169,17 +4286,69 @@ unsafe fn fix_fragment_only_varyings(gles: &mut dyn GLES, program: GLuint) {
         // The old vertex shader's type/source entries stay in the maps until
         // the guest deletes it — it may still be attached to other programs.
     });
-    log!(
-        "Program {}: injected {} fragment-only varying declaration(s) ({}) \
-         into the vertex shader so strict linkers accept the program",
-        program,
-        missing.len(),
-        missing
+    true
+}
+
+/// Last-resort fix-up: if a link still failed, parse the varying names the
+/// driver complained about ("FRAGMENT varying <name> does not match any
+/// VERTEX varying"), look their types up in the recorded fragment source and
+/// inject them into the vertex shader. The caller re-links afterwards.
+unsafe fn inject_driver_reported_varyings(
+    gles: &mut dyn GLES,
+    program: GLuint,
+    info_log: &str,
+) -> bool {
+    const VERTEX_SHADER: GLuint = 0x8B31;
+    const FRAGMENT_SHADER: GLuint = 0x8B30;
+
+    let mut names: Vec<String> = Vec::new();
+    for (i, _) in info_log.match_indices("FRAGMENT varying") {
+        let rest = info_log[i + "FRAGMENT varying".len()..].trim_start();
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        return false;
+    }
+    let Some((vertex_shader, vertex_src, missing)) = with_shader_bookkeeping(|bk| {
+        let attached = bk.program_attachments.get(&program)?.clone();
+        let mut vertex: Option<(GLuint, String)> = None;
+        let mut fragment_src: Option<String> = None;
+        for shader in attached {
+            match bk.shader_types.get(&shader).copied() {
+                Some(VERTEX_SHADER) => {
+                    if let Some(src) = bk.shader_sources.get(&shader) {
+                        vertex = Some((shader, src.clone()));
+                    }
+                }
+                Some(FRAGMENT_SHADER) => {
+                    if let Some(src) = bk.shader_sources.get(&shader) {
+                        fragment_src = Some(src.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        let (vertex_shader, vertex_src) = vertex?;
+        let fragment_src = fragment_src?;
+        let fs_decls = parse_varying_declarations(&fragment_src);
+        let missing: Vec<(String, String)> = names
             .iter()
-            .map(|(_, n)| n.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+            .filter_map(|name| fs_decls.iter().find(|(_, n)| n == name).cloned())
+            .collect();
+        if missing.is_empty() {
+            return None;
+        }
+        Some((vertex_shader, vertex_src, missing))
+    }) else {
+        return false;
+    };
+    swap_in_patched_vertex_shader(gles, program, vertex_shader, &vertex_src, &missing)
 }
 
 fn glShaderSource(
@@ -6776,5 +6945,26 @@ mod varying_declaration_parsing_tests {
             .filter(|(_, n)| !vert.iter().any(|(_, vn)| vn == n))
             .collect();
         assert_eq!(missing, vec![("vec4".to_string(), "vAlpha".to_string())]);
+    }
+
+    #[test]
+    fn commented_out_varyings_are_ignored() {
+        // Gameloft's generator emits the full varying block in both stages
+        // but comments unused entries out; these must not count as declared.
+        let vert = parse_varying_declarations(
+            "varying vec2 vUV;\n/* varying float vAlpha; */\n// varying vec3 vNormal;\nvoid main() {}\n",
+        );
+        assert_eq!(vert, vec![("vec2".to_string(), "vUV".to_string())]);
+    }
+
+    #[test]
+    fn multiple_declarations_per_line_and_mid_line() {
+        let src = "varying vec2 vUV, vUV2; varying float vAlpha;\nuniform varying_less;\nvoid main() { varying_not_keyword(); }\n";
+        let v = parse_varying_declarations(src);
+        assert!(v.contains(&("vec2".to_string(), "vUV".to_string())));
+        assert!(v.contains(&("vec2".to_string(), "vUV2".to_string())));
+        assert!(v.contains(&("float".to_string(), "vAlpha".to_string())));
+        assert!(!v.iter().any(|(_, n)| n == "varying_not_keyword"));
+        assert_eq!(v.len(), 3);
     }
 }
