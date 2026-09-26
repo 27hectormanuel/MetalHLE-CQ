@@ -219,6 +219,13 @@ pub struct Options {
     /// Log every GLES call made by the guest (via the LoggingGLES wrapper).
     /// Much noisier than `trace_gl_errors`. Diagnostic only.
     pub verbose_gles: bool,
+    /// When a compressed IPA entry's deflate stream is corrupt, keep the
+    /// successfully decompressed prefix instead of presenting an empty file
+    /// to the guest. Fixes apps (e.g. Gangstar) that render magenta
+    /// placeholder textures because their big asset entries come from
+    /// truncated/broken repacked IPAs. Off by default: feeding damaged data
+    /// to other apps' parsers can crash them.
+    pub salvage_corrupt_ipa_entries: bool,
     /// Prefer the vendor's native OpenGL ES driver over the bundled ANGLE
     /// libraries on Android. Defaults to `true` ("GLES Native" quick option
     /// ON): the native driver behaves closest to real iPhone-era hardware
@@ -309,6 +316,7 @@ impl Default for Options {
             trace_gl_errors: false,
             verbose_gles: false,
             gles_native: true,
+            salvage_corrupt_ipa_entries: false,
             // On Android the host GLES driver is essentially always
             // ARM Mali / Qualcomm Adreno / something equally strict,
             // and apps shipped for iOS overwhelmingly upload PVRTC and
@@ -574,6 +582,10 @@ impl Options {
             self.gles_native = true;
         } else if arg == "--no-gles-native" {
             self.gles_native = false;
+        } else if arg == "--salvage-corrupt-ipa-entries" {
+            self.salvage_corrupt_ipa_entries = true;
+            // bundle.rs has no Options access from the IPA read path.
+            std::env::set_var("TOUCHHLE_SALVAGE_CORRUPT_IPA", "1");
         } else if arg == "--fix-texture-min-filter" {
             self.fix_texture_min_filter = true;
             // GLES1Native reads this as its source of truth (it has no

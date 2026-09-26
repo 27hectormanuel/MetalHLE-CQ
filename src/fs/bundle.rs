@@ -281,18 +281,49 @@ impl IpaFileRef {
                     let size = file.size();
                     let mut buf = Vec::new();
                     if let Err(e) = file.read_to_end(&mut buf) {
-                        // The central directory can be readable even when the
-                        // compressed payload is truncated or has a bad CRC.
-                        // Discarding a partial archive is safer than letting a
-                        // guest parse corrupted Unity/player data and continue
-                        // in a damaged state.
-                        log!(
-                            "Warning: IpaFileRef::open(): IO error decompressing IPA entry {}: {}; rejecting partial buffer ({} bytes).",
-                            self.index,
-                            e,
-                            buf.len()
-                        );
-                        None
+                        let partial = buf.len();
+                        // Some IPAs in the wild (repacked/decrypted dumps)
+                        // have truncated or bit-rotted deflate streams for
+                        // their big asset entries. Rejecting the partial data
+                        // leaves the guest with an empty file (Gangstar then
+                        // renders magenta placeholder textures), while
+                        // salvaging it usually lets the engine load
+                        // everything that sits before the truncation. Off by
+                        // default because feeding damaged data to parsers can
+                        // crash other apps (the reason partial buffers are
+                        // normally rejected); enable per app with
+                        // --salvage-corrupt-ipa-entries / the quick option.
+                        if partial > 0
+                            && std::env::var_os("TOUCHHLE_SALVAGE_CORRUPT_IPA").is_some()
+                        {
+                            log!(
+                                "Warning: IpaFileRef::open(): IO error decompressing IPA entry {}: {}; salvaging partial buffer ({} of {} bytes) per TOUCHHLE_SALVAGE_CORRUPT_IPA.",
+                                self.index,
+                                e,
+                                partial,
+                                size
+                            );
+                            Some((
+                                buf,
+                                ArchivedFileMetadata {
+                                    last_modified: timestamp.into(),
+                                    size: partial as u64,
+                                },
+                            ))
+                        } else {
+                            // The central directory can be readable even when
+                            // the compressed payload is truncated or has a bad
+                            // CRC. Discarding a partial archive is safer than
+                            // letting a guest parse corrupted Unity/player
+                            // data and continue in a damaged state.
+                            log!(
+                                "Warning: IpaFileRef::open(): IO error decompressing IPA entry {}: {}; rejecting partial buffer ({} bytes).",
+                                self.index,
+                                e,
+                                partial
+                            );
+                            None
+                        }
                     } else {
                         Some((
                             buf,

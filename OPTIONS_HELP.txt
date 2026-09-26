@@ -426,6 +426,16 @@ Other options:
         and adds a glGetError() round-trip per call, so it should not be
         left on for normal use.
 
+    --salvage-corrupt-ipa-entries
+        When a compressed IPA entry's deflate stream is corrupt (truncated /
+        broken repacked IPA), keep the successfully decompressed prefix and
+        present it to the guest instead of an empty file. Fixes apps such as
+        Gangstar that otherwise render magenta placeholder textures because
+        their big asset entries fail to decompress. Off by default: damaged
+        data can crash other apps' parsers, so enable it only for apps that
+        misbehave with their IPA. Also available as the "Salvage corrupt IPA
+        entries" switch in the app picker's quick options.
+
     --gles-native / --no-gles-native
         Android only. ON by default (and exposed as the "GLES Native" switch
         in the app picker's quick options): use the vendor's native OpenGL ES
