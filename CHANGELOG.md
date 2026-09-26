@@ -19,6 +19,8 @@ Compatibility:
 
 - `realpath()` no longer aborts the guest when the app passes `NULL` as the resolved-path buffer (a valid POSIX usage that mallocs the result); it now allocates the buffer instead. It also sets `errno`/returns `NULL` on unreadable paths instead of failing the whole call. `dirname(3)` is now implemented, along with `getpwuid_r(3)` (a single stub `root`/`mobile` user with the app-container home directory) and `sysconf(_SC_GETPW_R_SIZE_MAX)`. Together these fix Unity's startup path (`rvmStartup` → `getenv("HOME")` fallback chain) for Unity games such as Deep Town. (@KlugKlugTG)
 
+- Plants vs. Zombies 2 now uses an iPhone 4 profile because its bundle requires a front-facing camera; this change reaches the title/loading screen, but menu/gameplay support remains incomplete. (@j92580498-max)
+
 - New working apps:
   - Devil May Cry 4 Refrain (@hikari-no-yume)
   - Amerzone Pt1 (@ciciplusplus)
@@ -34,6 +36,7 @@ Compatibility:
   - Asphalt 6 (@ciciplusplus)
   - World of Goo (@ciciplusplus)
 - API support improvements:
+  - On hosts without native PVRTC support, full-level `glCompressedTexSubImage2D` updates now reuse the software-decoded RGBA texture instead of issuing an unsupported compressed update. (@j92580498-max)
   - `-[NSObject performSelectorOnMainThread:withObject:waitUntilDone:]` now queues `waitUntilDone:NO` calls made on the main thread for the next run-loop pass instead of invoking them inline. This prevents asynchronous startup callbacks from observing partially initialized state and fixes Battleship FREE's age/terms flow stalling before its first rendered frame.
   - `NSBundle` now retains cached bundle instances, and `UINib` honors the bundle argument instead of asserting that every nib comes from the main app bundle. This allows Battleship FREE to load its nested age-verification nib and localized strings.
   - Bundled Mach-O dependencies are loaded transitively, and the guest ARM SJLJ unwinder is preferred when present instead of being replaced by host stubs; this lets C++ exceptions unwind normally during game startup.
