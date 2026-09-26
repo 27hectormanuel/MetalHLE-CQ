@@ -177,7 +177,6 @@ struct AppPickerDelegateHostObject {
     cheat_engine: Option<bool>,
     trace_gl_errors: Option<bool>,
     gles_native: Option<bool>,
-    salvage_ipa: Option<bool>,
     fullscreen: Option<bool>,
     device_model_tag: Option<i32>,
     device_model_toggle: bool,
@@ -265,10 +264,6 @@ const CLASSES: ClassExports = objc_classes! {
 - (())glesNative:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).gles_native = Some(switch_state);
-}
-- (())salvageIpa:(id)switch { // UISwitch*
-    let switch_state: bool = msg![env; switch isOn];
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).salvage_ipa = Some(switch_state);
 }
 - (())showFPS:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
@@ -568,7 +563,6 @@ fn app_picker_inner(
     let mut quick_options_show_fps = false;
     let mut quick_options_trace_gl_errors = false;
     let mut quick_options_gles_native = true;
-    let mut quick_options_salvage_ipa = false;
     let mut quick_options_device_tag: Option<i32> = None;
     let mut quick_options_device_model_open = false;
     let mut quick_options_device_model_scroll: isize = 0;
@@ -826,8 +820,6 @@ fn app_picker_inner(
             quick_options_trace_gl_errors = trace_gl_errors;
         } else if let Some(gles_native) = std::mem::take(&mut host_obj.gles_native) {
             quick_options_gles_native = gles_native;
-        } else if let Some(salvage_ipa) = std::mem::take(&mut host_obj.salvage_ipa) {
-            quick_options_salvage_ipa = salvage_ipa;
         } else if let Some(fullscreen) = std::mem::take(&mut host_obj.fullscreen) {
             quick_options_fullscreen = match fullscreen {
                 false => None,
@@ -906,9 +898,6 @@ fn app_picker_inner(
     }
     if !quick_options_gles_native {
         option_args.push("--no-gles-native".to_string());
-    }
-    if quick_options_salvage_ipa {
-        option_args.push("--salvage-corrupt-ipa-entries".to_string());
     }
 
     if let Some(tag) = quick_options_device_tag {
@@ -1516,8 +1505,6 @@ fn setup_quick_options(
         RowKind::Switch("traceGLErrors:", false),
         RowKind::Label("GLES Native"),
         RowKind::Switch("glesNative:", true),
-        RowKind::Label("Salvage corrupt IPA entries"),
-        RowKind::Switch("salvageIpa:", false),
         RowKind::Label("Use analog sticks for tilt controls"),
         RowKind::Switch("analogStickTiltControls:", true),
         // ---- (divider for stuff skipped below)
