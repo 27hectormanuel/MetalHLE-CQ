@@ -4225,15 +4225,15 @@ fn parse_varying_declarations(source: &str) -> Vec<(String, String)> {
             let ty = items[idx].0.clone();
             let mut k = idx + 1;
             while k < items.len() {
-                let name = items[k].0.clone();
                 let had_comma = items[k].1;
+                if k > idx + 1 && !had_comma {
+                    break;
+                }
+                let name = items[k].0.clone();
                 if !name.is_empty() {
                     out.push((ty.clone(), name));
                 }
                 k += 1;
-                if !had_comma {
-                    break;
-                }
             }
         }
         search_start = end;
@@ -4720,13 +4720,16 @@ unsafe fn reconcile_uniform_array_sizes(gles: &mut dyn GLES, program: GLuint) {
 /// Returns false (and leaves the program untouched) if either compilation
 /// failed.
 unsafe fn swap_both_patched_shaders(
-    gles: &GLES,
+    gles: &mut dyn GLES,
     program: GLuint,
     vertex_shader: GLuint,
     fragment_shader: GLuint,
     patched_vertex: &str,
     patched_fragment: &str,
 ) -> bool {
+    const VERTEX_SHADER: GLuint = 0x8B31;
+    const FRAGMENT_SHADER: GLuint = 0x8B30;
+
     let Some(new_vertex) = compile_shader_source(gles, VERTEX_SHADER, patched_vertex) else {
         return false;
     };
@@ -4750,7 +4753,8 @@ unsafe fn swap_both_patched_shaders(
         }
         bk.shader_types.insert(new_vertex, VERTEX_SHADER);
         bk.shader_types.insert(new_fragment, FRAGMENT_SHADER);
-        bk.shader_sources.insert(new_vertex, patched_vertex.to_string());
+        bk.shader_sources
+            .insert(new_vertex, patched_vertex.to_string());
         bk.shader_sources
             .insert(new_fragment, patched_fragment.to_string());
     });
@@ -4879,30 +4883,32 @@ fn merged_struct_body(a: &StructDefinition, b: &StructDefinition) -> Option<Stri
 /// Detect shared struct types used by array uniforms in both stages, unify
 /// their definitions to the member union, and swap in recompiled stages.
 /// Returns true if the program's shaders were replaced.
-unsafe fn reconcile_uniform_struct_definitions(gles: &GLES, program: GLuint) -> bool {
-    let (vertex_shader, fragment_shader) = {
-        let bk = SHADER_BOOKKEEPING.lock().unwrap();
-        match (
-            bk.program_attachments.get(&program).and_then(|list| {
-                list.iter().find(|s| bk.shader_types.get(s) == Some(&VERTEX_SHADER))
-            }),
-            bk.program_attachments.get(&program).and_then(|list| {
-                list.iter().find(|s| bk.shader_types.get(s) == Some(&FRAGMENT_SHADER))
-            }),
-        ) {
-            (Some(v), Some(f)) => (*v, *f),
-            _ => return false,
-        }
-    };
-    let (vertex_source, fragment_source) = {
-        let bk = SHADER_BOOKKEEPING.lock().unwrap();
-        match (
-            bk.shader_sources.get(&vertex_shader).cloned(),
-            bk.shader_sources.get(&fragment_shader).cloned(),
-        ) {
-            (Some(v), Some(f)) => (v, f),
-            _ => return false,
-        }
+unsafe fn reconcile_uniform_struct_definitions(gles: &mut dyn GLES, program: GLuint) -> bool {
+    const VERTEX_SHADER: GLuint = 0x8B31;
+    const FRAGMENT_SHADER: GLuint = 0x8B30;
+
+    let Some((vertex_shader, fragment_shader, vertex_source, fragment_source)) =
+        with_shader_bookkeeping(|bk| {
+            let attached = bk.program_attachments.get(&program)?;
+            let vertex_shader = attached
+                .iter()
+                .find(|shader| bk.shader_types.get(*shader) == Some(&VERTEX_SHADER))
+                .copied()?;
+            let fragment_shader = attached
+                .iter()
+                .find(|shader| bk.shader_types.get(*shader) == Some(&FRAGMENT_SHADER))
+                .copied()?;
+            let vertex_source = bk.shader_sources.get(&vertex_shader)?.clone();
+            let fragment_source = bk.shader_sources.get(&fragment_shader)?.clone();
+            Some((
+                vertex_shader,
+                fragment_shader,
+                vertex_source,
+                fragment_source,
+            ))
+        })
+    else {
+        return false;
     };
     let defines_v = collect_int_defines(&vertex_source);
     let defines_f = collect_int_defines(&fragment_source);
@@ -7778,7 +7784,10 @@ mod varying_declaration_parsing_tests {
 
 #[cfg(test)]
 mod uniform_array_reconciliation_tests {
-    use super::{parse_uniform_array_declarations, rewrite_uniform_array_sizes};
+    use super::{
+        merged_struct_body, parse_struct_definitions, parse_uniform_array_declarations,
+        rewrite_uniform_array_sizes,
+    };
 
     #[test]
     fn parses_array_sizes_and_rewrites_both_stages_to_max() {
@@ -7791,9 +7800,9 @@ mod uniform_array_reconciliation_tests {
         assert_eq!(vd.len(), 1);
         assert_eq!(fd.len(), 1);
         assert_eq!(vd[0].name, "light");
-        assert_eq!(vd[0].size, 4);
+        assert_eq!(vd[0].size, Some(4));
         assert_eq!(fd[0].name, "light");
-        assert_eq!(fd[0].size, 2);
+        assert_eq!(fd[0].size, Some(2));
 
         let fixes = vec![("light".to_string(), 4u32)];
         let patched_vertex = rewrite_uniform_array_sizes(vertex, &vd, &fixes);
@@ -7815,7 +7824,6 @@ mod uniform_array_reconciliation_tests {
         assert!(parse_uniform_array_declarations(&src, &defines).is_empty());
     }
 
-    #[test]
     #[test]
     fn struct_definitions_are_parsed_and_merged() {
         let v = "struct Light { vec4 pos; float r; };\n\

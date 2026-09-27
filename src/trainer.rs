@@ -155,9 +155,14 @@ impl VType {
         value
     }
 
+    fn address_range_is_valid(self, mem: &Mem, addr: u32) -> bool {
+        addr >= mem.null_segment_size()
+            && (addr as u64 + self.size() as u64) <= u32::MAX as u64 + 1
+    }
+
     /// Read the raw bits at `addr` for this type.
     pub fn read_at(self, mem: &Mem, addr: u32) -> Option<u64> {
-        if addr < mem.null_segment_size() {
+        if !self.address_range_is_valid(mem, addr) {
             return None;
         }
         let bytes = mem.get_bytes_fallible(ConstVoidPtr::from_bits(addr), self.size())?;
@@ -167,9 +172,10 @@ impl VType {
 
     /// Write raw bits without falling back to Mem's invalid-address sink.
     pub fn write_at(self, mem: &mut Mem, addr: u32, bits: u64) -> bool {
-        let Some(bytes) = mem.get_bytes_fallible_mut(
-            ConstVoidPtr::from_bits(addr), self.size(),
-        ) else {
+        if !self.address_range_is_valid(mem, addr) {
+            return false;
+        }
+        let Some(bytes) = mem.get_bytes_fallible_mut(ConstVoidPtr::from_bits(addr), self.size()) else {
             return false;
         };
         bytes.copy_from_slice(&bits.to_le_bytes()[..self.size() as usize]);
