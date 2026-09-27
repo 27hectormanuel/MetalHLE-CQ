@@ -1883,17 +1883,19 @@ pub fn class_addMethod(
 /// Class methods live on the metaclass, so we resolve the metaclass first
 /// and then walk its chain looking for the selector.
 pub fn class_getClassMethod(env: &mut crate::Environment, cls: Class, name: SEL) -> ConstVoidPtr {
-    if cls.is_null() {
+    if cls.is_null() || name.is_null() {
         return ConstVoidPtr::null();
     }
     // The metaclass holds the class-method table. `ObjC::read_isa` of a
     // class returns its metaclass.
     let mut curr = crate::objc::ObjC::read_isa(cls, &env.mem);
+    let mut defining = nil;
     while !curr.is_null() {
         if let Some(host_obj) = env.objc.get_host_object(curr) {
             if let Some(class_obj) = host_obj.as_any().downcast_ref::<ClassHostObject>() {
                 if class_obj.methods.contains_key(&name) {
-                    return curr.cast_const().cast();
+                    defining = curr;
+                    break;
                 }
             }
         }
@@ -1903,7 +1905,18 @@ pub fn class_getClassMethod(env: &mut crate::Environment, cls: Class, name: SEL)
         }
         curr = next;
     }
-    ConstVoidPtr::null()
+    if defining.is_null() {
+        return ConstVoidPtr::null();
+    }
+    // Like `class_getInstanceMethod`, hand out the opaque `Method` handle
+    // for the (defining metaclass, selector) pair — NOT the class pointer.
+    // Guests feed the result to `method_getImplementation` /
+    // `method_setImplementation` (the classic swizzling idiom, e.g.
+    // ObjectAL's `SynthesizeSingleton` macro replacing `+sharedInstance`);
+    // a raw class pointer fails to decode as a `Method` handle, so the
+    // swizzle silently no-ops and the guest's "method did not get
+    // swizzled" assertions fire forever.
+    method_handle_for(env, defining, name)
 }
 
 pub fn objc_retain(env: &mut crate::Environment, obj: id) -> id {
