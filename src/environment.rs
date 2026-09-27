@@ -471,6 +471,16 @@ impl Environment {
         // the iPhone list, and using the wrong one rotates the screen 180°.
         let supported_orientations =
             bundle.supported_interface_orientations_for_family(device_family.is_ipad());
+        log!(
+            "Startup orientation: family {:?} (ipad={}); base orientations {:?}; \
+             ~ipad override {:?}; used list {:?}; initial orientation {:?}",
+            device_family,
+            device_family.is_ipad(),
+            bundle.supported_interface_orientations(),
+            bundle.ipad_interface_orientation_override(),
+            supported_orientations,
+            options.initial_orientation
+        );
         let portrait_supported = supported_orientations.contains(&"UIInterfaceOrientationPortrait");
         if options.initial_orientation == window::DeviceOrientation::Portrait && !portrait_supported
         {
@@ -514,6 +524,10 @@ impl Environment {
                 );
             }
         }
+        log!(
+            "Startup orientation resolved to {:?}.",
+            options.initial_orientation
+        );
 
         // Read the executable before constructing the Mach-O image below;
         // this lets us reuse the bytes instead of reading the file twice.

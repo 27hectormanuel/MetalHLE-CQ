@@ -3695,6 +3695,9 @@ fn glLinkProgram(env: &mut Environment, program: GLuint) {
             }
             if ok == 0 {
                 log!("Program {} link failed: {}", program, s);
+                if s.contains("Field numbers of uniform") {
+                    log_uniform_array_declarations(program);
+                }
             }
         }
     });
@@ -4437,20 +4440,57 @@ unsafe fn swap_in_patched_vertex_shader(
 }
 
 /// A `uniform … name[N]` declaration: the uniform's name, the declared
-/// element count, and the byte span of the digits inside the brackets so
-/// the source can be rewritten in place.
+/// element count (None for unsized `name[]`), the raw text found between
+/// the brackets (for diagnostics) and the byte span of the bracket
+/// interior so the source can be rewritten in place.
 struct UniformArrayDecl {
     name: String,
-    size: u32,
+    size: Option<u32>,
+    raw_size: String,
     digits_span: (usize, usize),
+}
+
+/// Collect `#define NAME <integer>` (optionally wrapped in parentheses)
+/// macro definitions so uniform array sizes written through macros can be
+/// resolved to numbers.
+fn collect_int_defines(source: &str) -> std::collections::HashMap<String, u32> {
+    let mut out = std::collections::HashMap::new();
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix('#') else {
+            continue;
+        };
+        let mut tokens = rest.split_whitespace();
+        if tokens.next() != Some("define") {
+            continue;
+        }
+        let Some(name) = tokens.next() else { continue };
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        let Some(value) = tokens.next() else { continue };
+        let value = value.trim_matches(|c| c == '(' || c == ')');
+        if let Ok(n) = value.parse::<u32>() {
+            out.insert(name.to_string(), n);
+        }
+    }
+    out
 }
 
 /// Parse top-level `uniform` declarations that carry an `[N]` array size.
 /// The input must already have comments stripped (see
 /// [strip_glsl_comments]) so byte spans line up with the string being
-/// rewritten. Only the common single-declarator form is handled; exotic
-/// layouts are skipped rather than misparsed.
-fn parse_uniform_array_declarations(source: &str) -> Vec<UniformArrayDecl> {
+/// rewritten. Integer macros from `defines` are resolved; `[]` (unsized)
+/// declarations are reported with `size: None` so the caller can fill in
+/// the other stage's size. Only the common single-declarator form is
+/// handled; exotic layouts are skipped rather than misparsed.
+fn parse_uniform_array_declarations(
+    source: &str,
+    defines: &std::collections::HashMap<String, u32>,
+) -> Vec<UniformArrayDecl> {
     let bytes = source.as_bytes();
     let mut out = Vec::new();
     let mut search_start = 0usize;
@@ -4481,11 +4521,15 @@ fn parse_uniform_array_declarations(source: &str) -> Vec<UniformArrayDecl> {
         };
         let inner = &body[open_bracket + 1..open_bracket + close_rel];
         let trimmed = inner.trim();
-        if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        let Ok(size) = trimmed.parse::<u32>() else {
-            continue;
+        // Sized literally, through an integer macro, or unsized (`[]`).
+        let size = if trimmed.is_empty() {
+            None
+        } else if let Ok(n) = trimmed.parse::<u32>() {
+            Some(n)
+        } else if trimmed.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            defines.get(trimmed).copied()
+        } else {
+            None
         };
         // The declarator's name is the identifier token right before '['.
         let before = body[..open_bracket].trim_end();
@@ -4507,6 +4551,7 @@ fn parse_uniform_array_declarations(source: &str) -> Vec<UniformArrayDecl> {
         out.push(UniformArrayDecl {
             name: name.to_string(),
             size,
+            raw_size: trimmed.to_string(),
             digits_span: (digits_start, digits_end),
         });
     }
@@ -4602,8 +4647,11 @@ unsafe fn reconcile_uniform_array_sizes(gles: &mut dyn GLES, program: GLuint) {
     // being rewritten; dropping them from the patched source is harmless.
     let vertex_stripped = strip_glsl_comments(&vertex_src);
     let fragment_stripped = strip_glsl_comments(&fragment_src);
-    let vertex_uniforms = parse_uniform_array_declarations(&vertex_stripped);
-    let fragment_uniforms = parse_uniform_array_declarations(&fragment_stripped);
+    let vertex_defines = collect_int_defines(&vertex_stripped);
+    let fragment_defines = collect_int_defines(&fragment_stripped);
+    let vertex_uniforms = parse_uniform_array_declarations(&vertex_stripped, &vertex_defines);
+    let fragment_uniforms =
+        parse_uniform_array_declarations(&fragment_stripped, &fragment_defines);
     if vertex_uniforms.is_empty() || fragment_uniforms.is_empty() {
         return;
     }
@@ -4613,8 +4661,12 @@ unsafe fn reconcile_uniform_array_sizes(gles: &mut dyn GLES, program: GLuint) {
             continue;
         }
         if let Some(fd) = fragment_uniforms.iter().find(|fd| fd.name == vd.name) {
-            if fd.size != vd.size {
-                fixes.push((vd.name.clone(), vd.size.max(fd.size)));
+            match (vd.size, fd.size) {
+                (Some(a), Some(b)) if a != b => fixes.push((vd.name.clone(), a.max(b))),
+                // Unsized / unresolvable on one side: adopt the other's size.
+                (Some(a), None) => fixes.push((vd.name.clone(), a)),
+                (None, Some(b)) => fixes.push((vd.name.clone(), b)),
+                _ => {}
             }
         }
     }
@@ -4663,6 +4715,49 @@ unsafe fn reconcile_uniform_array_sizes(gles: &mut dyn GLES, program: GLuint) {
             .map(|(n, size)| format!("{}[{}]", n, size))
             .collect::<Vec<_>>()
             .join(", ")
+    );
+}
+
+/// Dump the `uniform …[N]` declarations parsed from each stage attached to
+/// `program` (name, raw bracket text, resolved size). Diagnostic for
+/// strict-linker uniform mismatches the pre-link reconciliation could not
+/// fix; the next user log then shows exactly what the shaders declare.
+fn log_uniform_array_declarations(program: GLuint) {
+    const VERTEX_SHADER: GLuint = 0x8B31;
+    const FRAGMENT_SHADER: GLuint = 0x8B30;
+    let Some((vertex_src, fragment_src)) = with_shader_bookkeeping(|bk| {
+        let attached = bk.program_attachments.get(&program)?.clone();
+        let mut vertex: Option<String> = None;
+        let mut fragment: Option<String> = None;
+        for shader in attached {
+            match bk.shader_types.get(&shader).copied() {
+                Some(VERTEX_SHADER) => vertex = bk.shader_sources.get(&shader).cloned(),
+                Some(FRAGMENT_SHADER) => fragment = bk.shader_sources.get(&shader).cloned(),
+                _ => {}
+            }
+        }
+        Some((vertex?, fragment?))
+    }) else {
+        return;
+    };
+    let fmt = |src: &str| -> String {
+        let stripped = strip_glsl_comments(src);
+        let defines = collect_int_defines(&stripped);
+        let decls = parse_uniform_array_declarations(&stripped, &defines);
+        if decls.is_empty() {
+            return "<none>".to_string();
+        }
+        decls
+            .iter()
+            .map(|d| format!("{}[{}] as {:?}", d.name, d.raw_size, d.size))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    log!(
+        "Program {} uniform array declarations - vertex: {}; fragment: {}",
+        program,
+        fmt(&vertex_src),
+        fmt(&fragment_src)
     );
 }
 
@@ -7410,8 +7505,9 @@ mod uniform_array_reconciliation_tests {
         let vertex = "uniform vec4 light[4];\nuniform float pad;\nvoid main() {}\n";
         let fragment =
             "precision mediump float;\nuniform highp vec4 light[2];\nvoid main() {}\n";
-        let vd = parse_uniform_array_declarations(vertex);
-        let fd = parse_uniform_array_declarations(fragment);
+        let defines = std::collections::HashMap::new();
+        let vd = parse_uniform_array_declarations(vertex, &defines);
+        let fd = parse_uniform_array_declarations(fragment, &defines);
         assert_eq!(vd.len(), 1);
         assert_eq!(fd.len(), 1);
         assert_eq!(vd[0].name, "light");
@@ -7435,6 +7531,26 @@ mod uniform_array_reconciliation_tests {
                    /* uniform vec4 light[3]; */\nvoid main() {}\n";
         // Callers strip comments before parsing (as the link fix-up does).
         let src = super::strip_glsl_comments(raw);
-        assert!(parse_uniform_array_declarations(&src).is_empty());
+        let defines = std::collections::HashMap::new();
+        assert!(parse_uniform_array_declarations(&src, &defines).is_empty());
+    }
+
+    #[test]
+    fn macro_sized_and_unsized_arrays_are_resolved() {
+        let vertex = "#define MAX_LIGHTS 4\nuniform vec4 light[MAX_LIGHTS];\n\
+                      void main() {}\n";
+        let fragment = "uniform vec4 light[];\nvoid main() {}\n";
+        let vdefs = super::collect_int_defines(vertex);
+        let fdefs = std::collections::HashMap::new();
+        let vd = parse_uniform_array_declarations(vertex, &vdefs);
+        let fd = parse_uniform_array_declarations(fragment, &fdefs);
+        assert_eq!(vd.len(), 1);
+        assert_eq!(vd[0].size, Some(4));
+        assert_eq!(fd.len(), 1);
+        assert_eq!(fd[0].size, None);
+        // The unsized side adopts the resolved size of the other stage.
+        let fixes = vec![("light".to_string(), 4u32)];
+        let patched = rewrite_uniform_array_sizes(fragment, &fd, &fixes);
+        assert!(patched.contains("light[4]"), "{patched}");
     }
 }

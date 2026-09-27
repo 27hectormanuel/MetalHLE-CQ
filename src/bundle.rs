@@ -433,25 +433,37 @@ impl Bundle {
     /// iPhone, which on iPad presents as the screen rotated by 180°.
     pub fn supported_interface_orientations_for_family(&self, ipad: bool) -> Vec<&str> {
         if ipad {
-            for key in [
-                "UISupportedInterfaceOrientations~ipad",
-                "UIInterfaceOrientation~ipad",
-            ] {
-                if let Some(v) = self.plist.get(key) {
-                    if let Some(arr) = v.as_array() {
-                        return arr.iter().filter_map(|o| o.as_string()).collect();
-                    }
-                    if let Some(s) = v.as_string() {
-                        return s
-                            .split(',')
-                            .map(|p| p.trim())
-                            .filter(|p| !p.is_empty())
-                            .collect();
-                    }
-                }
+            let override_list = self.ipad_interface_orientation_override();
+            if !override_list.is_empty() {
+                return override_list;
             }
         }
         self.supported_interface_orientations()
+    }
+
+    /// The raw `~ipad` orientation override list
+    /// (`UISupportedInterfaceOrientations~ipad` /
+    /// `UIInterfaceOrientation~ipad`); empty when the bundle carries no
+    /// override. Exposed for startup diagnostics.
+    pub fn ipad_interface_orientation_override(&self) -> Vec<&str> {
+        for key in [
+            "UISupportedInterfaceOrientations~ipad",
+            "UIInterfaceOrientation~ipad",
+        ] {
+            if let Some(v) = self.plist.get(key) {
+                if let Some(arr) = v.as_array() {
+                    return arr.iter().filter_map(|o| o.as_string()).collect();
+                }
+                if let Some(s) = v.as_string() {
+                    return s
+                        .split(',')
+                        .map(|p| p.trim())
+                        .filter(|p| !p.is_empty())
+                        .collect();
+                }
+            }
+        }
+        Vec::new()
     }
 
     pub fn supported_interface_orientations(&self) -> Vec<&str> {
