@@ -17,6 +17,8 @@ Changes are categorised as follows:
 
 Compatibility:
 
+- Android soft-keyboard requests from UIKit responders now reach the host IME after the editor view is attached; private `UIKeyboard` activation is bridged to SDL text input, and repeated focus requests retry the keyboard. This fixes text entry in Geometry Dash 2.11 and other apps.
+
 - Gangstar Rio now reports `UIScreen.bounds`, `nativeBounds`, and `currentMode.size` in landscape when launched in landscape, keeping its EAGL scene from rendering in a small clipped region on iPhone 5/5c.
 
 - ObjectAL-based games (e.g. Superman HD) now find their bundled sound effects: when every strict `NSBundle pathForResource:` lookup misses, a case-insensitive scan of the whole bundle is tried as a last resort, so `+[OALTools urlForPath:]` no longer reports "Could not find full path of file …" for effects stored in bundle subdirectories and `OALSimpleAudio` preloads them instead of spamming OAL errors. Separately, `class_getClassMethod` now returns a proper opaque `Method` handle (matching `class_getInstanceMethod`) instead of the raw class pointer; guests feed that handle to `method_getImplementation`/`method_setImplementation`, so class-method swizzling now actually takes effect — ObjectAL's `SynthesizeSingleton` macro replaces `+sharedInstance` that way, and previously the silently-failed swizzle flooded the log with "method did not get swizzled" NSAssert warnings on every call. (@KlugKlugTG)

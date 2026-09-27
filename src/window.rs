@@ -2458,6 +2458,24 @@ impl Window {
         }
     }
 
+    pub fn is_text_input_active(&self) -> bool {
+        if !self.on_main_stack {
+            log!("Warning: is_text_input_active called off main stack, returning false");
+            return false;
+        }
+        unsafe { sdl2_sys::SDL_IsTextInputActive() == sdl2_sys::SDL_bool::SDL_TRUE }
+    }
+
+    pub fn is_screen_keyboard_shown(&self) -> bool {
+        if !self.on_main_stack {
+            log!("Warning: is_screen_keyboard_shown called off main stack, returning false");
+            return false;
+        }
+        unsafe {
+            sdl2_sys::SDL_IsScreenKeyboardShown(self.window.raw()) == sdl2_sys::SDL_bool::SDL_TRUE
+        }
+    }
+
     pub fn on_main_stack(&self) -> bool {
         self.on_main_stack
     }

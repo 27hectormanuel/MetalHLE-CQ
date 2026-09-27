@@ -240,7 +240,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (bool)becomeFirstResponder {
     if !env.objc.borrow::<UITextViewHostObject>(this).editable { return false; }
-    if env.framework_state.uikit.ui_responder.first_responder == this { return true; }
+    if env.framework_state.uikit.ui_responder.first_responder == this {
+        crate::frameworks::uikit::ui_keyboard::start_text_input(env);
+        return true;
+    }
 
     let delegate: id = msg![env; this delegate];
     let delegate_alive = if delegate != nil {
@@ -259,7 +262,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     crate::frameworks::uikit::ui_keyboard::post_keyboard_notifications(env, true);
     env.framework_state.uikit.ui_responder.first_responder = this;
-    env.on_parent_stack_in_coroutine(|window, _| window.start_text_input());
+    crate::frameworks::uikit::ui_keyboard::start_text_input(env);
 
     let name = get_static_str(env, "UITextViewTextDidBeginEditingNotification");
     let center: id = msg_class![env; NSNotificationCenter defaultCenter];
@@ -289,7 +292,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     crate::frameworks::uikit::ui_keyboard::post_keyboard_notifications(env, false);
     env.framework_state.uikit.ui_responder.first_responder = nil;
-    env.on_parent_stack_in_coroutine(|window, _| window.stop_text_input());
+    crate::frameworks::uikit::ui_keyboard::stop_text_input(env);
 
     let name = get_static_str(env, "UITextViewTextDidEndEditingNotification");
     let center: id = msg_class![env; NSNotificationCenter defaultCenter];

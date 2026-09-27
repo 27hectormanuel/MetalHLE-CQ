@@ -405,7 +405,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (bool)canResignFirstResponder { true }
 
 - (bool)becomeFirstResponder {
-    if env.objc.borrow::<UITextFieldHostObject>(this).editing { return true; }
+    if env.objc.borrow::<UITextFieldHostObject>(this).editing {
+        crate::frameworks::uikit::ui_keyboard::start_text_input(env);
+        return true;
+    }
 
     let delegate: id = env.objc.borrow::<UITextFieldHostObject>(this).delegate;
     let mut delegate_alive = false;
@@ -436,7 +439,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let _: () = msg![env; center postNotificationName:name object:this userInfo:nil];
 
     env.framework_state.uikit.ui_responder.first_responder = this;
-    env.on_parent_stack_in_coroutine(|window, _| window.start_text_input());
+    crate::frameworks::uikit::ui_keyboard::start_text_input(env);
 
     let name = ns_string::get_static_str(env, UIKeyboardDidShowNotification);
     let _: () = msg![env; center postNotificationName:name object:this userInfo:nil];
@@ -473,7 +476,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let _: () = msg![env; center postNotificationName:name object:this userInfo:nil];
 
     env.framework_state.uikit.ui_responder.first_responder = nil;
-    env.on_parent_stack_in_coroutine(|window, _| window.stop_text_input());
+    crate::frameworks::uikit::ui_keyboard::stop_text_input(env);
 
     let name = ns_string::get_static_str(env, UIKeyboardDidHideNotification);
     let _: () = msg![env; center postNotificationName:name object:this userInfo:nil];

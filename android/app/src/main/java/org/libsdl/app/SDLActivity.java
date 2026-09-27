@@ -1298,12 +1298,22 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
             }
 
             mTextEdit.setVisibility(View.VISIBLE);
-            mTextEdit.requestFocus();
-
-            InputMethodManager imm = (InputMethodManager) SDL.getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
-            imm.showSoftInput(mTextEdit, 0);
-
+            final DummyEdit textEdit = mTextEdit;
             mScreenKeyboardShown = true;
+
+            textEdit.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (mTextEdit != textEdit || !mScreenKeyboardShown || textEdit.getVisibility() != View.VISIBLE) {
+                        return;
+                    }
+                    textEdit.requestFocus();
+                    InputMethodManager imm = (InputMethodManager) textEdit.getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
+                    if (imm != null) {
+                        imm.showSoftInput(textEdit, InputMethodManager.SHOW_IMPLICIT);
+                    }
+                }
+            });
         }
     }
 
