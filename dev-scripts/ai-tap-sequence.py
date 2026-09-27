@@ -6,14 +6,17 @@ coordinates relative to the emulator window, captures screenshots and checks
 that frames keep being presented and the process stays alive.
 
 Usage:
-    python dev-scripts/ai-tap-sequence.py APP [--exe PATH] [--out DIR]
-        [--step "WAIT:X,Y"]... [--final-wait SECONDS] [-- extra emulator args]
+    python dev-scripts/ai-tap-sequence.py APP [--exe PATH] [--cwd DIR] [--out DIR]
+        [--step "WAIT:X,Y"]... [--final-wait SECONDS]
+        [--require-touch-delivery] [-- extra emulator args]
 
 Each --step waits WAIT seconds, takes a screenshot, then taps at (X, Y),
 where X and Y are fractions (0..1) of the window's client area. Use "-" for
-X,Y to take a screenshot without tapping.
+X,Y to take a screenshot without tapping. `--require-touch-delivery` requires
+UIKit to report normal begin/end events for each tap, up to its 12-event log cap.
 
-Windows requires Pillow and pywin32. Linux/X11 requires xdotool, xwininfo, and ImageMagick's import.
+Windows requires Pillow and pywin32. Linux/X11 requires xdotool, xwininfo,
+and ImageMagick's import.
 """
 
 import argparse
@@ -30,7 +33,7 @@ if sys.platform == "win32":
     import win32gui
     from PIL import ImageGrab
 
-FPS_RE = re.compile(r"FPS: ([0-9.]+)")
+FPS_RE = re.compile(r"EAGLContext .* FPS: ([0-9.]+)")
 
 
 def find_window(pid_hint_title="touchHLE"):
@@ -99,6 +102,15 @@ def screenshot(hwnd, path):
         )
 
 
+def wait_for_process(proc, seconds):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return False
+        time.sleep(min(0.25, deadline - time.monotonic()))
+    return proc.poll() is None
+
+
 def main():
     argv = sys.argv[1:]
     extra = []
@@ -107,27 +119,43 @@ def main():
         argv, extra = argv[:i], argv[i + 1:]
     p = argparse.ArgumentParser()
     p.add_argument("app")
-    default_exe = (
-        "target/release/touchHLE.exe"
-        if sys.platform == "win32"
-        else "target/release/touchHLE"
+    repo_root = Path(__file__).resolve().parent.parent
+    default_exe = repo_root / "target" / "release" / (
+        "touchHLE.exe" if sys.platform == "win32" else "touchHLE"
     )
-    p.add_argument("--exe", default=str(Path(default_exe).resolve()))
+    p.add_argument("--exe", default=str(default_exe))
+    p.add_argument("--cwd", default=str(repo_root))
     p.add_argument("--out", default="tap-test-out")
     p.add_argument("--step", action="append", default=[])
     p.add_argument("--final-wait", type=float, default=10.0)
+    p.add_argument("--require-touch-delivery", action="store_true")
     args = p.parse_args(argv)
     if sys.platform not in ("win32", "linux"):
         p.error("This script supports Windows and Linux/X11 hosts.")
 
-    out = Path(args.out)
+    out = Path(args.out).expanduser().resolve()
+    cwd = Path(args.cwd).expanduser().resolve()
+    exe = Path(args.exe).expanduser().resolve()
+    app = Path(args.app).expanduser().resolve()
+    if not app.exists():
+        p.error(f"app bundle or IPA does not exist: {app}")
+    if not cwd.is_dir():
+        p.error(f"working directory does not exist: {cwd}")
+    if not exe.is_file():
+        p.error(f"emulator executable does not exist: {exe}")
     out.mkdir(parents=True, exist_ok=True)
     log_path = out / "emulator.log"
     log = open(log_path, "w", encoding="utf-8", errors="replace")
-    proc = subprocess.Popen(
-        [args.exe, "--print-fps", *extra, args.app],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    )
+    try:
+        proc = subprocess.Popen(
+            [str(exe), "--print-fps", *extra, str(app)],
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    except OSError as error:
+        log.close()
+        p.error(f"could not start emulator {exe}: {error}")
     fps_samples = []
 
     start = time.time()
@@ -141,23 +169,36 @@ def main():
             if m:
                 fps_samples.append((time.time(), float(m.group(1))))
 
-    threading.Thread(target=reader, daemon=True).start()
+    reader_thread = threading.Thread(target=reader, daemon=True)
+    reader_thread.start()
 
     hwnd = None
     for _ in range(60):
         hwnd = find_window()
-        if hwnd:
+        if hwnd or proc.poll() is not None:
             break
         time.sleep(0.5)
     if not hwnd:
-        print("FAIL: emulator window never appeared")
-        proc.kill()
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        reader_thread.join()
+        log.close()
+        print(
+            f"FAIL: emulator window never appeared (exit code {proc.returncode}); "
+            f"log: {log_path}"
+        )
+        for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-25:]:
+            print(line)
         return 1
 
     ok = True
     for n, step in enumerate(args.step):
         wait, _, pos = step.partition(":")
-        time.sleep(float(wait))
+        if not wait_for_process(proc, float(wait)):
+            print(f"FAIL: emulator exited during step {n} (code {proc.returncode})")
+            ok = False
+            break
         if proc.poll() is not None:
             print(f"FAIL: emulator exited (code {proc.returncode}) before step {n}")
             ok = False
@@ -173,19 +214,39 @@ def main():
             print(f"step {n}: screenshot {shot.name}")
 
     if ok:
-        time.sleep(args.final_wait)
-        screenshot(hwnd, out / "final.png")
-        alive = proc.poll() is None
-        tail = [f for t, f in fps_samples[-5:]]
-        print(f"FPS reports: {len(fps_samples)}, last: {tail}")
-        if not alive:
-            print(f"FAIL: emulator exited with code {proc.returncode}")
+        if not wait_for_process(proc, args.final_wait):
+            print(f"FAIL: emulator exited during final wait (code {proc.returncode})")
             ok = False
-        elif len(fps_samples) < 3 or all(f == 0 for f in tail):
-            print("FAIL: frames are not being presented")
-            ok = False
+        else:
+            screenshot(hwnd, out / "final.png")
+            alive = proc.poll() is None
+            tail = [f for t, f in fps_samples[-5:]]
+            print(f"EAGL FPS reports: {len(fps_samples)}, last: {tail}")
+            if not alive:
+                print(f"FAIL: emulator exited with code {proc.returncode}")
+                ok = False
+            elif len(fps_samples) < 3 or all(f == 0 for f in tail):
+                print("FAIL: frames are not being presented")
+                ok = False
     if proc.poll() is None:
         proc.kill()
+    proc.wait()
+    reader_thread.join()
+    log.close()
+    if args.require_touch_delivery:
+        requested = sum(step.partition(":")[2] != "-" for step in args.step)
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+        delivered = log_text.count("TOUCH-DIAG #")
+        ended = log_text.count("TOUCH-END #")
+        required = min(requested, 12)
+        if requested == 0 or delivered < required or ended < required:
+            print(
+                f"FAIL: requested {requested} tap(s); UIKit saw {delivered} begin(s) "
+                f"and {ended} end(s) (required {required})"
+            )
+            ok = False
+        else:
+            print(f"Touch delivery: {delivered} begin(s), {ended} end(s)")
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 
