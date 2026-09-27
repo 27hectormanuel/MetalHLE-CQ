@@ -28,6 +28,9 @@ The titles below have been tested with HyperHLE-Fork and are known to run. Compa
 - Scarface
 - Zombie Safari
 - Real Racing 1
+- Silent Ops
+- Need For Speed: Most Wanted (2012)
+- And more games
 
 ## Build and documentation
 
