@@ -1,90 +1,48 @@
 # HyperHLE-Fork
 
-**HyperHLE-Fork** (user-facing name: **HyperHLE**) is an independent, AI-assisted fork of the [touchHLE](https://github.com/hikari_no_yume/touchHLE) project — a high-level emulator (HLE) for early iPhone OS apps. This fork focuses on faster iteration, better mobile support, and broader app compatibility.
+**HyperHLE-Fork** is a community-maintained fork of [HyperHLE](https://github.com/HyperHLE/HyperHLE), itself based on [touchHLE](https://github.com/touchHLE/touchHLE). The user-facing name of this project is **HyperHLE**.
 
----
+HyperHLE is a high-level emulator for early iPhone OS apps. It reimplements selected iOS frameworks on the host, allowing compatible apps to run without booting iOS. This fork focuses on Android/mobile usability, fullscreen and orientation handling, graphics compatibility, and app-specific fixes. It is not an official Apple product.
 
-## About This Fork
-* **Clean Codebase:** Developed independently without copying code from touchHLE's GerritHub.
-* **AI-Assisted Development:** This fork utilizes AI tools and assistance to accelerate development and implement features.
-* **Completely Independent:** HyperHLE-Fork is a standalone project. It is **not** supported, endorsed, or maintained by the original touchHLE developers.
-* **Installable Over Old Versions:** Android builds use an auto-incrementing `versionCode` (derived from git tags/history), so new APKs can be installed directly over previously installed builds without uninstalling first.
-* **CI Releases:** Every push to `trunk` runs the [Build HyperHLE workflow](.github/workflows/HyperHLE_release.yml) and produces artifacts for Windows, macOS, Linux and Android; tagged builds can be published as GitHub releases.
+The repository does not distribute commercial apps or iOS firmware. Put an app bundle (`.app`) or IPA (`.ipa`) that you are entitled to use in `touchHLE_apps/`; it will appear in the app picker.
 
----
+## Platforms and features
 
-## Key Improvements Over Upstream
-* Automatic, always-installable Android builds (fixed versioning & signing).
-* GPU/GLES compatibility work: shader translation fixes, texture format handling, EAGL/Core Animation composition fixes against black screens.
-* Additional implemented iPhone OS framework APIs to get more real apps running.
+- Builds for Android, Windows, macOS, and Linux.
+- Virtual iPhone and iPad device profiles.
+- Android touch input and fullscreen/orientation handling.
+- Ongoing GLES, EAGL, Core Animation, audio, and iOS framework compatibility work.
+- Download build artifacts from the [HyperHLE GitHub Actions workflow](https://github.com/KlugKlugTG/HyperHLE-Fork/actions/workflows/HyperHLE_release.yml).
 
----
+## Newly tested and working games
 
-## Building
+The titles below have been tested with HyperHLE-Fork and are known to run. Compatibility may still vary with the app version, virtual device profile, host GPU/driver, and settings; this list does not guarantee that every feature or a full playthrough works.
+
+- N.O.V.A. 3
+- Gangstar Vegas
+- Geometry Dash (2.11 and 1.0)
+- Terraria (1.0)
+- Modern Combat 3 (1.5.0)
+- Asphalt 7
+- Turbo Dismount
+- Scarface
+- Zombie Safari
+- Real Racing 1
+
+## Build and documentation
+
+Build and run a desktop version with Cargo:
 
 ```sh
 cargo run --release -- path/to/app.app
 ```
 
-For Android, see `android/` and the workflow (`.github/workflows/HyperHLE_release.yml`) for the exact build steps used in CI.
-
-## Documentation
-
-* `docs/` — architecture notes and supported feature matrix.
-* `CHANGELOG.md` — notable changes from release to release.
-
----
-
-## Statement on Upstream Developers (hikari_no_yume/ciciplusplus) & Community Policy
-
-Previously, there was a major misunderstanding regarding the upstream developers' stance toward derivative projects. Following a direct and constructive dialogue between **TimofeyLednev** and **hikari_no_yume**, the true context behind their actions has been clarified.
-
-The upstream developers' aggressive measures against certain forks were not a random crusade against the open-source spirit or the MPL 2.0 license, but a targeted response to a proven case of **source code theft** from touchHLE's GerritHub by a specific individual. 
-
-To ensure complete transparency and maintain a clean open-source ecosystem, the HyperHLE team wishes to state the following:
-* **No Code Theft:** HyperHLE is built entirely through independent development methods. We strictly respect the original work and comply fully with the **Mozilla Public License 2.0 (MPL 2.0)**.
-* **Malicious Actor Removed:** The individual responsible for the code theft discovered by hikari_no_yume was completely removed and banned from the HyperHLE repository earlier this year (around April/May). We do not tolerate or support code plagiarism under any circumstances.
-* **Communication Lines Open:** TimofeyLednev has established direct contact with hikari_no_yume and shared the necessary information to bridge the gap between the actual creator of the HyperHLE fork and the upstream team, ensuring any future concerns can be resolved through proper discussion.
-
-> ⚠️ **IMPORTANT WARNING:**
-> Despite the ongoing dialogue to resolve these past misunderstandings, please remember that the official touchHLE Discord server maintains a strict local policy. **DO NOT mention any forks there**, as discussing them will still result in an immediate, permanent ban.
-
-Our team remains committed to clean code compliance and transparency. We look forward to a peaceful, parallel existence where both projects can focus on pushing early iOS emulation forward.
-
-### Clarification Regarding Sheva
-We would also like to address the developer **Sheva**, who contributed to this development. Sheva was banned by the upstream community in the summer of 2024 for unrelated reasons. If the original developers are associating him with Neo-Nazism because of a brief 2-week joke/experimental fork called *naziHLE* created in early 2024, we want to clarify that this is a baseless assumption and he is not a Nazi. 
-
----
-
-### Credits & Context
-
-This text was written by **TimofeyLednev** (also known on Discord by the Russian alias **"хайкуос шотает"**). 
-
-Timofey was banned from the official touchHLE server in April 2026 by ciciplusplus himself due to an accidental pull request, and was never unbanned. Alongside him, **Nekono** (also known as **j92580498-max**), the actual creator of the HyperHLE fork, was also banned at the same time.
-
-Thank you for reading and understanding the situation.
-
----
+For Android build steps, see the `android/` directory and the [CI workflow](https://github.com/KlugKlugTG/HyperHLE-Fork/actions/workflows/HyperHLE_release.yml). Command-line options are documented in [`OPTIONS_HELP.txt`](OPTIONS_HELP.txt); notable compatibility changes are tracked in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Community
 
-Join the [HyperHLE Discord server](discord.gg/ZpEkAV47H9) to discuss the project and get involved.
+Join the [HyperHLE Discord server](https://discord.gg/ZpEkAV47H9) to discuss the project and contribute.
 
----
+## Credits and license
 
-## Thanks
-
-We stand on the shoulders of giants. Even despite our past differences and the strict boundaries between our communities, we still acknowledge the foundational work done by the creators. Thank you to:
-
-* **The original touchHLE project contributors** (including **hikari_no_yume/ciciplusplus**), who designed the codebase, frameworks, and architecture that made early iOS emulation a reality.
-* Everyone who has contributed to the original project or supported its contributors financially.
-* The authors of and contributors to the many libraries used by this ecosystem: [dynarmic](https://github.com/merryhime/dynarmic), [rust-macho](https://github.com/flier/rust-macho), [SDL](https://libsdl.org/), [rust-sdl2](https://github.com/Rust-SDL2/rust-sdl2), [stb\_image](https://github.com/nothings/stb), Imagination Technologies' [PVRTC decompressor](https://github.com/powervr-graphics/Native_SDK/blob/master/framework/PVRCore/texture/PVRTDecompress.cpp), [openal-soft](https://github.com/kcat/openal-soft), [hound](https://github.com/ruuda/hound), [caf](https://github.com/rustaudio/caf), [Symphonia](https://github.com/pdeljanov/Symphonia), [RustType](https://gitlab.redox-os.org/redox-os/rusttype), [the Liberation fonts](https://github.com/liberationfonts/liberation-fonts), [the Noto CJK fonts](https://github.com/googlefonts/noto-cjk), [rust-plist](https://github.com/ebarnard/rust-plist), [nibarchive](https://github.com/michaelwright235/nibarchive), [quick-xml](https://github.com/tafia/quick-xml), [gl-rs](https://github.com/brendanzab/gl-rs), [cargo-license](https://github.com/onur/cargo-license), [cc-rs](https://github.com/rust-lang/cc-rs), [cmake-rs](https://github.com/rust-lang/cmake-rs), [cargo-ndk](https://github.com/bbqsrc/cargo-ndk), [cargo-ndk-android-gradle](https://github.com/willir/cargo-ndk-android-gradle), [md-5 and sha1](https://github.com/RustCrypto/hashes), [yore](https://github.com/bonega/yore), [encoding_rs](https://github.com/hsivonen/encoding_rs), [corosensei](https://github.com/Amanieu/corosensei) and the Rust standard library.
-* The Skyline emulator project (RIP), for writing the file management workaround for newer Android versions.
-* The [Rust project](https://www.rust-lang.org/) generally.
-* The various people out there who've documented the iPhone OS platform, officially or otherwise.
-* The iOS hacking/jailbreaking community.
-* The Free Software Foundation, for making libgcc and libstdc++ copyleft.
-* The National Security Agency of the United States of America, for [Ghidra](https://ghidra-sre.org/).
-* [GerritForge](http://www.gerritforge.com/) for providing free Gerrit hosting.
-* The many contributors to [Gerrit](https://www.gerritcodereview.com/); and all friends who took an interest in the project.
-* Developers of early iPhone OS apps and Apple/NeXT for creating such fantastic platforms.
+HyperHLE-Fork carries forward work from HyperHLE and touchHLE contributors and uses open-source libraries. It is licensed under the [Mozilla Public License 2.0](LICENSE); see the individual projects for their respective notices and licenses.
