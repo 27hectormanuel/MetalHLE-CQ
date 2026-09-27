@@ -254,6 +254,17 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
 
     let app_id = bundle.bundle_identifier();
 
+    // Gangstar Rio is landscape-only. Keep UIScreen's point and pixel axes
+    // aligned with the active orientation; portrait axes leave its EAGL scene
+    // occupying only a small portion of the display.
+    if app_id == "com.gameloft.gangstar3"
+        && std::env::var_os("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS").is_none()
+    {
+        unsafe {
+            std::env::set_var("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS", "1");
+        }
+    }
+
     // ULTRAHLE_MINIONJUMP_SCREEN_BEGIN
     // Minion Jump / SheepEscape needs the iPad landscape identity/profile.
     unsafe {

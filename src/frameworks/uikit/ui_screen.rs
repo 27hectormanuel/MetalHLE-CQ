@@ -28,20 +28,29 @@ fn screen_pixel_size_for_current_orientation(env: &mut crate::Environment) -> (C
 }
 
 fn screen_size_for_current_orientation(env: &mut crate::Environment) -> (u32, u32) {
-    let (portrait_width, portrait_height) = env.window().device_family().portrait_size();
+    let portrait_size = env.window().device_family().portrait_size();
+    let orientation = env.window().current_rotation();
+    let landscape_bounds = crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS");
+    screen_size_for_orientation(portrait_size, orientation, landscape_bounds)
+}
 
-    if crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS") {
-        let is_landscape = !matches!(
-            env.window().current_rotation(),
-            crate::window::DeviceOrientation::Portrait
-        );
-
-        if is_landscape {
-            return (portrait_height, portrait_width);
-        }
+fn screen_size_for_orientation(
+    portrait_size: (u32, u32),
+    orientation: crate::window::DeviceOrientation,
+    landscape_bounds: bool,
+) -> (u32, u32) {
+    let (portrait_width, portrait_height) = portrait_size;
+    if landscape_bounds
+        && matches!(
+            orientation,
+            crate::window::DeviceOrientation::LandscapeLeft
+                | crate::window::DeviceOrientation::LandscapeRight
+        )
+    {
+        (portrait_height, portrait_width)
+    } else {
+        (portrait_width, portrait_height)
     }
-
-    (portrait_width, portrait_height)
 }
 
 /// Per Apple documentation for `-setBrightness:`, values are clamped to the
@@ -267,3 +276,40 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+
+#[cfg(test)]
+mod tests {
+    use super::screen_size_for_orientation;
+    use crate::window::{DeviceFamily, DeviceOrientation};
+
+    #[test]
+    fn iphone_5_screen_bounds_follow_landscape_orientation() {
+        for device_family in [DeviceFamily::iPhone5, DeviceFamily::iPhone5c] {
+            let portrait_size = device_family.portrait_size();
+            assert_eq!(
+                screen_size_for_orientation(portrait_size, DeviceOrientation::LandscapeLeft, true,),
+                (568, 320)
+            );
+            assert_eq!(
+                screen_size_for_orientation(portrait_size, DeviceOrientation::LandscapeRight, true,),
+                (568, 320)
+            );
+            assert_eq!(
+                screen_size_for_orientation(portrait_size, DeviceOrientation::Portrait, true,),
+                (320, 568)
+            );
+            assert_eq!(
+                screen_size_for_orientation(
+                    portrait_size,
+                    DeviceOrientation::PortraitUpsideDown,
+                    true,
+                ),
+                (320, 568)
+            );
+            assert_eq!(
+                screen_size_for_orientation(portrait_size, DeviceOrientation::LandscapeLeft, false,),
+                (320, 568)
+            );
+        }
+    }
+}
