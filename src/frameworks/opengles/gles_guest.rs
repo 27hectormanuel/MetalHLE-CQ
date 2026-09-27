@@ -3661,6 +3661,10 @@ fn glLinkProgram(env: &mut Environment, program: GLuint) {
             // Gangstar Rio trips this with its `light` array. Rewrite both
             // stages to the max size before anything else touches them.
             reconcile_uniform_array_sizes(gles, program);
+            // Strict linkers also compare *struct member lists* of uniforms
+            // shared between stages ("Field numbers of uniform 'X' differ…");
+            // unify differing struct definitions to their member union.
+            reconcile_uniform_struct_definitions(gles, program);
             // Strict linkers (ANGLE) reject programs whose fragment shader
             // declares varyings the vertex shader doesn't (legal-but-undefined
             // on real iPhone-era hardware). Patch the vertex shader first so
@@ -4447,6 +4451,8 @@ struct UniformArrayDecl {
     name: String,
     size: Option<u32>,
     raw_size: String,
+    /// Type token preceding the name (e.g. `vec4`, or a user struct name).
+    ty: String,
     digits_span: (usize, usize),
 }
 
@@ -4546,12 +4552,20 @@ fn parse_uniform_array_declarations(
         if name.is_empty() || name.bytes().next().map_or(true, |b| b.is_ascii_digit()) {
             continue;
         }
+        // The type token is the last whitespace-separated token before the
+        // name (precision qualifiers sit further left).
+        let ty = before[..name_start]
+            .split_whitespace()
+            .last()
+            .unwrap_or("")
+            .to_string();
         let digits_start = kw_end + open_bracket + 1;
         let digits_end = kw_end + open_bracket + close_rel;
         out.push(UniformArrayDecl {
             name: name.to_string(),
             size,
             raw_size: trimmed.to_string(),
+            ty,
             digits_span: (digits_start, digits_end),
         });
     }
@@ -4677,13 +4691,48 @@ unsafe fn reconcile_uniform_array_sizes(gles: &mut dyn GLES, program: GLuint) {
     let patched_vertex = rewrite_uniform_array_sizes(&vertex_stripped, &vertex_uniforms, &fixes);
     let patched_fragment =
         rewrite_uniform_array_sizes(&fragment_stripped, &fragment_uniforms, &fixes);
-    let Some(new_vertex) = compile_shader_source(gles, VERTEX_SHADER, &patched_vertex) else {
+    if !swap_both_patched_shaders(
+        gles,
+        program,
+        vertex_shader,
+        fragment_shader,
+        &patched_vertex,
+        &patched_fragment,
+    ) {
         return;
+    }
+    log!(
+        "Program {}: reconciled {} uniform array size difference(s) ({}) \\\
+         between vertex and fragment shaders so strict linkers accept the \\\
+         program",
+        program,
+        fixes.len(),
+        fixes
+            .iter()
+            .map(|(n, size)| format!("{}[{}]", n, size))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+}
+
+/// Compile `patched_vertex`/`patched_fragment` and replace the stage shaders
+/// attached to `program` with the new objects, updating all bookkeeping.
+/// Returns false (and leaves the program untouched) if either compilation
+/// failed.
+unsafe fn swap_both_patched_shaders(
+    gles: &GLES,
+    program: GLuint,
+    vertex_shader: GLuint,
+    fragment_shader: GLuint,
+    patched_vertex: &str,
+    patched_fragment: &str,
+) -> bool {
+    let Some(new_vertex) = compile_shader_source(gles, VERTEX_SHADER, patched_vertex) else {
+        return false;
     };
-    let Some(new_fragment) = compile_shader_source(gles, FRAGMENT_SHADER, &patched_fragment)
-    else {
+    let Some(new_fragment) = compile_shader_source(gles, FRAGMENT_SHADER, patched_fragment) else {
         gles.DeleteShader(new_vertex);
-        return;
+        return false;
     };
     gles.DetachShader(program, vertex_shader);
     gles.AttachShader(program, new_vertex);
@@ -4701,21 +4750,252 @@ unsafe fn reconcile_uniform_array_sizes(gles: &mut dyn GLES, program: GLuint) {
         }
         bk.shader_types.insert(new_vertex, VERTEX_SHADER);
         bk.shader_types.insert(new_fragment, FRAGMENT_SHADER);
-        bk.shader_sources.insert(new_vertex, patched_vertex);
-        bk.shader_sources.insert(new_fragment, patched_fragment);
+        bk.shader_sources.insert(new_vertex, patched_vertex.to_string());
+        bk.shader_sources
+            .insert(new_fragment, patched_fragment.to_string());
     });
-    log!(
-        "Program {}: reconciled {} uniform array size difference(s) ({}) \\\
-         between vertex and fragment shaders so strict linkers accept the \\\
-         program",
-        program,
-        fixes.len(),
-        fixes
+    true
+}
+
+/// Types that can never be user-defined structs.
+const GLSL_BUILTIN_TYPES: &[&str] = &[
+    "float",
+    "int",
+    "bool",
+    "vec2",
+    "vec3",
+    "vec4",
+    "ivec2",
+    "ivec3",
+    "ivec4",
+    "bvec2",
+    "bvec3",
+    "bvec4",
+    "mat2",
+    "mat3",
+    "mat4",
+    "sampler2D",
+    "samplerCube",
+    "samplerExternalOES",
+    "highp",
+    "mediump",
+    "lowp",
+];
+
+struct StructDefinition {
+    name: String,
+    /// Span of the body between `{` and `}` inclusive.
+    body_span: (usize, usize),
+    /// Members as (type text, name, full declaration text).
+    members: Vec<(String, String, String)>,
+}
+
+/// Parse `struct NAME { … };` definitions out of GLSL source (comments must
+/// already be stripped). Struct bodies cannot nest braces, so the first `}`
+/// ends the body.
+fn parse_struct_definitions(source: &str) -> Vec<StructDefinition> {
+    let mut out = Vec::new();
+    let bytes = source.as_bytes();
+    for (idx, _) in source.match_indices("struct") {
+        let prev_ok =
+            idx == 0 || !(bytes[idx - 1].is_ascii_alphanumeric() || bytes[idx - 1] == b'_');
+        let next = idx + "struct".len();
+        let next_ok = next >= bytes.len()
+            || !(bytes[next].is_ascii_alphanumeric() || bytes[next] == b'_');
+        if !prev_ok || !next_ok {
+            continue;
+        }
+        let rest = &source[next..];
+        let Some(name_off) = rest.find(|c: char| c.is_ascii_alphanumeric() || c == '_') else {
+            continue;
+        };
+        let name_end = rest[name_off..]
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map(|e| name_off + e)
+            .unwrap_or(rest.len());
+        let name = &rest[name_off..name_end];
+        if name.is_empty() {
+            continue;
+        }
+        let Some(brace_off) = rest[name_end..].find('{') else {
+            continue;
+        };
+        let brace = next + name_end + brace_off;
+        let Some(close) = source[brace..].find('}') else {
+            continue;
+        };
+        let body = &source[brace + 1..brace + close];
+        let mut members = Vec::new();
+        for member in body.split(';') {
+            let m = member.trim();
+            if m.is_empty() {
+                continue;
+            }
+            let tokens: Vec<&str> = m.split_whitespace().collect();
+            if tokens.len() < 2 {
+                continue;
+            }
+            let member_name = tokens[tokens.len() - 1]
+                .trim_end_matches(|c: char| c.is_ascii_digit() || c == '[' || c == ']')
+                .to_string();
+            let member_type = tokens[..tokens.len() - 1].join(" ");
+            members.push((member_type, member_name, m.to_string()));
+        }
+        out.push(StructDefinition {
+            name: name.to_string(),
+            body_span: (brace, brace + close + 1),
+            members,
+        });
+    }
+    out
+}
+
+/// Build the union of two struct bodies: same order as `a`, with members
+/// present only in `b` appended. Returns None if a member exists in both
+/// with a different type (that is a genuine program error, not a linker
+/// quirk).
+fn merged_struct_body(a: &StructDefinition, b: &StructDefinition) -> Option<String> {
+    let mut members: Vec<(String, String, String)> = a.members.clone();
+    for (ty, name, raw) in &b.members {
+        match members.iter().find(|(_, n, _)| n == name) {
+            Some((existing_ty, _, _)) if existing_ty == ty => {}
+            Some(_) => return None,
+            None => members.push((ty.clone(), name.clone(), raw.clone())),
+        }
+    }
+    Some(
+        members
             .iter()
-            .map(|(n, size)| format!("{}[{}]", n, size))
+            .map(|(_, _, raw)| format!("{};", raw))
             .collect::<Vec<_>>()
-            .join(", ")
+            .join(" "),
+    )
+}
+
+/// Some strict desktop GL linkers reject a program when the vertex and
+/// fragment stages define the *same struct type with different member lists*
+/// (even if each stage only touches its own subset):
+/// "Field numbers of uniform 'X' differ between VERTEX and FRAGMENT shaders".
+/// Detect shared struct types used by array uniforms in both stages, unify
+/// their definitions to the member union, and swap in recompiled stages.
+/// Returns true if the program's shaders were replaced.
+unsafe fn reconcile_uniform_struct_definitions(gles: &GLES, program: GLuint) -> bool {
+    let (vertex_shader, fragment_shader) = {
+        let bk = SHADER_BOOKKEEPING.lock().unwrap();
+        match (
+            bk.program_attachments.get(&program).and_then(|list| {
+                list.iter().find(|s| bk.shader_types.get(s) == Some(&VERTEX_SHADER))
+            }),
+            bk.program_attachments.get(&program).and_then(|list| {
+                list.iter().find(|s| bk.shader_types.get(s) == Some(&FRAGMENT_SHADER))
+            }),
+        ) {
+            (Some(v), Some(f)) => (*v, *f),
+            _ => return false,
+        }
+    };
+    let (vertex_source, fragment_source) = {
+        let bk = SHADER_BOOKKEEPING.lock().unwrap();
+        match (
+            bk.shader_sources.get(&vertex_shader).cloned(),
+            bk.shader_sources.get(&fragment_shader).cloned(),
+        ) {
+            (Some(v), Some(f)) => (v, f),
+            _ => return false,
+        }
+    };
+    let defines_v = collect_int_defines(&vertex_source);
+    let defines_f = collect_int_defines(&fragment_source);
+    let uniforms_v = parse_uniform_array_declarations(&vertex_source, &defines_v);
+    let uniforms_f = parse_uniform_array_declarations(&fragment_source, &defines_f);
+    let mut structs_v = parse_struct_definitions(&vertex_source);
+    let mut structs_f = parse_struct_definitions(&fragment_source);
+    // Struct types used by array uniforms in both stages.
+    let mut shared_types: Vec<String> = Vec::new();
+    for dv in &uniforms_v {
+        if GLSL_BUILTIN_TYPES.contains(&dv.ty.as_str()) || dv.ty.is_empty() {
+            continue;
+        }
+        if uniforms_f
+            .iter()
+            .any(|df| df.name == dv.name && df.ty == dv.ty)
+        {
+            if !shared_types.contains(&dv.ty) {
+                shared_types.push(dv.ty.clone());
+            }
+        }
+    }
+    let mut patched_vertex = vertex_source.clone();
+    let mut patched_fragment = fragment_source.clone();
+    let mut changed = Vec::new();
+    for ty in shared_types {
+        let Some(sv) = structs_v.iter().find(|s| s.name == ty) else {
+            continue;
+        };
+        let Some(sf) = structs_f.iter().find(|s| s.name == ty) else {
+            continue;
+        };
+        // Only act when the member lists actually differ.
+        let same = sv.members.len() == sf.members.len()
+            && sv
+                .members
+                .iter()
+                .zip(&sf.members)
+                .all(|(a, b)| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
+        if same {
+            continue;
+        }
+        let Some(merged) = merged_struct_body(sv, sf) else {
+            log!(
+                "Program {}: struct {} has conflicting member types between \\\
+                 vertex and fragment shaders; leaving as-is",
+                program,
+                ty
+            );
+            return false;
+        };
+        // body_span includes the braces, so re-wrap the merged members.
+        // Spans shift as the source is edited, so re-parse after each edit.
+        let merged_braced = format!("{{ {} }}", merged);
+        let new_vertex = format!(
+            "{}{}{}",
+            &patched_vertex[..sv.body_span.0],
+            merged_braced,
+            &patched_vertex[sv.body_span.1..]
+        );
+        patched_vertex = new_vertex;
+        let new_fragment = format!(
+            "{}{}{}",
+            &patched_fragment[..sf.body_span.0],
+            merged_braced,
+            &patched_fragment[sf.body_span.1..]
+        );
+        patched_fragment = new_fragment;
+        changed.push(ty);
+        // Spans moved: re-parse the patched sources for the next iteration.
+        structs_v = parse_struct_definitions(&patched_vertex);
+        structs_f = parse_struct_definitions(&patched_fragment);
+    }
+    if changed.is_empty() {
+        return false;
+    }
+    if !swap_both_patched_shaders(
+        gles,
+        program,
+        vertex_shader,
+        fragment_shader,
+        &patched_vertex,
+        &patched_fragment,
+    ) {
+        return false;
+    }
+    log!(
+        "Program {}: unified struct definition(s) ({}) between vertex and \\\
+         fragment shaders so strict linkers accept the program",
+        program,
+        changed.join(", ")
     );
+    true
 }
 
 /// Dump the `uniform …[N]` declarations parsed from each stage attached to
@@ -7533,6 +7813,39 @@ mod uniform_array_reconciliation_tests {
         let src = super::strip_glsl_comments(raw);
         let defines = std::collections::HashMap::new();
         assert!(parse_uniform_array_declarations(&src, &defines).is_empty());
+    }
+
+    #[test]
+    #[test]
+    fn struct_definitions_are_parsed_and_merged() {
+        let v = "struct Light { vec4 pos; float r; };\n\
+                 uniform Light light[MAX_LIGHT];\nvoid main() {}\n";
+        let f = "struct Light { vec4 pos; float r; vec3 color; };\n\
+                 uniform Light light[MAX_LIGHT];\nvoid main() {}\n";
+        let sv = parse_struct_definitions(v);
+        let sf = parse_struct_definitions(f);
+        assert_eq!(sv.len(), 1);
+        assert_eq!(sf.len(), 1);
+        assert_eq!(sv[0].name, "Light");
+        assert_eq!(sv[0].members.len(), 2);
+        assert_eq!(sf[0].members.len(), 3);
+        let merged = merged_struct_body(&sv[0], &sf[0]).unwrap();
+        assert_eq!(merged, "vec4 pos; float r; vec3 color;");
+        // Reverse order: union follows the first struct's order.
+        let merged2 = merged_struct_body(&sf[0], &sv[0]).unwrap();
+        assert_eq!(merged2, "vec4 pos; float r; vec3 color;");
+        // Conflicting types for the same member abort the merge.
+        let conflict = parse_struct_definitions("struct Light { vec4 pos; int r; };\n");
+        assert!(merged_struct_body(&sv[0], &conflict[0]).is_none());
+    }
+
+    #[test]
+    fn struct_spans_cover_braces_for_replacement() {
+        let src = "// c\nstruct S { float a; };\nuniform S s[2];\n";
+        let defs = parse_struct_definitions(src);
+        assert_eq!(defs.len(), 1);
+        let (start, end) = defs[0].body_span;
+        assert_eq!(&src[start..end], "{ float a; }");
     }
 
     #[test]
