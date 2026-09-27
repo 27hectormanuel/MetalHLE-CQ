@@ -7,12 +7,13 @@ that frames keep being presented and the process stays alive.
 
 Usage:
     python dev-scripts/ai-tap-sequence.py APP [--exe PATH] [--cwd DIR] [--out DIR]
-        [--step "WAIT:X,Y"]... [--final-wait SECONDS]
+        [--step "WAIT:X,Y[*N]"]... [--final-wait SECONDS]
         [--require-touch-delivery] [-- extra emulator args]
 
 Each --step waits WAIT seconds, takes a screenshot, then taps at (X, Y),
 where X and Y are fractions (0..1) of the window's client area. Use "-" for
-X,Y to take a screenshot without tapping. `--require-touch-delivery` requires
+X,Y to take a screenshot without tapping. Append `*N` for N rapid taps, e.g.
+`--step "4:0.5,0.5*2"` for a double tap. `--require-touch-delivery` requires
 UIKit to report normal begin/end events for each tap, up to its 12-event log cap.
 
 Windows requires Pillow and pywin32. Linux/X11 requires xdotool, xwininfo,
@@ -25,6 +26,7 @@ import subprocess
 import sys
 import threading
 import time
+import os
 from pathlib import Path
 
 if sys.platform == "win32":
@@ -69,7 +71,7 @@ def client_rect(hwnd):
     return 0, 0, width, height
 
 
-def tap(hwnd, fx, fy):
+def tap(hwnd, fx, fy, tap_count=1):
     x0, y0, x1, y1 = client_rect(hwnd)
     x = int(x0 + (x1 - x0) * fx)
     y = int(y0 + (y1 - y0) * fy)
@@ -80,17 +82,36 @@ def tap(hwnd, fx, fy):
             pass
         win32api.SetCursorPos((x, y))
         time.sleep(0.05)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0)
-        time.sleep(0.12)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0)
+        for n in range(tap_count):
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0)
+            time.sleep(0.06)
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0)
+            if n + 1 < tap_count:
+                time.sleep(0.08)
     else:
         subprocess.run(
             ["xdotool", "mousemove", "--sync", "--window", str(hwnd), str(x), str(y)],
             check=True,
         )
-        subprocess.run(["xdotool", "mousedown", "1"], check=True)
-        time.sleep(0.12)
-        subprocess.run(["xdotool", "mouseup", "1"], check=True)
+        for n in range(tap_count):
+            subprocess.run(["xdotool", "mousedown", "1"], check=True)
+            time.sleep(0.06)
+            subprocess.run(["xdotool", "mouseup", "1"], check=True)
+            if n + 1 < tap_count:
+                time.sleep(0.08)
+
+
+def parse_step_position(position):
+    count = 1
+    if "*" in position:
+        position, count_text = position.rsplit("*", 1)
+        try:
+            count = int(count_text)
+        except ValueError as error:
+            raise ValueError(f"invalid tap count in step position: {position}*{count_text}") from error
+        if count < 1:
+            raise ValueError("tap count must be at least 1")
+    return position, count
 
 
 def screenshot(hwnd, path):
@@ -146,12 +167,15 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     log_path = out / "emulator.log"
     log = open(log_path, "w", encoding="utf-8", errors="replace")
+    env = os.environ.copy()
+    env["RUST_BACKTRACE"] = "full"
     try:
         proc = subprocess.Popen(
-            [str(exe), "--print-fps", *extra, str(app)],
+            [str(exe), str(app), "--print-fps", *extra],
             cwd=str(cwd),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            env=env,
         )
     except OSError as error:
         log.close()
@@ -195,6 +219,7 @@ def main():
     ok = True
     for n, step in enumerate(args.step):
         wait, _, pos = step.partition(":")
+        position, tap_count = parse_step_position(pos) if pos != "-" else ("-", 0)
         if not wait_for_process(proc, float(wait)):
             print(f"FAIL: emulator exited during step {n} (code {proc.returncode})")
             ok = False
@@ -206,10 +231,11 @@ def main():
         shot = out / f"step{n:02d}.png"
         screenshot(hwnd, shot)
         before = len(fps_samples)
-        if pos != "-":
-            fx, fy = (float(v) for v in pos.split(","))
-            tap(hwnd, fx, fy)
-            print(f"step {n}: screenshot {shot.name}, tap ({fx:.2f},{fy:.2f})")
+        if position != "-":
+            fx, fy = (float(v) for v in position.split(","))
+            tap(hwnd, fx, fy, tap_count)
+            action = "double-tap" if tap_count == 2 else f"{tap_count} tap(s)"
+            print(f"step {n}: screenshot {shot.name}, {action} ({fx:.2f},{fy:.2f})")
         else:
             print(f"step {n}: screenshot {shot.name}")
 
@@ -228,13 +254,37 @@ def main():
             elif len(fps_samples) < 3 or all(f == 0 for f in tail):
                 print("FAIL: frames are not being presented")
                 ok = False
+            elif time.time() - fps_samples[-1][0] > 3.0:
+                print("FAIL: frame counter stopped updating before the final check")
+                ok = False
     if proc.poll() is None:
         proc.kill()
     proc.wait()
     reader_thread.join()
     log.close()
+    log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    failure_patterns = (
+        r"App called exit\(",
+        r"Shader[^\n]*compile failed",
+        r"\[--trace-gl-errors\] glGetError\(\) = 0x[0-9a-f]+",
+        r"PANIC in thread",
+        r"thread .* panicked",
+        r"FATAL SIGNAL",
+    )
+    failures = [
+        line for line in log_text.splitlines()
+        if any(re.search(pattern, line, re.IGNORECASE) for pattern in failure_patterns)
+    ]
+    if failures:
+        print("FAIL: fatal guest or OpenGL diagnostics were logged:")
+        for line in failures[:10]:
+            print(line)
+        ok = False
     if args.require_touch_delivery:
-        requested = sum(step.partition(":")[2] != "-" for step in args.step)
+        requested = sum(
+            0 if step.partition(":")[2] == "-" else parse_step_position(step.partition(":")[2])[1]
+            for step in args.step
+        )
         log_text = log_path.read_text(encoding="utf-8", errors="replace")
         delivered = log_text.count("TOUCH-DIAG #")
         ended = log_text.count("TOUCH-END #")

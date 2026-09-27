@@ -19,6 +19,89 @@
 //! `gl_FragColor` is fine; built-in attribute names; integer textures; …) are
 //! not handled. We can extend this when needed.
 
+/// Patch legacy ES 2.0 shadow-sampler shaders for the capabilities of the host driver.
+/// The extension is fragment-only; some apps require it in their shared vertex prefix.
+/// On hosts without it, emulate comparison sampling with an ordinary depth-texture sample.
+/// <https://registry.khronos.org/OpenGL/extensions/EXT/EXT_shadow_samplers.txt>
+pub fn patch_shadow_samplers_extension(
+    source: &str,
+    is_vertex_shader: bool,
+    shadow_samplers_ext_supported: bool,
+) -> String {
+    let mut output = String::with_capacity(source.len() + 160);
+    for line in source.split_inclusive('\n') {
+        let line_without_comment = line.split("//").next().unwrap_or(line);
+        let directive = line_without_comment
+            .trim_start()
+            .strip_prefix('#')
+            .map(str::trim_start);
+        let extension_action = directive.and_then(|directive| {
+            let rest = directive.strip_prefix("extension")?;
+            let keyword_boundary = rest
+                .chars()
+                .next()
+                .map_or(true, |c| !c.is_ascii_alphanumeric() && c != '_');
+            if !keyword_boundary {
+                return None;
+            }
+            let mut parts = rest.trim_start().split_whitespace();
+            if parts.next()? != "GL_EXT_shadow_samplers" {
+                return None;
+            }
+            Some(parts.last().unwrap_or(""))
+        });
+
+        if extension_action.is_some() && (is_vertex_shader || !shadow_samplers_ext_supported) {
+            if line.ends_with("\r\n") {
+                output.push_str("\r\n");
+            } else if line.ends_with('\n') {
+                output.push('\n');
+            }
+        } else {
+            output.push_str(line);
+        }
+    }
+
+    if is_vertex_shader || shadow_samplers_ext_supported || !output.contains("shadow2DEXT") {
+        return output;
+    }
+
+    let sample_function = if output
+        .lines()
+        .any(|line| line.trim_start().starts_with("#version 300 es"))
+    {
+        "texture"
+    } else {
+        "texture2D"
+    };
+    let mut output = output
+        .replace("sampler2DShadow", "sampler2D")
+        .replace("shadow2DEXT", "touchHLE_shadow2DEXT");
+    let helper = format!(
+        "highp float touchHLE_shadow2DEXT(highp sampler2D shadow_map, highp vec3 shadow_coord) {{\n    highp float depth = {sample_function}(shadow_map, shadow_coord.xy).r;\n    return step(shadow_coord.z, depth);\n}}\n\n"
+    );
+    let mut offset = 0;
+    let mut insertion_point = None;
+    for line in output.split_inclusive('\n') {
+        if line.trim() == "#define FRAGMENT" {
+            insertion_point = Some(offset + line.len());
+            break;
+        }
+        offset += line.len();
+    }
+    let insertion_point = insertion_point.or_else(|| {
+        output.find("void main").map(|main_start| {
+            output[..main_start]
+                .rfind('\n')
+                .map_or(0, |newline| newline + 1)
+        })
+    });
+    if let Some(insertion_point) = insertion_point {
+        output.insert_str(insertion_point, &helper);
+    }
+    output
+}
+
 /// Translate a GLSL ES 1.00 shader source to GLSL 1.20.
 pub fn translate_glsl_es_to_120(source: &str) -> String {
     translate_glsl_es_with_version(source, "#version 120\n")
@@ -282,6 +365,33 @@ fn is_ident_char(b: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn patches_shadow_sampler_extension_by_shader_stage() {
+        let src = "#version 100\n#  extension GL_EXT_shadow_samplers : require\nvoid main() {}\n";
+        let vertex = patch_shadow_samplers_extension(src, true, false);
+        assert!(!vertex.contains("GL_EXT_shadow_samplers"));
+        assert_eq!(vertex, "#version 100\n\nvoid main() {}\n");
+
+        let supported_fragment = patch_shadow_samplers_extension(src, false, true);
+        assert!(supported_fragment.contains("#  extension GL_EXT_shadow_samplers : require"));
+    }
+
+    #[test]
+    fn emulates_shadow_sampler_when_the_host_lacks_the_extension() {
+        let src = "#version 100\n#define FRAGMENT\n#extension GL_EXT_shadow_samplers : require\nprecision highp float;\nuniform highp sampler2DShadow u_shadowMap;\nvoid main() { highp float result = shadow2DEXT(u_shadowMap, vec3(0.5)); gl_FragColor = vec4(result); }\n";
+        let patched = patch_shadow_samplers_extension(src, false, false);
+        assert!(!patched.contains("GL_EXT_shadow_samplers"));
+        assert!(!patched.contains("sampler2DShadow"));
+        assert!(patched.contains("uniform highp sampler2D u_shadowMap;"));
+        assert!(patched.contains("touchHLE_shadow2DEXT(u_shadowMap, vec3(0.5))"));
+        assert!(patched.contains("texture2D(shadow_map, shadow_coord.xy).r"));
+        assert!(patched.contains("step(shadow_coord.z, depth)"));
+        assert!(
+            patched.find("highp float touchHLE_shadow2DEXT").unwrap()
+                < patched.find("void main").unwrap()
+        );
+    }
 
     #[test]
     fn rewrites_version_directive() {

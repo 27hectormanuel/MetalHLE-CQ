@@ -512,6 +512,9 @@ impl GLES for GLES3OnGL3<'_> {
             }
             return;
         }
+        if !self.advertise_es3 && matches!(pname, 0x884C | 0x884D) {
+            return;
+        }
         gl33::TexParameteri(target, pname, param)
     }
     unsafe fn TexParameterf(&mut self, target: GLenum, pname: GLenum, param: GLfloat) {
@@ -519,6 +522,9 @@ impl GLES for GLES3OnGL3<'_> {
             if param != 0.0 {
                 gl33::GenerateMipmap(target);
             }
+            return;
+        }
+        if !self.advertise_es3 && matches!(pname, 0x884C | 0x884D) {
             return;
         }
         gl33::TexParameterf(target, pname, param)
@@ -530,6 +536,9 @@ impl GLES for GLES3OnGL3<'_> {
             }
             return;
         }
+        if !self.advertise_es3 && matches!(pname, 0x884C | 0x884D) {
+            return;
+        }
         gl33::TexParameteriv(target, pname, params)
     }
     unsafe fn TexParameterfv(&mut self, target: GLenum, pname: GLenum, params: *const GLfloat) {
@@ -537,6 +546,9 @@ impl GLES for GLES3OnGL3<'_> {
             if !params.is_null() && *params != 0.0 {
                 gl33::GenerateMipmap(target);
             }
+            return;
+        }
+        if !self.advertise_es3 && matches!(pname, 0x884C | 0x884D) {
             return;
         }
         gl33::TexParameterfv(target, pname, params)
@@ -952,7 +964,9 @@ impl GLES for GLES3OnGL3<'_> {
         // `#version` directive: `#version 300 es` triggers the GLSL 3.30
         // Core translator, anything else (including no directive) uses the
         // GLSL 1.20 translator that the ES 2.0 path established.
-        use super::gles2_glsl::{translate_glsl_es_300_to_330, translate_glsl_es_to_120};
+        use super::gles2_glsl::{
+            patch_shadow_samplers_extension, translate_glsl_es_300_to_330, translate_glsl_es_to_120,
+        };
         use std::ffi::CString;
 
         let n = count.max(0) as usize;
@@ -975,6 +989,14 @@ impl GLES for GLES3OnGL3<'_> {
             };
             joined.push_str(&s);
         }
+
+        let mut shader_type = 0;
+        gl33::GetShaderiv(shader, gl33::SHADER_TYPE, &mut shader_type);
+        let joined = patch_shadow_samplers_extension(
+            &joined,
+            shader_type as GLenum == gl33::VERTEX_SHADER,
+            self.advertise_es3,
+        );
 
         let is_es3 = joined
             .lines()
