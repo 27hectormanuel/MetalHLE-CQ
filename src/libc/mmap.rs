@@ -293,9 +293,26 @@ fn munlock(env: &mut Environment, addr: ConstPtr<u8>, len: GuestUSize) -> i32 {
     0
 }
 
+/// `int msync(void *addr, size_t len, int flags)` — synchronize a mapped
+/// region with the file that backs it. touchHLE's `mmap` copies file
+/// content into a guest allocation and never writes it back, and guest
+/// memory is not paged, so there is nothing to flush: report success as
+/// a no-op (Darwin returns 0 on success; returning -1 would make guests
+/// that treat msync failures as fatal — e.g. engines persisting save
+/// data through mmap — abort their write path).
+///
+/// Reference: POSIX msync(2) — returns 0 on success, -1 with errno on
+/// failure.
+fn msync(env: &mut Environment, addr: MutVoidPtr, len: GuestUSize, flags: i32) -> i32 {
+    log_dbg!("msync({:?}, {}, {:#x}) -> 0 (no-op)", addr, len, flags);
+    set_errno(env, 0);
+    0
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(mmap(_, _, _, _, _, _)),
     export_c_func!(munmap(_, _)),
+    export_c_func!(msync(_, _, _)),
     export_c_func!(madvise(_, _, _)),
     export_c_func!(shm_open(_, _, _)),
     export_c_func!(shm_unlink(_)),

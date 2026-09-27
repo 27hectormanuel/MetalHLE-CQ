@@ -3656,6 +3656,11 @@ fn glLinkProgram(env: &mut Environment, program: GLuint) {
             }
         }
         if gles.is_es2() {
+            // Strict linkers also reject uniform arrays whose element count
+            // differs between stages (lenient PowerVR drivers accepted it);
+            // Gangstar Rio trips this with its `light` array. Rewrite both
+            // stages to the max size before anything else touches them.
+            reconcile_uniform_array_sizes(gles, program);
             // Strict linkers (ANGLE) reject programs whose fragment shader
             // declares varyings the vertex shader doesn't (legal-but-undefined
             // on real iPhone-era hardware). Patch the vertex shader first so
@@ -4429,6 +4434,236 @@ unsafe fn swap_in_patched_vertex_shader(
         // the guest deletes it — it may still be attached to other programs.
     });
     true
+}
+
+/// A `uniform … name[N]` declaration: the uniform's name, the declared
+/// element count, and the byte span of the digits inside the brackets so
+/// the source can be rewritten in place.
+struct UniformArrayDecl {
+    name: String,
+    size: u32,
+    digits_span: (usize, usize),
+}
+
+/// Parse top-level `uniform` declarations that carry an `[N]` array size.
+/// The input must already have comments stripped (see
+/// [strip_glsl_comments]) so byte spans line up with the string being
+/// rewritten. Only the common single-declarator form is handled; exotic
+/// layouts are skipped rather than misparsed.
+fn parse_uniform_array_declarations(source: &str) -> Vec<UniformArrayDecl> {
+    let bytes = source.as_bytes();
+    let mut out = Vec::new();
+    let mut search_start = 0usize;
+    while let Some(rel) = source[search_start..].find("uniform") {
+        let start = search_start + rel;
+        let kw_end = start + "uniform".len();
+        let before_ok = start == 0 || {
+            let b = bytes[start - 1];
+            !(b.is_ascii_alphanumeric() || b == b'_')
+        };
+        let after_ok = kw_end >= source.len() || {
+            let b = bytes[kw_end];
+            !(b.is_ascii_alphanumeric() || b == b'_')
+        };
+        if !before_ok || !after_ok {
+            search_start = kw_end;
+            continue;
+        }
+        let rest = &source[kw_end..];
+        let semi = rest.find(';').unwrap_or(rest.len());
+        let body = &rest[..semi];
+        search_start = (kw_end + semi + 1).min(source.len());
+        let Some(open_bracket) = body.find('[') else {
+            continue;
+        };
+        let Some(close_rel) = body[open_bracket..].find(']') else {
+            continue;
+        };
+        let inner = &body[open_bracket + 1..open_bracket + close_rel];
+        let trimmed = inner.trim();
+        if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(size) = trimmed.parse::<u32>() else {
+            continue;
+        };
+        // The declarator's name is the identifier token right before '['.
+        let before = body[..open_bracket].trim_end();
+        // take_while on the reversed iterator yields the trailing identifier
+        // run right-to-left; .last() is therefore its leftmost character.
+        let name_start = before
+            .char_indices()
+            .rev()
+            .take_while(|&(_, c)| c.is_ascii_alphanumeric() || c == '_')
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let name = &before[name_start..];
+        if name.is_empty() || name.bytes().next().map_or(true, |b| b.is_ascii_digit()) {
+            continue;
+        }
+        let digits_start = kw_end + open_bracket + 1;
+        let digits_end = kw_end + open_bracket + close_rel;
+        out.push(UniformArrayDecl {
+            name: name.to_string(),
+            size,
+            digits_span: (digits_start, digits_end),
+        });
+    }
+    out
+}
+
+/// Rewrite every declaration whose name appears in `fixes` (name → new
+/// element count), applying replacements from the end of the source so
+/// earlier byte spans stay valid.
+fn rewrite_uniform_array_sizes(
+    source: &str,
+    decls: &[UniformArrayDecl],
+    fixes: &[(String, u32)],
+) -> String {
+    let mut spans: Vec<((usize, usize), u32)> = decls
+        .iter()
+        .filter_map(|d| {
+            fixes
+                .iter()
+                .find(|(n, _)| n == &d.name)
+                .map(|(_, size)| (d.digits_span, *size))
+        })
+        .collect();
+    spans.sort_by(|a, b| b.0.0.cmp(&a.0.0));
+    let mut out = source.to_string();
+    for ((s, e), size) in spans {
+        out.replace_range(s..e, &size.to_string());
+    }
+    out
+}
+
+unsafe fn compile_shader_source(gles: &mut dyn GLES, type_: GLuint, src: &str) -> Option<GLuint> {
+    const COMPILE_STATUS: GLenum = 0x8B81;
+    let cs = std::ffi::CString::new(src.as_bytes().to_vec()).ok()?;
+    let ptr = cs.as_ptr();
+    let shader = gles.CreateShader(type_);
+    if shader == 0 {
+        return None;
+    }
+    gles.ShaderSource(shader, 1, &ptr, std::ptr::null());
+    gles.CompileShader(shader);
+    let mut ok: GLint = 0;
+    gles.GetShaderiv(shader, COMPILE_STATUS, &mut ok);
+    if ok == 0 {
+        gles.DeleteShader(shader);
+        None
+    } else {
+        Some(shader)
+    }
+}
+
+/// Lenient iPhone-era drivers (PowerVR) accepted a uniform array declared
+/// with *different* element counts in the vertex and fragment shaders;
+/// strict linkers fail the whole program with "Field numbers of uniform
+/// 'X' differ between VERTEX and FRAGMENT shaders" (Gangstar Rio e.g.
+/// declares `light` with a per-stage element count). Mirror the lenient
+/// hardware: before linking, rewrite both stages so every shared uniform
+/// array uses the maximum of the two declared sizes.
+unsafe fn reconcile_uniform_array_sizes(gles: &mut dyn GLES, program: GLuint) {
+    const VERTEX_SHADER: GLuint = 0x8B31;
+    const FRAGMENT_SHADER: GLuint = 0x8B30;
+
+    let Some((vertex_shader, vertex_src, fragment_shader, fragment_src)) =
+        with_shader_bookkeeping(|bk| {
+            let attached = bk.program_attachments.get(&program)?.clone();
+            let mut vertex: Option<(GLuint, String)> = None;
+            let mut fragment: Option<(GLuint, String)> = None;
+            for shader in attached {
+                match bk.shader_types.get(&shader).copied() {
+                    Some(VERTEX_SHADER) => {
+                        if let Some(src) = bk.shader_sources.get(&shader) {
+                            vertex = Some((shader, src.clone()));
+                        }
+                    }
+                    Some(FRAGMENT_SHADER) => {
+                        if let Some(src) = bk.shader_sources.get(&shader) {
+                            fragment = Some((shader, src.clone()));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match (vertex, fragment) {
+                (Some(v), Some(f)) => Some((v.0, v.1, f.0, f.1)),
+                _ => None,
+            }
+        })
+    else {
+        return;
+    };
+
+    // Comments are stripped so the parser's byte spans match the string
+    // being rewritten; dropping them from the patched source is harmless.
+    let vertex_stripped = strip_glsl_comments(&vertex_src);
+    let fragment_stripped = strip_glsl_comments(&fragment_src);
+    let vertex_uniforms = parse_uniform_array_declarations(&vertex_stripped);
+    let fragment_uniforms = parse_uniform_array_declarations(&fragment_stripped);
+    if vertex_uniforms.is_empty() || fragment_uniforms.is_empty() {
+        return;
+    }
+    let mut fixes: Vec<(String, u32)> = Vec::new();
+    for vd in &vertex_uniforms {
+        if fixes.iter().any(|(n, _)| n == &vd.name) {
+            continue;
+        }
+        if let Some(fd) = fragment_uniforms.iter().find(|fd| fd.name == vd.name) {
+            if fd.size != vd.size {
+                fixes.push((vd.name.clone(), vd.size.max(fd.size)));
+            }
+        }
+    }
+    if fixes.is_empty() {
+        return;
+    }
+
+    let patched_vertex = rewrite_uniform_array_sizes(&vertex_stripped, &vertex_uniforms, &fixes);
+    let patched_fragment =
+        rewrite_uniform_array_sizes(&fragment_stripped, &fragment_uniforms, &fixes);
+    let Some(new_vertex) = compile_shader_source(gles, VERTEX_SHADER, &patched_vertex) else {
+        return;
+    };
+    let Some(new_fragment) = compile_shader_source(gles, FRAGMENT_SHADER, &patched_fragment)
+    else {
+        gles.DeleteShader(new_vertex);
+        return;
+    };
+    gles.DetachShader(program, vertex_shader);
+    gles.AttachShader(program, new_vertex);
+    gles.DetachShader(program, fragment_shader);
+    gles.AttachShader(program, new_fragment);
+    with_shader_bookkeeping(|bk| {
+        if let Some(list) = bk.program_attachments.get_mut(&program) {
+            for (old, new) in [(vertex_shader, new_vertex), (fragment_shader, new_fragment)] {
+                if let Some(slot) = list.iter_mut().find(|s| **s == old) {
+                    *slot = new;
+                } else {
+                    list.push(new);
+                }
+            }
+        }
+        bk.shader_types.insert(new_vertex, VERTEX_SHADER);
+        bk.shader_types.insert(new_fragment, FRAGMENT_SHADER);
+        bk.shader_sources.insert(new_vertex, patched_vertex);
+        bk.shader_sources.insert(new_fragment, patched_fragment);
+    });
+    log!(
+        "Program {}: reconciled {} uniform array size difference(s) ({}) \\\
+         between vertex and fragment shaders so strict linkers accept the \\\
+         program",
+        program,
+        fixes.len(),
+        fixes
+            .iter()
+            .map(|(n, size)| format!("{}[{}]", n, size))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 }
 
 /// Last-resort fix-up: if a link still failed, parse the varying names the
@@ -7163,5 +7398,43 @@ mod varying_declaration_parsing_tests {
         assert!(v.contains(&("float".to_string(), "vAlpha".to_string())));
         assert!(!v.iter().any(|(_, n)| n == "varying_not_keyword"));
         assert_eq!(v.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod uniform_array_reconciliation_tests {
+    use super::{parse_uniform_array_declarations, rewrite_uniform_array_sizes};
+
+    #[test]
+    fn parses_array_sizes_and_rewrites_both_stages_to_max() {
+        let vertex = "uniform vec4 light[4];\nuniform float pad;\nvoid main() {}\n";
+        let fragment =
+            "precision mediump float;\nuniform highp vec4 light[2];\nvoid main() {}\n";
+        let vd = parse_uniform_array_declarations(vertex);
+        let fd = parse_uniform_array_declarations(fragment);
+        assert_eq!(vd.len(), 1);
+        assert_eq!(fd.len(), 1);
+        assert_eq!(vd[0].name, "light");
+        assert_eq!(vd[0].size, 4);
+        assert_eq!(fd[0].name, "light");
+        assert_eq!(fd[0].size, 2);
+
+        let fixes = vec![("light".to_string(), 4u32)];
+        let patched_vertex = rewrite_uniform_array_sizes(vertex, &vd, &fixes);
+        let patched_fragment = rewrite_uniform_array_sizes(fragment, &fd, &fixes);
+        assert!(patched_vertex.contains("light[4]"), "{patched_vertex}");
+        assert!(patched_fragment.contains("light[4]"), "{patched_fragment}");
+        assert!(!patched_fragment.contains("light[2]"), "{patched_fragment}");
+        // Untouched declarations stay as they were.
+        assert!(patched_vertex.contains("uniform float pad;"));
+    }
+
+    #[test]
+    fn non_array_uniforms_and_commented_ones_are_ignored() {
+        let raw = "uniform vec4 nolit;\nuniform float lit2;\n\
+                   /* uniform vec4 light[3]; */\nvoid main() {}\n";
+        // Callers strip comments before parsing (as the link fix-up does).
+        let src = super::strip_glsl_comments(raw);
+        assert!(parse_uniform_array_declarations(&src).is_empty());
     }
 }

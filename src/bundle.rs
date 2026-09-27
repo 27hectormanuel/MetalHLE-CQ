@@ -424,6 +424,36 @@ impl Bundle {
             .map(|v| v.as_string().unwrap())
     }
 
+    /// Same as [Bundle::supported_interface_orientations], but when running
+    /// as iPad the `~ipad` plist variants
+    /// (`UISupportedInterfaceOrientations~ipad` /
+    /// `UIInterfaceOrientation~ipad`) take precedence if present — Apple's
+    /// documented override mechanism for universal apps. Ignoring them makes
+    /// landscape-only universal games pick the orientation order written for
+    /// iPhone, which on iPad presents as the screen rotated by 180°.
+    pub fn supported_interface_orientations_for_family(&self, ipad: bool) -> Vec<&str> {
+        if ipad {
+            for key in [
+                "UISupportedInterfaceOrientations~ipad",
+                "UIInterfaceOrientation~ipad",
+            ] {
+                if let Some(v) = self.plist.get(key) {
+                    if let Some(arr) = v.as_array() {
+                        return arr.iter().filter_map(|o| o.as_string()).collect();
+                    }
+                    if let Some(s) = v.as_string() {
+                        return s
+                            .split(',')
+                            .map(|p| p.trim())
+                            .filter(|p| !p.is_empty())
+                            .collect();
+                    }
+                }
+            }
+        }
+        self.supported_interface_orientations()
+    }
+
     pub fn supported_interface_orientations(&self) -> Vec<&str> {
         // Apple's Bundle Resources documentation
         // (https://developer.apple.com/documentation/bundleresources/information-property-list/uisupportedinterfaceorientations)
