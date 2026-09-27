@@ -1129,6 +1129,22 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                                     ui_view::ui_scroll_view::ui_text_view::handle_return(env, responder)
                                 }
                             }
+                        } else {
+                            let ui_search_bar_class =
+                                env.objc.get_known_class("UISearchBar", &mut env.mem);
+                            if env.objc.class_is_subclass_of(class, ui_search_bar_class) {
+                                match text_event {
+                                    TextInputEvent::Text(text) => {
+                                        ui_search_bar::handle_text(env, responder, text)
+                                    }
+                                    TextInputEvent::Backspace => {
+                                        ui_search_bar::handle_backspace(env, responder)
+                                    }
+                                    TextInputEvent::Return => {
+                                        ui_search_bar::handle_return(env, responder)
+                                    }
+                                }
+                            }
                         }
                     }
                 }

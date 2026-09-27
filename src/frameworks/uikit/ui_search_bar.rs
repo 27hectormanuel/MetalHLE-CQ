@@ -6,8 +6,9 @@
 //! UISearchBar.
 
 use crate::frameworks::core_graphics::CGRect;
+use crate::frameworks::foundation::{ns_string, NSUInteger};
 use crate::objc::{
-    id, msg_super, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
+    id, msg, msg_super, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
 };
 
 #[derive(Default)]
@@ -343,16 +344,79 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<UISearchBarHostObject>(this).search_text_position_adjustment = offset;
 }
 
+- (())touchesBegan:(id)_touches withEvent:(id)_event {
+    let _: bool = msg![env; this becomeFirstResponder];
+}
+
+- (bool)canBecomeFirstResponder { true }
+- (bool)canResignFirstResponder { true }
+
 - (bool)becomeFirstResponder {
+    if env.framework_state.uikit.ui_responder.first_responder == this {
+        env.objc.borrow_mut::<UISearchBarHostObject>(this).is_first_responder = true;
+        crate::frameworks::uikit::ui_keyboard::start_text_input(env);
+        return true;
+    }
+
+    let delegate: id = msg![env; this delegate];
+    let delegate_alive = search_bar_delegate_is_alive(env, delegate);
+    if delegate_alive {
+        let selector = env.objc.register_host_selector("searchBarShouldBeginEditing:".to_string(), &mut env.mem);
+        if msg![env; delegate respondsToSelector:selector] && !msg![env; delegate searchBarShouldBeginEditing:this] {
+            return false;
+        }
+    }
+
+    let previous_responder = env.framework_state.uikit.ui_responder.first_responder;
+    if previous_responder != nil && previous_responder != this && !msg![env; previous_responder resignFirstResponder] {
+        return false;
+    }
+
+    crate::frameworks::uikit::ui_keyboard::post_keyboard_notifications(env, true);
+    env.framework_state.uikit.ui_responder.first_responder = this;
     env.objc.borrow_mut::<UISearchBarHostObject>(this).is_first_responder = true;
+    crate::frameworks::uikit::ui_keyboard::start_text_input(env);
+
+    if delegate_alive {
+        let selector = env.objc.register_host_selector("searchBarTextDidBeginEditing:".to_string(), &mut env.mem);
+        if msg![env; delegate respondsToSelector:selector] {
+            let _: () = msg![env; delegate searchBarTextDidBeginEditing:this];
+        }
+    }
     true
 }
+
 - (bool)resignFirstResponder {
+    if env.framework_state.uikit.ui_responder.first_responder != this {
+        env.objc.borrow_mut::<UISearchBarHostObject>(this).is_first_responder = false;
+        return true;
+    }
+
+    let delegate: id = msg![env; this delegate];
+    let delegate_alive = search_bar_delegate_is_alive(env, delegate);
+    if delegate_alive {
+        let selector = env.objc.register_host_selector("searchBarShouldEndEditing:".to_string(), &mut env.mem);
+        if msg![env; delegate respondsToSelector:selector] && !msg![env; delegate searchBarShouldEndEditing:this] {
+            return false;
+        }
+    }
+
+    crate::frameworks::uikit::ui_keyboard::post_keyboard_notifications(env, false);
+    env.framework_state.uikit.ui_responder.first_responder = nil;
     env.objc.borrow_mut::<UISearchBarHostObject>(this).is_first_responder = false;
+    crate::frameworks::uikit::ui_keyboard::stop_text_input(env);
+
+    if delegate_alive {
+        let selector = env.objc.register_host_selector("searchBarTextDidEndEditing:".to_string(), &mut env.mem);
+        if msg![env; delegate respondsToSelector:selector] {
+            let _: () = msg![env; delegate searchBarTextDidEndEditing:this];
+        }
+    }
     true
 }
+
 - (bool)isFirstResponder {
-    env.objc.borrow::<UISearchBarHostObject>(this).is_first_responder
+    env.framework_state.uikit.ui_responder.first_responder == this
 }
 
 // Per the UISearchBar reference, these setters store per-state/per-icon
@@ -452,3 +516,69 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+
+fn search_bar_delegate_is_alive(env: &mut crate::Environment, delegate: id) -> bool {
+    if delegate == nil {
+        return false;
+    }
+    let isa: u32 = env.mem.read(delegate.cast());
+    isa != 0
+}
+
+fn notify_search_bar_text_changed(env: &mut crate::Environment, search_bar: id, text: id) {
+    let delegate: id = msg![env; search_bar delegate];
+    if !search_bar_delegate_is_alive(env, delegate) {
+        return;
+    }
+    let selector = env
+        .objc
+        .register_host_selector("searchBar:textDidChange:".to_string(), &mut env.mem);
+    if msg![env; delegate respondsToSelector:selector] {
+        let _: () = msg![env; delegate searchBar:search_bar textDidChange:text];
+    }
+}
+
+pub fn handle_text(env: &mut crate::Environment, search_bar: id, text: String) {
+    let inserted = ns_string::from_rust_string(env, text);
+    let current: id = msg![env; search_bar text];
+    let current = if current == nil {
+        ns_string::get_static_str(env, "")
+    } else {
+        current
+    };
+    let updated: id = msg![env; current stringByAppendingString:inserted];
+    let _: () = msg![env; search_bar setText:updated];
+    let _: () = msg![env; search_bar setNeedsDisplay];
+    notify_search_bar_text_changed(env, search_bar, updated);
+    release(env, updated);
+    release(env, inserted);
+}
+
+pub fn handle_backspace(env: &mut crate::Environment, search_bar: id) {
+    let current: id = msg![env; search_bar text];
+    if current == nil {
+        return;
+    }
+    let length: NSUInteger = msg![env; current length];
+    if length == 0 {
+        return;
+    }
+    let updated: id = msg![env; current substringToIndex:(length - 1)];
+    let _: () = msg![env; search_bar setText:updated];
+    let _: () = msg![env; search_bar setNeedsDisplay];
+    notify_search_bar_text_changed(env, search_bar, updated);
+    release(env, updated);
+}
+
+pub fn handle_return(env: &mut crate::Environment, search_bar: id) {
+    let delegate: id = msg![env; search_bar delegate];
+    if !search_bar_delegate_is_alive(env, delegate) {
+        return;
+    }
+    let selector = env
+        .objc
+        .register_host_selector("searchBarSearchButtonClicked:".to_string(), &mut env.mem);
+    if msg![env; delegate respondsToSelector:selector] {
+        let _: () = msg![env; delegate searchBarSearchButtonClicked:search_bar];
+    }
+}

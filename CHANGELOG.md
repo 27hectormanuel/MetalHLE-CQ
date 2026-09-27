@@ -17,7 +17,8 @@ Changes are categorised as follows:
 
 Compatibility:
 
-- Android soft-keyboard requests from UIKit responders now reach the host IME after the editor view is attached; private `UIKeyboard` activation is bridged to SDL text input, and repeated focus requests retry the keyboard. This fixes text entry in Geometry Dash 2.11 and other apps.
+- Android soft-keyboard requests from UIKit responders now reach the host IME after the editor view is attached; private `UIKeyboard` activation is bridged to SDL text input, and repeated focus requests retry the keyboard.
+- `UISearchBar` now participates in first-responder handling and routes text, backspace, and Search-key events to its delegate.
 
 - Gangstar Rio now reports `UIScreen.bounds`, `nativeBounds`, and `currentMode.size` in landscape when launched in landscape, keeping its EAGL scene from rendering in a small clipped region on iPhone 5/5c.
 
