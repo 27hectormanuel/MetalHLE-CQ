@@ -1194,6 +1194,56 @@ fn path_for_resource_helper(
             return ns_string::from_rust_string(env, full);
         }
     }
+
+    // Last-resort fallback: scan the whole bundle tree for a file whose
+    // name matches case-insensitively. Some middleware (e.g. ObjectAL's
+    // `+[OALTools urlForPath:]`, which resolves bare effect filenames
+    // via `pathForResource:ofType:`) ships assets in bundle
+    // subdirectories; the strict NSBundle lookups above miss them and
+    // the guest then floods the log with "Could not find full path of
+    // file …" errors and plays no sound. Reached only when every
+    // stricter lookup has failed.
+    if let Some(file_name) = rust_path.file_name() {
+        let wanted = file_name.to_str().unwrap_or("").to_lowercase();
+        if !wanted.is_empty() {
+            let root: id = msg![env; bundle resourcePath];
+            let root_str = ns_string::to_rust_string(env, root);
+            let mut stack: Vec<String> = Vec::new();
+            if !root_str.is_empty() {
+                stack.push(root_str.into_owned());
+            }
+            let mut visited_dirs = 0usize;
+            while let Some(dir) = stack.pop() {
+                if visited_dirs >= 1000 {
+                    break;
+                }
+                visited_dirs += 1;
+                let Ok(entries) =
+                    env.fs.enumerate_with_types(crate::fs::GuestPath::new(&dir))
+                else {
+                    continue;
+                };
+                // Collect first so the env.fs borrow ends before we
+                // recurse into ns_string / msg!.
+                let entries: Vec<(String, bool)> = entries
+                    .map(|(name, ty)| {
+                        (
+                            name.to_owned(),
+                            matches!(ty, crate::fs::FsNodeType::Directory),
+                        )
+                    })
+                    .collect();
+                for (entry, is_dir) in entries {
+                    let full = format!("{}/{}", dir, entry);
+                    if is_dir {
+                        stack.push(full);
+                    } else if entry.to_lowercase() == wanted {
+                        return ns_string::from_rust_string(env, full);
+                    }
+                }
+            }
+        }
+    }
     nil
 }
 

@@ -117,8 +117,26 @@ impl AudioFile {
         path: P,
         fs: &Fs,
     ) -> Result<Self, AudioFileOpenError> {
-        let Ok(bytes) = fs.read(path.as_ref()) else {
-            return Err(AudioFileOpenError::FileReadError);
+        let bytes = match fs.read(path.as_ref()) {
+            Ok(bytes) => bytes,
+            Err(()) => {
+                // Guests (or bundled middleware) sometimes hardcode asset
+                // paths whose layout only matches the original device's
+                // flattened bundle; e.g. ObjectAL music tracks built as
+                // `<bundle>/music2.mp3` while the file ships in a
+                // subdirectory. Try the lenient basename scan before
+                // giving up, mirroring NSBundle's last-resort fallback.
+                let Some(resolved) = fs.resolve_lenient_path(path.as_ref()) else {
+                    return Err(AudioFileOpenError::FileReadError);
+                };
+                log!(
+                    "AudioFile: {:?} not found; lenient resolution -> {:?}",
+                    path.as_ref(),
+                    resolved
+                );
+                fs.read(&resolved)
+                    .map_err(|_| AudioFileOpenError::FileReadError)?
+            }
         };
         if let Ok(file) = Self::read_from_vec(bytes) {
             Ok(file)

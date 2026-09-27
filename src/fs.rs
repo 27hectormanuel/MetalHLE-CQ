@@ -1205,6 +1205,71 @@ impl Fs {
         Some(GuestPathBuf::from(resolved_path))
     }
 
+    /// Lenient fallback for [resolve_case_insensitive_path]: search for the
+    /// requested basename anywhere under the deepest existing ancestor
+    /// directory of `path` (bounded scan).
+    ///
+    /// iPhone-era games and middleware frequently hardcode asset paths that
+    /// only match the Xcode-flattened layout on the original device; some
+    /// bundles keep the same assets in subdirectories instead. The strict
+    /// case-insensitive walk above misses those, so as a last resort the
+    /// final path component is looked up by name in the subtree rooted at
+    /// the longest existing prefix of the request. Only used by callers
+    /// that would otherwise fail (e.g. audio decoding), never to reject a
+    /// path that resolves normally.
+    pub fn resolve_lenient_path(&self, path: &GuestPath) -> Option<GuestPathBuf> {
+        if let Some(p) = self.resolve_case_insensitive_path(path) {
+            return Some(p);
+        }
+        let components = resolve_path(path, Some(&self.working_directory));
+        let wanted = components.last()?.to_lowercase();
+        // Longest existing directory prefix of the request.
+        let mut prefix = String::from("/");
+        let mut prefix_len = 0usize;
+        for (i, comp) in components.iter().enumerate() {
+            let mut candidate = prefix.clone();
+            if candidate != "/" {
+                candidate.push('/');
+            }
+            candidate.push_str(comp);
+            if self.is_dir(GuestPath::new(&candidate)) {
+                prefix = candidate;
+                prefix_len = i + 1;
+            } else {
+                break;
+            }
+        }
+        if prefix_len + 1 >= components.len() {
+            // The parent directory exists and the name is simply absent
+            // from it; scanning the subtree cannot find anything new.
+            return None;
+        }
+        let mut stack: Vec<String> = vec![prefix];
+        let mut visited_dirs = 0usize;
+        while let Some(dir) = stack.pop() {
+            if visited_dirs >= 1000 {
+                return None;
+            }
+            visited_dirs += 1;
+            let Ok(entries) = self.enumerate_with_types(GuestPath::new(&dir)) else {
+                continue;
+            };
+            // Collect first so the borrow of self ends each iteration.
+            let entries: Vec<(String, bool)> = entries
+                .map(|(name, ty)| (name.to_owned(), matches!(ty, FsNodeType::Directory)))
+                .collect();
+            for (name, is_dir) in entries {
+                let full = format!("{}/{}", dir, name);
+                if is_dir {
+                    stack.push(full);
+                } else if name.to_lowercase() == wanted {
+                    return Some(GuestPathBuf::from(full));
+                }
+            }
+        }
+        None
+    }
+
     /// Returns access information about the file/directory at the path
     /// (exists, read, write, execute)
     pub fn access(&self, path: &GuestPath) -> (bool, bool, bool, bool) {

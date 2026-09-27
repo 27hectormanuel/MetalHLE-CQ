@@ -76,8 +76,10 @@ fn read_context(
 ) -> Result<Option<SCNetworkReachabilityContext>, &'static str> {
     if ptr.is_null() { return Ok(None); }
     let size = guest_size_of::<SCNetworkReachabilityContext>();
+    let end = ptr.to_bits() as u64 + size as u64;
     // get_bytes_fallible can return a SHORT synthetic null-page slice.
     if ptr.to_bits() < mem.null_segment_size()
+        || end > u32::MAX as u64 + 1
         || mem.get_bytes_fallible(ptr.cast(), size).map(|b| b.len()) != Some(size as usize)
     {
         return Err("unreadable context");
