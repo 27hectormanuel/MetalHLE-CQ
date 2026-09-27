@@ -548,12 +548,17 @@ fn app_picker_inner(
     );
 
     let mut quick_options_cheat_engine = quick_options_trainer_enabled(&env.options);
+    // "GLES Native" starts out matching the effective option state (OFF by
+    // default, i.e. the bundled ANGLE backend), so the switch always shows
+    // what will actually be used when the app is launched.
+    let mut quick_options_gles_native = quick_options_gles_native_enabled(&env.options);
     let quick_options_stuff = setup_quick_options(
         env,
         delegate,
         main_view,
         app_frame,
         quick_options_cheat_engine,
+        quick_options_gles_native,
     );
     let mut quick_options_scale_hack: Option<NonZeroU32> = None;
     let mut quick_options_fullscreen: Option<()> = None;
@@ -562,7 +567,6 @@ fn app_picker_inner(
     let mut quick_options_network = false;
     let mut quick_options_show_fps = false;
     let mut quick_options_trace_gl_errors = false;
-    let mut quick_options_gles_native = true;
     let mut quick_options_device_tag: Option<i32> = None;
     let mut quick_options_device_model_open = false;
     let mut quick_options_device_model_scroll: isize = 0;
@@ -896,9 +900,11 @@ fn app_picker_inner(
     if quick_options_trace_gl_errors {
         option_args.push("--trace-gl-errors".to_string());
     }
-    if !quick_options_gles_native {
-        option_args.push("--no-gles-native".to_string());
-    }
+    // Always passed explicitly (like `--trainer`/`--no-trainer`): the base
+    // default is now OFF, so the switch has to be able to turn the native
+    // driver back on, and the picker's choice should win over any
+    // `--gles-native`/`--no-gles-native` in the options files.
+    option_args.push(quick_options_gles_native_argument(quick_options_gles_native).to_string());
 
     if let Some(tag) = quick_options_device_tag {
         let tag = tag as NSInteger;
@@ -1403,6 +1409,7 @@ fn setup_quick_options(
     super_view: id,
     app_frame: CGRect,
     cheat_engine_enabled: bool,
+    gles_native_enabled: bool,
 ) -> QuickOptionsStuff {
     // UIView*
     let main_frame = CGRect {
@@ -1504,7 +1511,7 @@ fn setup_quick_options(
         RowKind::Label("Trace GL errors"),
         RowKind::Switch("traceGLErrors:", false),
         RowKind::Label("GLES Native"),
-        RowKind::Switch("glesNative:", true),
+        RowKind::Switch("glesNative:", gles_native_enabled),
         RowKind::Label("Use analog sticks for tilt controls"),
         RowKind::Switch("analogStickTiltControls:", true),
         // ---- (divider for stuff skipped below)
@@ -1871,6 +1878,24 @@ fn quick_options_trainer_argument(enabled: bool) -> &'static str {
     }
 }
 
+/// Initial state of the "GLES Native" switch: whatever the effective
+/// [`Options`] say. The app picker runs before the options files are read,
+/// so in practice this is OFF unless `--gles-native` was given on the
+/// command line.
+fn quick_options_gles_native_enabled(options: &Options) -> bool {
+    options.gles_native
+}
+
+/// Launch argument matching the "GLES Native" switch. Always emitted so that
+/// the switch's choice overrides the base default and the options files.
+fn quick_options_gles_native_argument(enabled: bool) -> &'static str {
+    if enabled {
+        "--gles-native"
+    } else {
+        "--no-gles-native"
+    }
+}
+
 #[cfg(test)]
 mod quick_options_trainer_tests {
     use super::*;
@@ -1892,5 +1917,29 @@ mod quick_options_trainer_tests {
         enabled = quick_options_trainer_enabled(&options);
         assert!(!enabled);
         assert_eq!(quick_options_trainer_argument(enabled), "--no-trainer");
+    }
+}
+
+#[cfg(test)]
+mod quick_options_gles_native_tests {
+    use super::*;
+
+    #[test]
+    fn gles_native_toggle_defaults_off_and_emits_explicit_launch_option() {
+        let mut options = Options::default();
+
+        let mut enabled = quick_options_gles_native_enabled(&options);
+        assert!(!enabled);
+        assert_eq!(quick_options_gles_native_argument(enabled), "--no-gles-native");
+
+        options.parse_argument("--gles-native").unwrap();
+        enabled = quick_options_gles_native_enabled(&options);
+        assert!(enabled);
+        assert_eq!(quick_options_gles_native_argument(enabled), "--gles-native");
+
+        options.parse_argument("--no-gles-native").unwrap();
+        enabled = quick_options_gles_native_enabled(&options);
+        assert!(!enabled);
+        assert_eq!(quick_options_gles_native_argument(enabled), "--no-gles-native");
     }
 }

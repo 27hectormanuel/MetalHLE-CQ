@@ -220,12 +220,14 @@ pub struct Options {
     /// Much noisier than `trace_gl_errors`. Diagnostic only.
     pub verbose_gles: bool,
     /// Prefer the vendor's native OpenGL ES driver over the bundled ANGLE
-    /// libraries on Android. Defaults to `true` ("GLES Native" quick option
-    /// ON): the native driver behaves closest to real iPhone-era hardware
-    /// (lenient GLSL ES linking etc.) and avoids ANGLE's stricter validation
-    /// that breaks some apps' shaders (e.g. Gangstar's fragment-only
-    /// varyings). Disable (`--no-gles-native`, quick option OFF) to force the
-    /// bundled ANGLE backend. Only meaningful on Android; ignored elsewhere.
+    /// libraries on Android. Defaults to `false` ("GLES Native" quick option
+    /// OFF): the bundled ANGLE backend is the predictable default, since
+    /// vendor drivers differ a lot between devices. Enable (`--gles-native`,
+    /// quick option ON) to use the vendor driver instead: it behaves closest
+    /// to real iPhone-era hardware (lenient GLSL ES linking etc.) and avoids
+    /// ANGLE's stricter validation, which breaks some apps' shaders (e.g.
+    /// Gangstar's fragment-only varyings). Only meaningful on Android;
+    /// ignored elsewhere.
     pub gles_native: bool,
     /// After a `glTexImage2D(level=0, …)` upload, if the bound texture's
     /// `GL_TEXTURE_MIN_FILTER` is still the ES 1.1 default
@@ -308,7 +310,7 @@ impl Default for Options {
             ignore_gl_errors: false,
             trace_gl_errors: false,
             verbose_gles: false,
-            gles_native: true,
+            gles_native: false,
             // On Android the host GLES driver is essentially always
             // ARM Mali / Qualcomm Adreno / something equally strict,
             // and apps shipped for iOS overwhelmingly upload PVRTC and
