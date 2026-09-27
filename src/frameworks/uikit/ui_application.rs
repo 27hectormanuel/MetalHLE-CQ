@@ -26,6 +26,13 @@ pub struct State {
     /// Whether shake to edit is enabled
     pub(super) application_supports_shake_to_edit: bool,
     pub(super) ignoring_interaction_events_count: u32,
+    /// Set when `-[UIWindow addSubview:]` actually applied a rotation
+    /// transform to the root view because the app said yes to
+    /// `shouldAutorotateToInterfaceOrientation:`. Apps that rotate their
+    /// own drawing answer no and never get a transform; the EAGL present
+    /// path uses this to decide whether it must replicate the transform
+    /// (Core Animation composition is bypassed for direct presenters).
+    pub autorotation_transform_applied: bool,
 }
 
 #[derive(Default)]
