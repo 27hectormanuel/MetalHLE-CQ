@@ -265,6 +265,17 @@ pub const CLASSES: ClassExports = objc_classes! {
         return nil;
     }
 
+    // On success, explicitly clear *outError. Sloppy callers — e.g. old
+    // ObjectAL's `-[OALAudioTrack preloadUrl:seekTime:]`, which declares
+    // `NSError* error;` uninitialised and then tests `nil != error` —
+    // would otherwise read stack garbage, conclude the load failed and
+    // log `[error localizedDescription]` as `(null)` while dropping the
+    // perfectly good player. Apple's own implementations tolerate such
+    // callers in practice; writing nil keeps them working.
+    if !outError.is_null() {
+        env.mem.write(outError, nil);
+    }
+
     this
 }
 
@@ -284,6 +295,11 @@ pub const CLASSES: ClassExports = objc_classes! {
             let guest_audio_file = audio_file::register_audio_file(env, host_object);
             env.objc.borrow_mut::<AVAudioPlayerHostObject>(this).audio_file_id =
                 Some(guest_audio_file);
+            // Clear *outError on success; see initWithContentsOfURL: for
+            // why uninitialised-error callers need this.
+            if !outError.is_null() {
+                env.mem.write(outError, nil);
+            }
             this
         }
         Err(_) => {
