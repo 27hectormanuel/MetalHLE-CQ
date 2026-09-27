@@ -1125,6 +1125,16 @@ fn strtoll(env: &mut Environment, str: ConstPtr<u8>, endptr: MutPtr<MutPtr<u8>>,
     }
 }
 
+fn strtoll_l(
+    env: &mut Environment,
+    str: ConstPtr<u8>,
+    endptr: MutPtr<MutPtr<u8>>,
+    base: i32,
+    _locale: ConstVoidPtr,
+) -> i64 {
+    strtoll(env, str, endptr, base)
+}
+
 fn strtol(env: &mut Environment, str: ConstPtr<u8>, endptr: MutPtr<MutPtr<u8>>, base: i32) -> i32 {
     set_errno(env, 0);
     match strtol_inner(env, str, base as u32) {
@@ -1896,6 +1906,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(strtoull(_, _, _)),
     export_c_func!(strtoull_l(_, _, _, _)),
     export_c_func!(strtoll(_, _, _)),
+    export_c_func!(strtoll_l(_, _, _, _)),
     export_c_func_aliased!("strtoq", strtoll(_, _, _)),
     export_c_func_aliased!("strtouq", strtoull(_, _, _)),
     export_c_func!(strtol(_, _, _)),

@@ -324,6 +324,18 @@ mod tests {
     }
 
     #[test]
+    fn strtoll_l_is_exported() {
+        let is_exported = DYLIB_LIST
+            .iter()
+            .flat_map(|dylib| dylib.function_exports)
+            .copied()
+            .flatten()
+            .any(|(function_name, _)| *function_name == "_strtoll_l");
+
+        assert!(is_exported, "Missing libc export _strtoll_l");
+    }
+
+    #[test]
     fn no_duplicate_functions() {
         let mut seen = HashSet::new();
 
