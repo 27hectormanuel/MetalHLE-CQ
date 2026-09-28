@@ -1144,6 +1144,8 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                                         ui_search_bar::handle_return(env, responder)
                                     }
                                 }
+                            } else if ui_responder::is_text_input_responder(env, responder) {
+                                ui_responder::handle_text_input_event(env, responder, text_event);
                             }
                         }
                     }

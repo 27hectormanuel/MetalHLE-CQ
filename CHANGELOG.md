@@ -19,6 +19,7 @@ Compatibility:
 
 - Android soft-keyboard requests from UIKit responders now reach the host IME after the editor view is attached; private `UIKeyboard` activation is bridged to SDL text input, and repeated focus requests retry the keyboard.
 - `UISearchBar` now participates in first-responder handling and routes text, backspace, and Search-key events to its delegate.
+- Cocos2d's `EAGLView` `UIKeyInput` responder now opens the host keyboard and receives text, delete, and Return events through the guest's IME dispatcher.
 
 - Gangstar Rio now reports `UIScreen.bounds`, `nativeBounds`, and `currentMode.size` in landscape when launched in landscape, keeping its EAGL scene from rendering in a small clipped region on iPhone 5/5c.
 
