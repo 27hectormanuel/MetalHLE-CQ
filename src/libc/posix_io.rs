@@ -353,6 +353,153 @@ fn looks_like_audio_file(path: &str) -> bool {
     }
 }
 
+/// Per-fd bookkeeping for the `TOUCHHLE_TRACE_AUDIO_FILES` diagnostics: enough
+/// to distinguish "the app probed the header and gave up" from "the app
+/// streamed the whole file". Keyed by descriptor, reset on every open (the
+/// descriptors of short-lived audio files get reused constantly).
+struct AudioFileTraceEntry {
+    path: String,
+    bytes_read: u64,
+    reads: u32,
+    seeks: u32,
+    /// Whether the first bytes of file content have been dumped already.
+    header_dumped: bool,
+}
+
+static AUDIO_FILE_TRACES: std::sync::Mutex<
+    std::collections::HashMap<FileDescriptor, AudioFileTraceEntry>,
+> = std::sync::Mutex::new(std::collections::HashMap::new());
+
+fn audio_trace_enabled() -> bool {
+    crate::env_flag_cached!("TOUCHHLE_TRACE_AUDIO_FILES")
+}
+
+fn audio_trace_register(fd: FileDescriptor, path: &str) {
+    if let Ok(mut traces) = AUDIO_FILE_TRACES.lock() {
+        traces.insert(
+            fd,
+            AudioFileTraceEntry {
+                path: path.to_string(),
+                bytes_read: 0,
+                reads: 0,
+                seeks: 0,
+                header_dumped: false,
+            },
+        );
+    }
+}
+
+/// Logs the first bytes of an audio file's content (its magic) plus a sampled
+/// progress line. The magic answers a question that costs hours of guessing
+/// otherwise: whether the bytes the app is about to decode really are the
+/// container it thinks they are (`ID3`/`0xff 0xfb` for MP3, `OggS` for Vorbis)
+/// or something else entirely (an encrypted or truncated asset).
+fn audio_trace_read(
+    env: &mut Environment,
+    fd: FileDescriptor,
+    buffer: MutVoidPtr,
+    bytes_read: u64,
+) {
+    if !audio_trace_enabled() {
+        return;
+    }
+    let Ok(mut traces) = AUDIO_FILE_TRACES.lock() else {
+        return;
+    };
+    let Some(entry) = traces.get_mut(&fd) else {
+        return;
+    };
+    entry.reads += 1;
+    entry.bytes_read += bytes_read;
+    let dump_header = !entry.header_dumped && bytes_read > 0;
+    if dump_header {
+        entry.header_dumped = true;
+    }
+    let verbose = entry.reads <= 8 || entry.reads % 64 == 0;
+    if !dump_header && !verbose {
+        return;
+    }
+    let path = entry.path.clone();
+    let reads = entry.reads;
+    let total = entry.bytes_read;
+    drop(traces);
+
+    if dump_header {
+        let n: u32 = bytes_read.min(16).try_into().unwrap_or(16);
+        let bytes = env.mem.bytes_at(buffer.cast(), n);
+        let hex: Vec<String> = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+        let ascii: String = bytes
+            .iter()
+            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .collect();
+        log!(
+            "TOUCHHLE_TRACE_AUDIO_FILES: first {} byte(s) of {:?} are [{}] \
+             (as text: {:?})",
+            n,
+            path,
+            hex.join(" "),
+            ascii
+        );
+    }
+    log!(
+        "TOUCHHLE_TRACE_AUDIO_FILES: read #{} from {:?} returned {} byte(s), \
+         {} byte(s) read so far",
+        reads,
+        path,
+        bytes_read,
+        total
+    );
+}
+
+fn audio_trace_seek(fd: FileDescriptor, offset: off_t, whence: i32, result: off_t) {
+    if !audio_trace_enabled() {
+        return;
+    }
+    let Ok(mut traces) = AUDIO_FILE_TRACES.lock() else {
+        return;
+    };
+    let Some(entry) = traces.get_mut(&fd) else {
+        return;
+    };
+    entry.seeks += 1;
+    if entry.seeks > 8 && entry.seeks % 64 != 0 {
+        return;
+    }
+    let path = entry.path.clone();
+    let seeks = entry.seeks;
+    drop(traces);
+    log!(
+        "TOUCHHLE_TRACE_AUDIO_FILES: seek #{} on {:?} (offset {:#x}, whence {}) \
+         => {:#x}",
+        seeks,
+        path,
+        offset,
+        whence,
+        result
+    );
+}
+
+fn audio_trace_close(fd: FileDescriptor) {
+    if !audio_trace_enabled() {
+        return;
+    }
+    let Ok(mut traces) = AUDIO_FILE_TRACES.lock() else {
+        return;
+    };
+    let Some(entry) = traces.remove(&fd) else {
+        return;
+    };
+    drop(traces);
+    log!(
+        "TOUCHHLE_TRACE_AUDIO_FILES: closed {:?} after {} read(s) ({} byte(s)) \
+         and {} seek(s)",
+        entry.path,
+        entry.reads,
+        entry.bytes_read,
+        entry.seeks
+    );
+}
+
 pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> FileDescriptor {
     let known_flags = O_ACCMODE
         | O_NONBLOCK
@@ -539,6 +686,11 @@ pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> Fil
             res,
             flags
         );
+        if res != -1 {
+            // Track it so the read/seek/close hooks below can report how much
+            // of the file the app actually consumed.
+            audio_trace_register(res, &actual_path_string);
+        }
     }
     res
 }
@@ -622,6 +774,7 @@ pub fn read(
                     bytes_read
                 );
             }
+            audio_trace_read(env, fd, buffer, bytes_read as u64);
             bytes_read.try_into().unwrap_or(-1)
         }
         Err(e) => {
@@ -915,6 +1068,7 @@ pub fn lseek(env: &mut Environment, fd: FileDescriptor, offset: off_t, whence: i
             return -1;
         }
     };
+    audio_trace_seek(fd, offset, whence, res);
     log_dbg!("lseek({:?}, {:#x}, {}) => {}", fd, offset, whence, res);
     res
 }
@@ -955,6 +1109,7 @@ pub fn close(env: &mut Environment, fd: FileDescriptor) -> i32 {
                 let _ = file_obj.file.sync_all();
             }
 
+            audio_trace_close(fd);
             log_dbg!("close({}) -> success", fd);
             return 0;
         }

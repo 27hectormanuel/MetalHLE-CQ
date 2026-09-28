@@ -1383,9 +1383,23 @@ impl Environment {
                         );
                         let return_value: mem::MutVoidPtr =
                             start_routine.call_from_host(env, (user_data,));
-                        let curr_thread = &mut env.threads[env.current_thread];
+                        let tid = env.current_thread;
+                        let curr_thread = &mut env.threads[tid];
                         curr_thread.return_value = Some(return_value);
                         curr_thread.active = false;
+                        // Opt-in: report that a guest worker thread's start
+                        // routine returned, i.e. the thread is gone for good.
+                        // A thread that finishes right after being created is
+                        // the classic signature of a worker that gave up (see
+                        // TOUCHHLE_TRACE_THREADS in libc/pthread/thread.rs).
+                        if crate::env_flag_cached!("TOUCHHLE_TRACE_THREADS") {
+                            log!(
+                                "TOUCHHLE_TRACE_THREADS: thread {} \
+                                 (start_routine {:#x}) returned; thread finished",
+                                tid,
+                                start_routine.addr_with_thumb_bit()
+                            );
+                        }
                     });
                 }));
                 if let Err(e) = res {

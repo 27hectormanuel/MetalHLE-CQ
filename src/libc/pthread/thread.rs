@@ -346,6 +346,21 @@ pub fn pthread_create(
         thread_id
     );
     log_once!("First pthread_create (app spawned a worker thread via raw pthread)");
+    // Opt-in diagnostics for "a worker thread seems to do nothing" (e.g. the
+    // streaming thread of an audio middleware, which is what decides whether
+    // music plays while one-shot samples still do). Pairs with the
+    // thread-finished line in `Environment::new_thread` and the name line in
+    // [pthread_setname_np].
+    if crate::env_flag_cached!("TOUCHHLE_TRACE_THREADS") {
+        log!(
+            "TOUCHHLE_TRACE_THREADS: pthread_create -> thread {} \
+             (start_routine {:#x}, stacksize {:#x}, user_data {:?})",
+            thread_id,
+            start_routine.addr_with_thumb_bit(),
+            attr.stacksize,
+            user_data
+        );
+    }
     0
 }
 
@@ -857,6 +872,13 @@ fn pthread_setname_np(env: &mut Environment, name: ConstPtr<u8>) -> i32 {
         host_obj.name = truncated.clone();
     }
     log_dbg!("pthread_setname_np({:?})", truncated);
+    if crate::env_flag_cached!("TOUCHHLE_TRACE_THREADS") {
+        log!(
+            "TOUCHHLE_TRACE_THREADS: thread {} named {:?}",
+            env.current_thread,
+            truncated
+        );
+    }
     0
 }
 
