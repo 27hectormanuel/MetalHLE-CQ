@@ -1618,6 +1618,18 @@ pub const CLASSES: ClassExports = objc_classes! {
     ui_font::size_with_font(env, font, &text, None)
 }
 
+- (CGSize)sizeWithAttributes:(id)attributes {
+    let text = to_rust_string(env, this);
+    let font_key = get_static_str(env, "NSFont");
+    let font: id = msg![env; attributes objectForKey:font_key];
+    let font: id = if font == nil {
+        msg_class![env; UIFont systemFontOfSize:12.0]
+    } else {
+        font
+    };
+    ui_font::size_with_font(env, font, &text, None)
+}
+
 - (CGSize)sizeWithFont:(id)font forWidth:(CGFloat)width lineBreakMode:(UILineBreakMode)line_break_mode {
     let text = to_rust_string(env, this);
     let size = CGSize { width, height: 99999.0 };
