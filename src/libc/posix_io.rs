@@ -333,189 +333,6 @@ pub(crate) fn resolve_existing_guest_path(env: &Environment, path: &str) -> Opti
     candidates.iter().find_map(|candidate| resolve(candidate))
 }
 
-/// Does `path` look like an audio file? Only used by the opt-in
-/// `TOUCHHLE_TRACE_AUDIO_FILES` diagnostics in [open_direct].
-///
-/// Extension matching (case-insensitive) is deliberately naive: it has to be
-/// cheap enough to run on every `open()`/`fopen()`, and it covers the
-/// containers audio middleware actually reads.
-fn looks_like_audio_file(path: &str) -> bool {
-    const AUDIO_EXTENSIONS: [&str; 13] = [
-        "mp3", "ogg", "oga", "wav", "aif", "aiff", "aifc", "m4a", "aac", "caf", "flac", "wma",
-        "mp4",
-    ];
-    match path.rsplit_once('.') {
-        Some((_, extension)) => {
-            let extension = extension.to_ascii_lowercase();
-            AUDIO_EXTENSIONS.iter().any(|&known| extension == known)
-        }
-        None => false,
-    }
-}
-
-/// Per-fd bookkeeping for the `TOUCHHLE_TRACE_AUDIO_FILES` diagnostics: enough
-/// to distinguish "the app probed the header and gave up" from "the app
-/// streamed the whole file". Keyed by descriptor, reset on every open (the
-/// descriptors of short-lived audio files get reused constantly).
-struct AudioFileTraceEntry {
-    path: String,
-    bytes_read: u64,
-    reads: u32,
-    seeks: u32,
-    /// Whether the first bytes of file content have been dumped already.
-    header_dumped: bool,
-}
-
-// `HashMap::new` isn't const (its hasher isn't), so this needs `LazyLock` —
-// the same pattern `libc/sysctl.rs` uses for its static map.
-static AUDIO_FILE_TRACES: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<FileDescriptor, AudioFileTraceEntry>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
-fn audio_trace_enabled() -> bool {
-    crate::env_flag_cached!("TOUCHHLE_TRACE_AUDIO_FILES")
-}
-
-fn audio_trace_register(fd: FileDescriptor, path: &str) {
-    if let Ok(mut traces) = AUDIO_FILE_TRACES.lock() {
-        traces.insert(
-            fd,
-            AudioFileTraceEntry {
-                path: path.to_string(),
-                bytes_read: 0,
-                reads: 0,
-                seeks: 0,
-                header_dumped: false,
-            },
-        );
-    }
-}
-
-/// Logs the first bytes of an audio file's content (its magic) plus a sampled
-/// progress line. The magic answers a question that costs hours of guessing
-/// otherwise: whether the bytes the app is about to decode really are the
-/// container it thinks they are (`ID3`/`0xff 0xfb` for MP3, `OggS` for Vorbis)
-/// or something else entirely (an encrypted or truncated asset).
-fn audio_trace_read(
-    env: &mut Environment,
-    fd: FileDescriptor,
-    buffer: MutVoidPtr,
-    bytes_read: u64,
-    new_offset: off_t,
-) {
-    if !audio_trace_enabled() {
-        return;
-    }
-    let Ok(mut traces) = AUDIO_FILE_TRACES.lock() else {
-        return;
-    };
-    let Some(entry) = traces.get_mut(&fd) else {
-        return;
-    };
-    entry.reads += 1;
-    entry.bytes_read += bytes_read;
-    // A read whose *start* offset is 0 shows the real file header. Apps that
-    // probe the end of the file first (very common: seek to EOF, ftell, seek
-    // back to 0) make the "first bytes read" something else entirely, so both
-    // cases are labelled explicitly.
-    let at_offset_zero = new_offset == bytes_read as off_t;
-    let dump_header = bytes_read > 0 && (at_offset_zero || !entry.header_dumped);
-    if dump_header {
-        entry.header_dumped = true;
-    }
-    let verbose = entry.reads <= 8 || entry.reads % 64 == 0;
-    if !dump_header && !verbose {
-        return;
-    }
-    let path = entry.path.clone();
-    let reads = entry.reads;
-    let total = entry.bytes_read;
-    // Which guest thread issues the reads is decisive: reads from FMOD's own
-    // stream/mixer thread mean FMOD opened the file itself (path based), reads
-    // from the main thread mean the game slurped the file into memory and will
-    // hand FMOD a buffer (FMOD_OPENMEMORY). Completely different code paths.
-    let tid = env.current_thread;
-    drop(traces);
-
-    if dump_header {
-        let n: u32 = bytes_read.min(16).try_into().unwrap_or(16);
-        let bytes = env.mem.bytes_at(buffer.cast(), n);
-        let hex: Vec<String> = bytes.iter().map(|b| format!("{:02x}", b)).collect();
-        let ascii: String = bytes
-            .iter()
-            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
-            .collect();
-        log!(
-            "TOUCHHLE_TRACE_AUDIO_FILES: {}{} byte(s) of {:?} are [{}] \
-             (as text: {:?})",
-            if at_offset_zero { "header at file offset 0, first " } else { "first read, first " },
-            n,
-            path,
-            hex.join(" "),
-            ascii
-        );
-    }
-    log!(
-        "TOUCHHLE_TRACE_AUDIO_FILES: read #{} from {:?} by thread {} returned \
-         {} byte(s), offset now {:#x}, {} byte(s) read so far",
-        reads,
-        path,
-        tid,
-        bytes_read,
-        new_offset.max(0) as u64,
-        total
-    );
-}
-
-fn audio_trace_seek(fd: FileDescriptor, offset: off_t, whence: i32, result: off_t) {
-    if !audio_trace_enabled() {
-        return;
-    }
-    let Ok(mut traces) = AUDIO_FILE_TRACES.lock() else {
-        return;
-    };
-    let Some(entry) = traces.get_mut(&fd) else {
-        return;
-    };
-    entry.seeks += 1;
-    if entry.seeks > 8 && entry.seeks % 64 != 0 {
-        return;
-    }
-    let path = entry.path.clone();
-    let seeks = entry.seeks;
-    drop(traces);
-    log!(
-        "TOUCHHLE_TRACE_AUDIO_FILES: seek #{} on {:?} (offset {:#x}, whence {}) \
-         => {:#x}",
-        seeks,
-        path,
-        offset,
-        whence,
-        result
-    );
-}
-
-fn audio_trace_close(fd: FileDescriptor) {
-    if !audio_trace_enabled() {
-        return;
-    }
-    let Ok(mut traces) = AUDIO_FILE_TRACES.lock() else {
-        return;
-    };
-    let Some(entry) = traces.remove(&fd) else {
-        return;
-    };
-    drop(traces);
-    log!(
-        "TOUCHHLE_TRACE_AUDIO_FILES: closed {:?} after {} read(s) ({} byte(s)) \
-         and {} seek(s)",
-        entry.path,
-        entry.reads,
-        entry.bytes_read,
-        entry.seeks
-    );
-}
-
 pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> FileDescriptor {
     let known_flags = O_ACCMODE
         | O_NONBLOCK
@@ -685,29 +502,6 @@ pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> Fil
         flags,
         res
     );
-    // Opt-in diagnostics for "the app plays no music": log every open() of a
-    // file whose name looks like audio. `open_direct` is the funnel for
-    // open(2), fopen(3), mmap(2) and NSFileHandle, so this shows whether the
-    // app reads its audio at all, which path it resolves to (app bundle vs.
-    // Documents/cache) and whether the open failed. Enabled by setting
-    // TOUCHHLE_TRACE_AUDIO_FILES=1, and turned on automatically for a few
-    // bundle identifiers in lib.rs.
-    if crate::env_flag_cached!("TOUCHHLE_TRACE_AUDIO_FILES")
-        && looks_like_audio_file(&actual_path_string)
-    {
-        log!(
-            "TOUCHHLE_TRACE_AUDIO_FILES: open({:?}) => {} (fd {}, flags {:#x})",
-            actual_path_string,
-            if res == -1 { "FAILED" } else { "ok" },
-            res,
-            flags
-        );
-        if res != -1 {
-            // Track it so the read/seek/close hooks below can report how much
-            // of the file the app actually consumed.
-            audio_trace_register(res, &actual_path_string);
-        }
-    }
     res
 }
 
@@ -725,7 +519,7 @@ pub fn read(
     // Keep the descriptor borrow inside this block: after an unreadable Unity
     // archive is detected, we need the whole Environment to record it before
     // the guest can reach its fatal exit path.
-    let (read_result, unusable_player_archive, pos_before) = {
+    let (read_result, unusable_player_archive) = {
         let Some(file) = env.libc_state.posix_io.file_for_fd(fd) else {
             log!(
                 "Warning: read({:?}, {:?}, {:#x}) called with unknown fd, returning -1",
@@ -737,13 +531,10 @@ pub fn read(
             return -1;
         };
 
-        // Position before the read; also used to report where an audio file
-        // read landed (see audio_trace_read).
-        let pos_before = file.file.stream_position().ok();
         // A zero-length first read of Unity's mandatory archive means that a
         // ZIP entry was registered but could not be decompressed. Do not treat
         // a normal EOF after valid data as a mount failure.
-        let starts_at_beginning = pos_before == Some(0);
+        let starts_at_beginning = file.file.stream_position().ok() == Some(0);
         let archive_path = file.path.clone();
         let read_result = {
             let buffer_slice = env.mem.bytes_at_mut(buffer.cast(), size);
@@ -761,7 +552,7 @@ pub fn read(
             Err(_) => archive_path,
             _ => None,
         };
-        (read_result, unusable_player_archive, pos_before)
+        (read_result, unusable_player_archive)
     };
 
     if let Some(path) = unusable_player_archive {
@@ -793,12 +584,6 @@ pub fn read(
                     bytes_read
                 );
             }
-            // File offset after the read, for the audio-file tracing.
-            let new_offset: off_t = match pos_before {
-                Some(pos) => pos as off_t + bytes_read as off_t,
-                None => -1,
-            };
-            audio_trace_read(env, fd, buffer, bytes_read as u64, new_offset);
             bytes_read.try_into().unwrap_or(-1)
         }
         Err(e) => {
@@ -1092,7 +877,6 @@ pub fn lseek(env: &mut Environment, fd: FileDescriptor, offset: off_t, whence: i
             return -1;
         }
     };
-    audio_trace_seek(fd, offset, whence, res);
     log_dbg!("lseek({:?}, {:#x}, {}) => {}", fd, offset, whence, res);
     res
 }
@@ -1133,7 +917,6 @@ pub fn close(env: &mut Environment, fd: FileDescriptor) -> i32 {
                 let _ = file_obj.file.sync_all();
             }
 
-            audio_trace_close(fd);
             log_dbg!("close({}) -> success", fd);
             return 0;
         }

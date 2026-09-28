@@ -322,35 +322,6 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     }
     // ULTRAHLE_POTATO_LANDSCAPE_END
 
-    // ULTRAHLE_GEOMETRYDASH_AUDIO_TRACE_BEGIN
-    // Geometry Dash plays its music through FMOD Ex, which *streams* music
-    // tracks (decoded incrementally on a worker thread) while its sound effects
-    // are one-shot samples decoded up front. "Sound effects work but there is no
-    // music at all" therefore always means the streaming side never got its
-    // data. Two questions decide where it is lost, so trace both for this app:
-    //
-    // * TOUCHHLE_TRACE_AUDIO_FILES - every open()/read()/lseek()/close() of an
-    //   audio-looking file, including the first bytes read (the container
-    //   magic) and the total consumed. Tells us whether a song is streamed to
-    //   the end, probed and abandoned, or contains something other than the
-    //   audio the app expects (see `open_direct` in src/libc/posix_io.rs).
-    // * TOUCHHLE_TRACE_THREADS - every pthread_create/setname_np and every
-    //   thread whose start routine returned. Tells us whether the streamer
-    //   thread exists at all, what it is called, and whether it dies
-    //   immediately.
-    //
-    // Users can set either variable themselves for any other app.
-    if app_id.starts_with("com.robtop.geometryjump") {
-        for name in ["TOUCHHLE_TRACE_AUDIO_FILES", "TOUCHHLE_TRACE_THREADS"] {
-            if std::env::var_os(name).is_none() {
-                unsafe {
-                    std::env::set_var(name, "1");
-                }
-            }
-        }
-    }
-    // ULTRAHLE_GEOMETRYDASH_AUDIO_TRACE_END
-
     let minimum_os_version = bundle.minimum_os_version();
     let required_device_capabilities = bundle.required_device_capabilities();
     let device_family = bundle.device_family_array();

@@ -1399,23 +1399,9 @@ impl Environment {
                         );
                         let return_value: mem::MutVoidPtr =
                             start_routine.call_from_host(env, (user_data,));
-                        let tid = env.current_thread;
-                        let curr_thread = &mut env.threads[tid];
+                        let curr_thread = &mut env.threads[env.current_thread];
                         curr_thread.return_value = Some(return_value);
                         curr_thread.active = false;
-                        // Opt-in: report that a guest worker thread's start
-                        // routine returned, i.e. the thread is gone for good.
-                        // A thread that finishes right after being created is
-                        // the classic signature of a worker that gave up (see
-                        // TOUCHHLE_TRACE_THREADS in libc/pthread/thread.rs).
-                        if crate::env_flag_cached!("TOUCHHLE_TRACE_THREADS") {
-                            log!(
-                                "TOUCHHLE_TRACE_THREADS: thread {} \
-                                 (start_routine {:#x}) returned; thread finished",
-                                tid,
-                                start_routine.addr_with_thumb_bit()
-                            );
-                        }
                     });
                 }));
                 if let Err(e) = res {
@@ -1707,39 +1693,12 @@ impl Environment {
         }
     }
 
-    /// Diagnostics helper for the opt-in `TOUCHHLE_TRACE_THREADS` tracing:
-    /// report what every guest thread is currently doing (running, finished, or
-    /// blocked on a specific mutex/cond/semaphore/sleep deadline). This is what
-    /// answers "is that engine worker thread actually making progress, or is it
-    /// stuck waiting on something the emulator never delivers?".
-    pub fn log_thread_states(&self) {
-        for (id, thread) in self.threads.iter().enumerate() {
-            let name = crate::libc::pthread::thread::thread_name_for_id(self, id)
-                .map(|n| format!(" ({})", n))
-                .unwrap_or_default();
-            let state = if !thread.active {
-                "finished".to_string()
-            } else if id == self.current_thread {
-                "running".to_string()
-            } else {
-                format!("{:?}", thread.blocked_by)
-            };
-            log!(
-                "TOUCHHLE_TRACE_THREADS: state of thread {}{}: {}",
-                id,
-                name,
-                state
-            );
-        }
-    }
-
     /// Run the emulator. This is the main loop and won't return until app exit.
     /// Only `main.rs` should call this.
     pub fn run(mut self) {
         let mut curr_host_context = self.threads[0].host_context.take().unwrap();
         let panic_cell = self.panic_cell.clone();
         let mut stepping = false;
-        let mut last_thread_state_dump = Instant::now();
         loop {
             if stepping {
                 self.remaining_ticks = None;
@@ -1786,16 +1745,6 @@ impl Environment {
                 } else {
                     1_000_000
                 });
-            }
-            // Diagnostics: periodically report the state of every guest thread
-            // (opt-in via TOUCHHLE_TRACE_THREADS, which the emulator turns on
-            // automatically for known-affected games). Throttled to one dump
-            // every few seconds so a long session stays readable.
-            if crate::env_flag_cached!("TOUCHHLE_TRACE_THREADS")
-                && last_thread_state_dump.elapsed() >= Duration::from_secs(5)
-            {
-                last_thread_state_dump = Instant::now();
-                self.log_thread_states();
             }
             // RTCV-style game corruption: once per main-loop iteration, give the
             // corruption engine a chance to mangle live guest memory. This is a

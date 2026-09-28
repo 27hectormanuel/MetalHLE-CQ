@@ -571,40 +571,13 @@ pub fn AudioFileOpenWithCallbacks(
         return final_status;
     }
 
-    // Diagnostics: what exactly the guest's callbacks handed us. Without
-    // this it is impossible to tell "the guest delivered no data" apart
-    // from "we could not decode the data it delivered", and the latter used
-    // to turn into silence without a trace.
-    let data_len = data_vec.len();
-    let preview: Vec<u8> = data_vec.iter().take(8).copied().collect();
-    log_dbg!(
-        "AudioFileOpenWithCallbacks(): callbacks delivered {} bytes, first bytes {:02x?}",
-        data_len,
-        preview
-    );
-
     let host_object = match audio::AudioFile::read_from_vec(data_vec) {
-        Ok(file) => {
-            let desc = file.audio_description();
-            log!(
-                "AudioFileOpenWithCallbacks(): decoded {} bytes -> {:?}, \
-                 {:.0} Hz, {} ch, {} bytes of PCM, {} packets",
-                data_len,
-                desc.format,
-                desc.sample_rate,
-                desc.channels_per_frame,
-                file.byte_count(),
-                file.packet_count()
-            );
-            AudioFileHostObject::Real(file)
-        }
+        Ok(file) => AudioFileHostObject::Real(file),
         Err(e) => {
             log!(
-                "Warning: parse error in AudioFileOpenWithCallbacks(): {:?} \
-                 (callbacks delivered {} bytes, first bytes {:02x?}).",
-                e,
-                data_len,
-                preview
+                "Warning: AudioFileOpenWithCallbacks() could not decode the \
+                 data delivered by the guest's callbacks: {:?}",
+                e
             );
             if !audiofile_dummy_on_error_enabled() {
                 // The real Audio File Services returns an error in this

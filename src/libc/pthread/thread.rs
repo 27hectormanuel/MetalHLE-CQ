@@ -25,22 +25,6 @@ impl State {
     }
 }
 
-/// Diagnostics helper: the name a guest thread gave itself via
-/// `pthread_setname_np` (e.g. "FMOD mixer thread"), if any. Lets tracing
-/// output label threads meaningfully instead of by bare id.
-pub fn thread_name_for_id(env: &Environment, id: ThreadId) -> Option<String> {
-    env.libc_state
-        .pthread
-        .thread
-        .threads
-        .values()
-        .find(|t| t.thread_id == id)
-        .and_then(|t| {
-            let name = t.name.trim();
-            (!name.is_empty()).then(|| name.to_string())
-        })
-}
-
 /// Apple's implementation is a 4-byte magic number followed by an 36-byte
 /// opaque region. We only have to match the size theirs has.
 #[derive(Copy, Clone, Debug)]
@@ -362,25 +346,6 @@ pub fn pthread_create(
         thread_id
     );
     log_once!("First pthread_create (app spawned a worker thread via raw pthread)");
-    // Opt-in diagnostics for "a worker thread seems to do nothing" (e.g. the
-    // streaming thread of an audio middleware, which is what decides whether
-    // music plays while one-shot samples still do). Pairs with the
-    // thread-finished line in `Environment::new_thread` and the name line in
-    // [pthread_setname_np].
-    if crate::env_flag_cached!("TOUCHHLE_TRACE_THREADS") {
-        // `pthread_attr_t` is `#[repr(C, packed)]`, so its fields must not be
-        // passed straight to a formatting macro: that would take a reference to
-        // an unaligned place (E0793). Copy the value out first.
-        let stacksize = attr.stacksize;
-        log!(
-            "TOUCHHLE_TRACE_THREADS: pthread_create -> thread {} \
-             (start_routine {:#x}, stacksize {:#x}, user_data {:?})",
-            thread_id,
-            start_routine.addr_with_thumb_bit(),
-            stacksize,
-            user_data
-        );
-    }
     0
 }
 
@@ -892,13 +857,6 @@ fn pthread_setname_np(env: &mut Environment, name: ConstPtr<u8>) -> i32 {
         host_obj.name = truncated.clone();
     }
     log_dbg!("pthread_setname_np({:?})", truncated);
-    if crate::env_flag_cached!("TOUCHHLE_TRACE_THREADS") {
-        log!(
-            "TOUCHHLE_TRACE_THREADS: thread {} named {:?}",
-            env.current_thread,
-            truncated
-        );
-    }
     0
 }
 

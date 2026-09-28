@@ -999,38 +999,6 @@ impl Mem {
             return;
         }
         let size = self.allocator.free(addr);
-        // Diagnostics for silent-audio reports (opt-in via
-        // TOUCHHLE_TRACE_AUDIO_FILES, which the emulator enables automatically
-        // for known-affected games).
-        //
-        // A *large* buffer being freed may be one the guest handed to its audio
-        // middleware without transferring ownership: FMOD's
-        // `FMOD_OPENMEMORY_POINT` streams, for instance, decode directly out of
-        // the caller's buffer for the entire lifetime of the sound, and games
-        // routinely let that buffer go out of scope right after
-        // `createStream()` returns. On a real device the freed bytes survive
-        // until the chunk is reused, so nobody notices; here they are scrubbed
-        // the instant `free()` runs, and the streamer decodes zeroes. Dumping
-        // the head of every large freed buffer turns "the music is silent" into
-        // "the game frees a buffer that still contains an ID3/OggS file".
-        if crate::env_flag_cached!("TOUCHHLE_TRACE_AUDIO_FILES") && size >= 0x10000 {
-            let n: GuestUSize = size.min(16);
-            let head = self.bytes_at_mut(ptr.cast(), n).to_vec();
-            let hex: Vec<String> = head.iter().map(|b| format!("{:02x}", b)).collect();
-            let ascii: String = head
-                .iter()
-                .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
-                .collect();
-            log!(
-                "TOUCHHLE_TRACE_AUDIO_FILES: free() of a {:#x}-byte buffer at {:?}, \
-                 first {} byte(s) still were [{}] \"{}\"",
-                size,
-                ptr,
-                n,
-                hex.join(" "),
-                ascii
-            );
-        }
         if self.zero_memory_on_free {
             self.bytes_at_mut(ptr.cast(), size).fill(0);
         }

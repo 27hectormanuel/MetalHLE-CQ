@@ -6,7 +6,6 @@
  */
 //! `AudioUnit.h` (Audio Unit Services)
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
 use crate::audio::openal::al_types::{ALuint, ALvoid};
@@ -1399,43 +1398,6 @@ fn alloc_render_timestamp(env: &mut Environment, sample_time: f64) -> MutVoidPtr
     timestamp.cast_void()
 }
 
-/// Diagnostics for "the audio unit is running but nothing is audible".
-///
-/// Counts consecutive all-zero buffers returned by the guest's render callback
-/// and warns once. That separates an emulator-side failure (the callback is
-/// never invoked or its output never reaches OpenAL — no warning is printed)
-/// from a guest-side one (the app's own mixer is producing silence, e.g.
-/// because a music stream never started). In the latter case the audio pipeline
-/// is doing its job and there is nothing further to fix here, but a bug report
-/// gets pointed at the right layer.
-static SILENT_RENDER_STREAK: AtomicU32 = AtomicU32::new(0);
-static SILENT_RENDER_WARNED: AtomicBool = AtomicBool::new(false);
-/// Roughly five seconds of continuous silence at ~23ms per buffer.
-const SILENT_RENDER_STREAK_LIMIT: u32 = 200;
-
-fn note_rendered_audio(samples: &[u8]) {
-    if samples.is_empty() {
-        return;
-    }
-    // Both integer and 32-bit float PCM represent silence as all-zero bytes.
-    if !samples.iter().all(|&byte| byte == 0) {
-        SILENT_RENDER_STREAK.store(0, Ordering::Relaxed);
-        return;
-    }
-    let streak = SILENT_RENDER_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
-    if streak == SILENT_RENDER_STREAK_LIMIT && !SILENT_RENDER_WARNED.swap(true, Ordering::Relaxed) {
-        log!(
-            "Warning: the last {} buffers rendered by the guest's audio unit \
-             callback were completely silent. The emulator is calling the \
-             callback and queuing everything it returns, so the app's own \
-             mixer is producing no audio (a stream that never started, a muted \
-             channel group or a missing/undecodable audio file are the usual \
-             causes).",
-            streak
-        );
-    }
-}
-
 /// Per-bus рендеринг для 3D Mixer / любого юнита, в котором через
 /// `AUGraphSetNodeInputCallback` (или эквивалент) задан input render
 /// callback на отдельные шины. Для каждой такой шины вызывает гостевой
@@ -1640,7 +1602,6 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
 
             let (al_fmt, _, processed) =
                 decode_buffer(&env.mem, &fmt, buffer_data.cast(), buffer_size, &[]);
-            note_rendered_audio(&processed);
 
             if processed.is_empty() {
                 // Если callback ничего не записал — прекращаем burst.
@@ -1979,7 +1940,6 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
 
         let (al_fmt, _, processed) =
             decode_buffer(&env.mem, &stream_format, buffer1_data.cast(), buffer_size, &[]);
-        note_rendered_audio(&processed);
         {
             let context = env
                 .framework_state
