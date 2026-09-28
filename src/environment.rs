@@ -1735,19 +1735,17 @@ impl Environment {
                 self.corruptor = corruptor;
             }
             // Game trainer (Cheat Engine-style memory search/patch + on-screen
-            // UI). No-op unless enabled (default on for games).
-            {
-                let app_id = self.bundle.bundle_identifier().to_string();
-                let mut trainer = std::mem::replace(
-                    &mut self.trainer,
-                    crate::trainer::Trainer::new(false),
+            // UI). Disabled by default; skip it unless `--trainer` is enabled.
+            if self.trainer.enabled {
+                self.trainer.tick(
+                    &mut self.mem,
+                    Some(self.bundle.bundle_identifier()),
+                    &self.objc,
                 );
-                trainer.tick(&mut self.mem, Some(app_id.as_str()), &self.objc);
-                self.trainer = trainer;
-                if let Some(speed) = crate::trainer_ui::take_speed_request() {
-                    self.guest_clock.set_speed(speed);
-                    crate::trainer_ui::publish_status(format!("GAME SPEED {}", speed.label()));
-                }
+            }
+            if let Some(speed) = crate::trainer_ui::take_speed_request() {
+                self.guest_clock.set_speed(speed);
+                crate::trainer_ui::publish_status(format!("GAME SPEED {}", speed.label()));
             }
             let mut kill_current_thread = false;
             if let Some(w) = self.window.as_mut() {
