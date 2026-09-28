@@ -284,7 +284,7 @@ fn patch_shader_for_native_es2(
         out.push_str(ext);
         out.push('\n');
     }
-    if inject_default_float_precision && !has_default_float_precision {
+    if inject_default_float_precision && !is_vertex_shader && !has_default_float_precision {
         out.push_str("precision mediump float;\n");
     }
     for line in &body_lines {

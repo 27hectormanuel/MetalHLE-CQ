@@ -17,8 +17,8 @@ use crate::frameworks::foundation::ns_thread::{self, detach_new_thread_inner};
 use crate::libc::semaphore::{host_create_semaphore, host_destroy_semaphore, sem_post, sem_wait};
 use crate::mem::MutVoidPtr;
 use crate::objc::{
-    autorelease, id, msg, msg_class, msg_send, msg_send_no_type_checking, nil, objc_classes,
-    release, retain, Class, ClassExports, NSZonePtr, ObjC, TrivialHostObject, SEL,
+    autorelease, id, msg, msg_class, msg_send, msg_send_no_type_checking, msg_send_super2, nil,
+    objc_classes, release, retain, Class, ClassExports, NSZonePtr, ObjC, TrivialHostObject, SEL,
 };
 use crate::Environment;
 use std::sync::Mutex;
@@ -223,6 +223,84 @@ fn perform_selector_on_thread(
     }
 }
 
+fn object_class_hierarchy(env: &Environment, object: id) -> Vec<Class> {
+    let mut class = ObjC::read_isa(object, &env.mem);
+    let mut hierarchy = Vec::new();
+    while !class.is_null() {
+        hierarchy.push(class);
+        let superclass = env.objc.get_superclass(class);
+        if superclass.is_null() || superclass == class {
+            break;
+        }
+        class = superclass;
+    }
+    hierarchy.reverse();
+    hierarchy
+}
+
+pub(crate) fn invoke_cxx_constructors(env: &mut Environment, object: id) {
+    let Some(selector) = env.objc.lookup_selector(".cxx_construct") else {
+        return;
+    };
+    let hierarchy = object_class_hierarchy(env, object);
+    if !hierarchy
+        .iter()
+        .any(|&class| env.objc.class_has_uninherited_method(class, selector))
+    {
+        return;
+    }
+    let return_value = env.cpu.regs()[0];
+    let super_info = env.mem.alloc(8).cast::<u32>();
+    for (index, &class) in hierarchy.iter().enumerate() {
+        if !env.objc.class_has_uninherited_method(class, selector) {
+            continue;
+        }
+        if index + 1 == hierarchy.len() {
+            let _: id = msg_send(env, (object, selector));
+        } else {
+            env.mem.write(super_info, object.to_bits());
+            env.mem
+                .write(super_info + 1, hierarchy[index + 1].to_bits());
+            let super_info_ptr: crate::mem::ConstPtr<crate::objc::objc_super> =
+                super_info.cast_const().cast();
+            let _: id = msg_send_super2(env, (super_info_ptr, selector));
+        }
+    }
+    env.mem.free(super_info.cast::<std::ffi::c_void>());
+    env.cpu.regs_mut()[0] = return_value;
+}
+
+pub(crate) fn invoke_cxx_destructors(env: &mut Environment, object: id) {
+    let Some(selector) = env.objc.lookup_selector(".cxx_destruct") else {
+        return;
+    };
+    let hierarchy = object_class_hierarchy(env, object);
+    if !hierarchy
+        .iter()
+        .any(|&class| env.objc.class_has_uninherited_method(class, selector))
+    {
+        return;
+    }
+    let super_info = env.mem.alloc(8).cast::<u32>();
+    for index in (0..hierarchy.len()).rev() {
+        let class = hierarchy[index];
+        if !env.objc.class_has_uninherited_method(class, selector) {
+            continue;
+        }
+        if index + 1 == hierarchy.len() {
+            let _: () = msg_send(env, (object, selector));
+        } else {
+            env.mem.write(super_info, object.to_bits());
+            env.mem
+                .write(super_info + 1, hierarchy[index + 1].to_bits());
+            let super_info_ptr: crate::mem::ConstPtr<crate::objc::objc_super> =
+                super_info.cast_const().cast();
+            let _: () = msg_send_super2(env, (super_info_ptr, selector));
+        }
+    }
+    env.mem.free(super_info.cast::<std::ffi::c_void>());
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -234,7 +312,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 + (id)allocWithZone:(NSZonePtr)_zone {
     log_dbg!("[{:?} allocWithZone:]", this);
-    env.objc.alloc_object(this, Box::new(TrivialHostObject), &mut env.mem)
+    let object = env.objc.alloc_object(this, Box::new(TrivialHostObject), &mut env.mem);
+    invoke_cxx_constructors(env, object);
+    object
 }
 
 + (id)new {
@@ -379,6 +459,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     log_dbg!("[{:?} dealloc]", this);
+    invoke_cxx_destructors(env, this);
 
     // Очищаем и высвобождаем динамические свойства KVC
     let mut to_release = Vec::new();
