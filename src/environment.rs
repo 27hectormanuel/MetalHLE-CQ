@@ -1735,7 +1735,7 @@ impl Environment {
                 self.corruptor = corruptor;
             }
             // Game trainer (Cheat Engine-style memory search/patch + on-screen
-            // UI). No-op unless enabled (default on for games).
+            // UI). Disabled by default; skip it unless `--trainer` is enabled.
             if self.trainer.enabled {
                 self.trainer.tick(
                     &mut self.mem,
