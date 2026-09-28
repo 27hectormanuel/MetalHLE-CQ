@@ -63,6 +63,12 @@ pub struct MixerBusState {
     pub render_callback: Option<AURenderCallbackStruct>,
     pub stream_format: Option<AudioStreamBasicDescription>,
     pub last_render_time: Option<Instant>,
+    /// Running total of frames handed to this bus's render callback, used as
+    /// the `mSampleTime` of the `AudioTimeStamp` we pass to it. Must advance
+    /// monotonically: callbacks that pace a streamer against the audio clock
+    /// (FMOD, used by Geometry Dash) treat a non-advancing or absent timestamp
+    /// as "no time has passed" and mix nothing.
+    pub sample_time: f64,
 }
 
 impl Default for MixerBusState {
@@ -79,6 +85,7 @@ impl Default for MixerBusState {
             render_callback: None,
             stream_format: None,
             last_render_time: None,
+            sample_time: 0.0,
         }
     }
 }
@@ -112,6 +119,11 @@ pub struct AudioComponentInstanceHostObject {
     pub last_render_time: Option<Instant>,
     pub al_source: Option<ALuint>,
     pub is_running_handler: bool,
+
+    /// Running total of frames handed to this unit's render callback, used as
+    /// the `mSampleTime` of the `AudioTimeStamp` we pass to it (see
+    /// `MixerBusState::sample_time`).
+    pub sample_time: f64,
 
     /// Property listeners registered through `AudioUnitAddPropertyListener`.
     /// The callback is kept as a guest function and invoked with the same
@@ -168,6 +180,7 @@ impl Default for AudioComponentInstanceHostObject {
             last_render_time: None,
             al_source: None,
             is_running_handler: false,
+            sample_time: 0.0,
             property_listeners: Vec::new(),
             is_3d_mixer: false,
             mixer_buses: HashMap::new(),

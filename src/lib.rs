@@ -322,6 +322,24 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     }
     // ULTRAHLE_POTATO_LANDSCAPE_END
 
+    // ULTRAHLE_GEOMETRYDASH_AUDIO_TRACE_BEGIN
+    // Geometry Dash plays its music through FMOD Ex, which *streams* music
+    // tracks (decoded incrementally on a worker thread) while its sound effects
+    // are one-shot samples decoded up front. "Sound effects work but there is no
+    // music at all" therefore always means the streaming side never got its
+    // data, and the first question is whether the song files are even being
+    // read. Log every audio-file open for this app (see `open_direct` in
+    // src/libc/posix_io.rs) so that answer is in the log; users can still set
+    // the variable themselves for any other app.
+    if app_id.starts_with("com.robtop.geometryjump")
+        && std::env::var_os("TOUCHHLE_TRACE_AUDIO_FILES").is_none()
+    {
+        unsafe {
+            std::env::set_var("TOUCHHLE_TRACE_AUDIO_FILES", "1");
+        }
+    }
+    // ULTRAHLE_GEOMETRYDASH_AUDIO_TRACE_END
+
     let minimum_os_version = bundle.minimum_os_version();
     let required_device_capabilities = bundle.required_device_capabilities();
     let device_family = bundle.device_family_array();

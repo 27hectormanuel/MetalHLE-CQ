@@ -333,6 +333,26 @@ pub(crate) fn resolve_existing_guest_path(env: &Environment, path: &str) -> Opti
     candidates.iter().find_map(|candidate| resolve(candidate))
 }
 
+/// Does `path` look like an audio file? Only used by the opt-in
+/// `TOUCHHLE_TRACE_AUDIO_FILES` diagnostics in [open_direct].
+///
+/// Extension matching (case-insensitive) is deliberately naive: it has to be
+/// cheap enough to run on every `open()`/`fopen()`, and it covers the
+/// containers audio middleware actually reads.
+fn looks_like_audio_file(path: &str) -> bool {
+    const AUDIO_EXTENSIONS: [&str; 13] = [
+        "mp3", "ogg", "oga", "wav", "aif", "aiff", "aifc", "m4a", "aac", "caf", "flac", "wma",
+        "mp4",
+    ];
+    match path.rsplit_once('.') {
+        Some((_, extension)) => {
+            let extension = extension.to_ascii_lowercase();
+            AUDIO_EXTENSIONS.iter().any(|&known| extension == known)
+        }
+        None => false,
+    }
+}
+
 pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> FileDescriptor {
     let known_flags = O_ACCMODE
         | O_NONBLOCK
@@ -502,6 +522,24 @@ pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> Fil
         flags,
         res
     );
+    // Opt-in diagnostics for "the app plays no music": log every open() of a
+    // file whose name looks like audio. `open_direct` is the funnel for
+    // open(2), fopen(3), mmap(2) and NSFileHandle, so this shows whether the
+    // app reads its audio at all, which path it resolves to (app bundle vs.
+    // Documents/cache) and whether the open failed. Enabled by setting
+    // TOUCHHLE_TRACE_AUDIO_FILES=1, and turned on automatically for a few
+    // bundle identifiers in lib.rs.
+    if crate::env_flag_cached!("TOUCHHLE_TRACE_AUDIO_FILES")
+        && looks_like_audio_file(&actual_path_string)
+    {
+        log!(
+            "TOUCHHLE_TRACE_AUDIO_FILES: open({:?}) => {} (fd {}, flags {:#x})",
+            actual_path_string,
+            if res == -1 { "FAILED" } else { "ok" },
+            res,
+            flags
+        );
+    }
     res
 }
 

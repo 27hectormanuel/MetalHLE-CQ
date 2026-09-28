@@ -6,6 +6,7 @@
  */
 //! `AudioUnit.h` (Audio Unit Services)
 
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
 use crate::audio::openal::al_types::{ALuint, ALvoid};
@@ -23,13 +24,15 @@ use crate::export_c_func;
 use crate::frameworks::audio_toolbox::audio_components;
 use crate::frameworks::audio_toolbox::audio_queue::log_if_broken_audio_format;
 use crate::frameworks::carbon_core::{paramErr, OSStatus};
-use crate::frameworks::core_audio_types::{fourcc, AudioStreamBasicDescription};
+use crate::frameworks::core_audio_types::{
+    fourcc, AudioStreamBasicDescription, AudioTimeStamp, SMPTETime,
+};
 use crate::frameworks::core_foundation::cf_run_loop::CFRunLoopGetMain;
 use crate::frameworks::foundation::ns_dictionary::dict_from_keys_and_objects;
 use crate::frameworks::foundation::ns_run_loop;
 use crate::frameworks::foundation::ns_string;
 use crate::mem::{guest_size_of, ConstVoidPtr, MutPtr, MutVoidPtr, SafeRead};
-use crate::objc::{autorelease, id, msg, msg_class, nil};
+use crate::objc::{autorelease, id, msg, msg_class};
 
 use super::audio_components::{AURenderCallbackStruct, AudioComponentInstance};
 use super::audio_queue::decode_buffer;
@@ -1343,6 +1346,96 @@ fn AudioUnitComplexRender(
     0
 }
 
+/// `AudioTimeStampFlags` from `<CoreAudio/CoreAudioTypes.h>`.
+const kAudioTimeStampSampleTimeValid: u32 = 1 << 0;
+const kAudioTimeStampHostTimeValid: u32 = 1 << 1;
+const kAudioTimeStampRateScalarValid: u32 = 1 << 2;
+
+/// Allocates a guest-visible `AudioTimeStamp` describing the current render
+/// pass. The caller owns it and must `env.mem.free()` it once the callback has
+/// returned.
+///
+/// `sample_time` is the number of frames rendered so far: it has to advance by
+/// `frames` on every pass. `host_time` is expressed in the same units
+/// `mach_absolute_time` reports, so a callback can correlate the two clocks.
+///
+/// Passing `nil` here instead — which this code used to do — is not a harmless
+/// omission. `inTimeStamp` is a documented input of `AURenderCallback`, and
+/// middleware that mixes *streams* (long music tracks decoded on a worker
+/// thread) rather than one-shot samples reads `mSampleTime`/`mHostTime` to work
+/// out how much audio the device consumed and therefore how far ahead to mix.
+/// FMOD's AudioUnit output — the engine Geometry Dash 2.11 uses for both its
+/// music and its sound effects — is such a mixer; with no timestamp at all it
+/// has nothing to synchronise its stream buffer against.
+fn alloc_render_timestamp(env: &mut Environment, sample_time: f64) -> MutVoidPtr {
+    let host_time: u64 = env
+        .guest_clock
+        .now()
+        .duration_since(env.startup_time)
+        .as_nanos() as u64;
+    let timestamp = env.mem.alloc_and_write(AudioTimeStamp {
+        sample_time,
+        host_time,
+        // We hand the callback exactly as many frames as it asked for, at the
+        // format's nominal rate, i.e. no drift.
+        rate_scalar: 1.0,
+        world_clock_type: 0,
+        SMPTE_time: SMPTETime {
+            subframes: 0,
+            subframe_divisor: 0,
+            counter: 0,
+            type_: 0,
+            flags: 0,
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        },
+        flags: kAudioTimeStampSampleTimeValid
+            | kAudioTimeStampHostTimeValid
+            | kAudioTimeStampRateScalarValid,
+        _reserved: 0,
+    });
+    timestamp.cast_void()
+}
+
+/// Diagnostics for "the audio unit is running but nothing is audible".
+///
+/// Counts consecutive all-zero buffers returned by the guest's render callback
+/// and warns once. That separates an emulator-side failure (the callback is
+/// never invoked or its output never reaches OpenAL — no warning is printed)
+/// from a guest-side one (the app's own mixer is producing silence, e.g.
+/// because a music stream never started). In the latter case the audio pipeline
+/// is doing its job and there is nothing further to fix here, but a bug report
+/// gets pointed at the right layer.
+static SILENT_RENDER_STREAK: AtomicU32 = AtomicU32::new(0);
+static SILENT_RENDER_WARNED: AtomicBool = AtomicBool::new(false);
+/// Roughly five seconds of continuous silence at ~23ms per buffer.
+const SILENT_RENDER_STREAK_LIMIT: u32 = 200;
+
+fn note_rendered_audio(samples: &[u8]) {
+    if samples.is_empty() {
+        return;
+    }
+    // Both integer and 32-bit float PCM represent silence as all-zero bytes.
+    if !samples.iter().all(|&byte| byte == 0) {
+        SILENT_RENDER_STREAK.store(0, Ordering::Relaxed);
+        return;
+    }
+    let streak = SILENT_RENDER_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+    if streak == SILENT_RENDER_STREAK_LIMIT && !SILENT_RENDER_WARNED.swap(true, Ordering::Relaxed) {
+        log!(
+            "Warning: the last {} buffers rendered by the guest's audio unit \
+             callback were completely silent. The emulator is calling the \
+             callback and queuing everything it returns, so the app's own \
+             mixer is producing no audio (a stream that never started, a muted \
+             channel group or a missing/undecodable audio file are the usual \
+             causes).",
+            streak
+        );
+    }
+}
+
 /// Per-bus рендеринг для 3D Mixer / любого юнита, в котором через
 /// `AUGraphSetNodeInputCallback` (или эквивалент) задан input render
 /// callback на отдельные шины. Для каждой такой шины вызывает гостевой
@@ -1361,6 +1454,7 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
         ALuint,
         Instant,
         AudioStreamBasicDescription,
+        f64,
     )> = {
         let at = &mut env.framework_state.audio_toolbox;
         let hardware_sr = at.audio_session.current_hardware_sample_rate;
@@ -1399,7 +1493,7 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
                 continue;
             };
             let fmt = bus.stream_format.unwrap_or(default_format);
-            v.push((*bus_id, cb, src, last, fmt));
+            v.push((*bus_id, cb, src, last, fmt, bus.sample_time));
         }
         v
     };
@@ -1413,7 +1507,10 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
     );
 
     let now = Instant::now();
-    for (bus_id, callback, al_source, last_render_time, fmt) in plan {
+    for (bus_id, callback, al_source, last_render_time, fmt, start_sample_time) in plan {
+        // Frames rendered for this bus so far; handed to the callback through
+        // the `AudioTimeStamp` below and advanced by every render pass.
+        let mut sample_time = start_sample_time;
         // Ограничиваем глубину очереди OpenAL, чтобы буферы не накапливались
         // быстрее, чем воспроизводятся. Если этого не делать, при длительной
         // игре источник набирает всё больше необработанных буферов, звук
@@ -1527,26 +1624,30 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
                 }],
             });
 
+            let timestamp = alloc_render_timestamp(env, sample_time);
             let _: OSStatus = input_proc.call_from_host(
                 env,
                 (
                     input_proc_ref,
                     action_flags,
-                    nil.cast_void().cast_const(),
+                    timestamp.cast_const(),
                     bus_id,
                     frames,
                     abl.cast::<std::ffi::c_void>(),
                 ),
             );
+            sample_time += frames as f64;
 
             let (al_fmt, _, processed) =
                 decode_buffer(&env.mem, &fmt, buffer_data.cast(), buffer_size, &[]);
+            note_rendered_audio(&processed);
 
             if processed.is_empty() {
                 // Если callback ничего не записал — прекращаем burst.
                 env.mem.free(action_flags.cast_void());
                 env.mem.free(buffer_data.cast_void());
                 env.mem.free(abl.cast_void().cast());
+                env.mem.free(timestamp);
                 break;
             }
 
@@ -1581,6 +1682,7 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
             env.mem.free(action_flags.cast_void());
             env.mem.free(buffer_data.cast_void());
             env.mem.free(abl.cast_void().cast());
+            env.mem.free(timestamp);
         }
 
         // Освобождаем неиспользованные дренированные буферы, чтобы они не утекли.
@@ -1595,13 +1697,14 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
             }
         }
 
-        // Обновляем last_render_time для шины.
+        // Обновляем last_render_time и sample_time для шины.
         if let Some(obj) = audio_components::State::get(&mut env.framework_state)
             .audio_component_instances
             .get_mut(&audio_unit)
         {
             if let Some(bus) = obj.mixer_buses.get_mut(&bus_id) {
                 bus.last_render_time = Some(now);
+                bus.sample_time = sample_time;
             }
         }
     }
@@ -1633,6 +1736,7 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
         al_source,
         last_render_time,
         callback,
+        start_sample_time,
     ) = {
         let at = &mut env.framework_state.audio_toolbox;
         let Some(obj) = at
@@ -1655,6 +1759,7 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
             obj.al_source,
             obj.last_render_time,
             obj.render_callback,
+            obj.sample_time,
         )
     };
 
@@ -1816,6 +1921,9 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
 
     let input_proc = callback.input_proc;
     let input_proc_ref = callback.input_proc_ref_con;
+    // Frames rendered by this unit so far, passed to the callback through the
+    // `AudioTimeStamp` below and advanced by every render pass.
+    let mut sample_time = start_sample_time;
 
     for _ in 0..render_passes {
         // Восстанавливаем логику из оригинала: Resident Evil 4 ожидает 2 буфера
@@ -1855,20 +1963,23 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
             (abl.cast(), buf1, Some(buf2))
         };
 
+        let timestamp = alloc_render_timestamp(env, sample_time);
         let _: OSStatus = input_proc.call_from_host(
             env,
             (
                 input_proc_ref,
                 action_flags,
-                nil.cast_void().cast_const(),
+                timestamp.cast_const(),
                 0u32,
                 frames,
                 audio_buffer_list,
             ),
         );
+        sample_time += frames as f64;
 
         let (al_fmt, _, processed) =
             decode_buffer(&env.mem, &stream_format, buffer1_data.cast(), buffer_size, &[]);
+        note_rendered_audio(&processed);
         {
             let context = env
                 .framework_state
@@ -1899,6 +2010,7 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
 
         env.mem.free(audio_buffer_list.cast_void());
         env.mem.free(buffer1_data.cast_void());
+        env.mem.free(timestamp);
         if let Some(b2) = buffer2_data {
             env.mem.free(b2.cast_void());
         }
@@ -1928,6 +2040,7 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
     {
         obj.last_render_time = Some(now);
         obj.is_running_handler = false;
+        obj.sample_time = sample_time;
     }
 }
 
