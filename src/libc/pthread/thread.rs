@@ -25,6 +25,22 @@ impl State {
     }
 }
 
+/// Diagnostics helper: the name a guest thread gave itself via
+/// `pthread_setname_np` (e.g. "FMOD mixer thread"), if any. Lets tracing
+/// output label threads meaningfully instead of by bare id.
+pub fn thread_name_for_id(env: &Environment, id: ThreadId) -> Option<String> {
+    env.libc_state
+        .pthread
+        .thread
+        .threads
+        .values()
+        .find(|t| t.thread_id == id)
+        .and_then(|t| {
+            let name = t.name.trim();
+            (!name.is_empty()).then(|| name.to_string())
+        })
+}
+
 /// Apple's implementation is a 4-byte magic number followed by an 36-byte
 /// opaque region. We only have to match the size theirs has.
 #[derive(Copy, Clone, Debug)]

@@ -401,6 +401,7 @@ fn audio_trace_read(
     fd: FileDescriptor,
     buffer: MutVoidPtr,
     bytes_read: u64,
+    new_offset: off_t,
 ) {
     if !audio_trace_enabled() {
         return;
@@ -413,7 +414,12 @@ fn audio_trace_read(
     };
     entry.reads += 1;
     entry.bytes_read += bytes_read;
-    let dump_header = !entry.header_dumped && bytes_read > 0;
+    // A read whose *start* offset is 0 shows the real file header. Apps that
+    // probe the end of the file first (very common: seek to EOF, ftell, seek
+    // back to 0) make the "first bytes read" something else entirely, so both
+    // cases are labelled explicitly.
+    let at_offset_zero = new_offset == bytes_read as off_t;
+    let dump_header = bytes_read > 0 && (at_offset_zero || !entry.header_dumped);
     if dump_header {
         entry.header_dumped = true;
     }
@@ -424,6 +430,11 @@ fn audio_trace_read(
     let path = entry.path.clone();
     let reads = entry.reads;
     let total = entry.bytes_read;
+    // Which guest thread issues the reads is decisive: reads from FMOD's own
+    // stream/mixer thread mean FMOD opened the file itself (path based), reads
+    // from the main thread mean the game slurped the file into memory and will
+    // hand FMOD a buffer (FMOD_OPENMEMORY). Completely different code paths.
+    let tid = env.current_thread;
     drop(traces);
 
     if dump_header {
@@ -435,8 +446,9 @@ fn audio_trace_read(
             .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
             .collect();
         log!(
-            "TOUCHHLE_TRACE_AUDIO_FILES: first {} byte(s) of {:?} are [{}] \
+            "TOUCHHLE_TRACE_AUDIO_FILES: {}{} byte(s) of {:?} are [{}] \
              (as text: {:?})",
+            if at_offset_zero { "header at file offset 0, first " } else { "first read, first " },
             n,
             path,
             hex.join(" "),
@@ -444,11 +456,13 @@ fn audio_trace_read(
         );
     }
     log!(
-        "TOUCHHLE_TRACE_AUDIO_FILES: read #{} from {:?} returned {} byte(s), \
-         {} byte(s) read so far",
+        "TOUCHHLE_TRACE_AUDIO_FILES: read #{} from {:?} by thread {} returned \
+         {} byte(s), offset now {:#x}, {} byte(s) read so far",
         reads,
         path,
+        tid,
         bytes_read,
+        new_offset.max(0) as u64,
         total
     );
 }
@@ -711,7 +725,7 @@ pub fn read(
     // Keep the descriptor borrow inside this block: after an unreadable Unity
     // archive is detected, we need the whole Environment to record it before
     // the guest can reach its fatal exit path.
-    let (read_result, unusable_player_archive) = {
+    let (read_result, unusable_player_archive, pos_before) = {
         let Some(file) = env.libc_state.posix_io.file_for_fd(fd) else {
             log!(
                 "Warning: read({:?}, {:?}, {:#x}) called with unknown fd, returning -1",
@@ -723,10 +737,13 @@ pub fn read(
             return -1;
         };
 
+        // Position before the read; also used to report where an audio file
+        // read landed (see audio_trace_read).
+        let pos_before = file.file.stream_position().ok();
         // A zero-length first read of Unity's mandatory archive means that a
         // ZIP entry was registered but could not be decompressed. Do not treat
         // a normal EOF after valid data as a mount failure.
-        let starts_at_beginning = file.file.stream_position().ok() == Some(0);
+        let starts_at_beginning = pos_before == Some(0);
         let archive_path = file.path.clone();
         let read_result = {
             let buffer_slice = env.mem.bytes_at_mut(buffer.cast(), size);
@@ -744,7 +761,7 @@ pub fn read(
             Err(_) => archive_path,
             _ => None,
         };
-        (read_result, unusable_player_archive)
+        (read_result, unusable_player_archive, pos_before)
     };
 
     if let Some(path) = unusable_player_archive {
@@ -776,7 +793,12 @@ pub fn read(
                     bytes_read
                 );
             }
-            audio_trace_read(env, fd, buffer, bytes_read as u64);
+            // File offset after the read, for the audio-file tracing.
+            let new_offset: off_t = match pos_before {
+                Some(pos) => pos as off_t + bytes_read as off_t,
+                None => -1,
+            };
+            audio_trace_read(env, fd, buffer, bytes_read as u64, new_offset);
             bytes_read.try_into().unwrap_or(-1)
         }
         Err(e) => {
