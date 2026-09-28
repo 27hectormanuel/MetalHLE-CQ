@@ -352,12 +352,16 @@ pub fn pthread_create(
     // thread-finished line in `Environment::new_thread` and the name line in
     // [pthread_setname_np].
     if crate::env_flag_cached!("TOUCHHLE_TRACE_THREADS") {
+        // `pthread_attr_t` is `#[repr(C, packed)]`, so its fields must not be
+        // passed straight to a formatting macro: that would take a reference to
+        // an unaligned place (E0793). Copy the value out first.
+        let stacksize = attr.stacksize;
         log!(
             "TOUCHHLE_TRACE_THREADS: pthread_create -> thread {} \
              (start_routine {:#x}, stacksize {:#x}, user_data {:?})",
             thread_id,
             start_routine.addr_with_thumb_bit(),
-            attr.stacksize,
+            stacksize,
             user_data
         );
     }

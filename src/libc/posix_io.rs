@@ -366,9 +366,11 @@ struct AudioFileTraceEntry {
     header_dumped: bool,
 }
 
-static AUDIO_FILE_TRACES: std::sync::Mutex<
-    std::collections::HashMap<FileDescriptor, AudioFileTraceEntry>,
-> = std::sync::Mutex::new(std::collections::HashMap::new());
+// `HashMap::new` isn't const (its hasher isn't), so this needs `LazyLock` —
+// the same pattern `libc/sysctl.rs` uses for its static map.
+static AUDIO_FILE_TRACES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<FileDescriptor, AudioFileTraceEntry>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 fn audio_trace_enabled() -> bool {
     crate::env_flag_cached!("TOUCHHLE_TRACE_AUDIO_FILES")
