@@ -588,8 +588,11 @@ impl Environment {
             || bundle
                 .bundle_identifier()
                 .starts_with("com.go.starwave.CritterCrunch");
+        let is_geometry_dash = bundle
+            .bundle_identifier()
+            .starts_with("com.robtop.geometryjump");
         // We always reset this flag depending on which game is launched.
-        mem.zero_memory_on_free = !is_spore && !is_critter_crunch;
+        mem.zero_memory_on_free = !is_spore && !is_critter_crunch && !is_geometry_dash;
         if is_spore {
             log!("Applying game-specific hack for Spore Origins: zeroing memory on alloc instead of free.");
         }
@@ -597,6 +600,19 @@ impl Environment {
             // Without this hack, every time a critter 'explodes',
             // the game crashes with a null page access error.
             log!("Applying game-specific hack for Critter Crunch: zeroing memory on alloc instead of free.");
+        }
+        if is_geometry_dash {
+            // Geometry Dash plays its music as FMOD streams fed from a memory
+            // buffer that the game frees as soon as createStream() has
+            // returned. Scrubbing freed memory (the default) therefore wipes
+            // the song out from under FMOD's streamer, which then decodes
+            // silence and the game retries loading the track, while one-shot
+            // samples — decoded before the buffer is freed — keep working.
+            // That is exactly the reported symptom: sound effects are audible,
+            // music never is. Real malloc leaves freed bytes in place until the
+            // chunk is reused, so zero on alloc instead, as for Spore Origins
+            // and Critter Crunch above.
+            log!("Applying game-specific hack for Geometry Dash: zeroing memory on alloc instead of free.");
         }
         let executable = mach_o::MachO::load_from_bytes(
             &executable_bytes,
