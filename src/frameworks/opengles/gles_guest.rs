@@ -421,9 +421,6 @@ fn glGetIntegerv(env: &mut Environment, pname: GLenum, params: MutPtr<GLint>) {
         0x8cdf | 0x8d57 => {
             env.mem.write(params, 1 as _);
         }
-        gles11::MAX_TEXTURE_SIZE => {
-            env.mem.write(params, 2048 as _);
-        }
         _ => {
             if env
                 .framework_state
