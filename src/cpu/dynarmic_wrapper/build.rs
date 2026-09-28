@@ -16,14 +16,9 @@ fn link_lib(lib: &str) {
     println!("cargo:rustc-link-lib=static={lib}");
 }
 
-fn build_type_windows() -> &'static str {
-    let os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS was not set");
+fn build_type_windows<'a>(os: &str, cmake_profile: &'a str) -> &'a str {
     if os.eq_ignore_ascii_case("windows") {
-        if cfg!(debug_assertions) {
-            "Debug"
-        } else {
-            "Release"
-        }
+        cmake_profile
     } else {
         ""
     }
@@ -34,6 +29,7 @@ fn main() {
     let workspace_root = package_root.join("../../..");
 
     let mut build = cmake::Config::new(workspace_root.join("vendor/dynarmic"));
+    let cmake_profile = build.get_profile().to_owned();
     build.define("DYNARMIC_FRONTENDS", "A32"); // We don't need 64-bit
     build.define("DYNARMIC_WARNINGS_AS_ERRORS", "OFF");
     build.define("DYNARMIC_TESTS", "OFF");
@@ -113,9 +109,9 @@ fn main() {
     link_search(
         &dynarmic_out
             .join("build/externals/fmt")
-            .join(build_type_windows()),
+            .join(build_type_windows(&os, &cmake_profile)),
     );
-    link_lib(if cfg!(debug_assertions) {
+    link_lib(if cmake_profile == "Debug" {
         "fmtd"
     } else {
         "fmt"
@@ -123,7 +119,7 @@ fn main() {
     link_search(
         &dynarmic_out
             .join("build/externals/mcl/src")
-            .join(build_type_windows()),
+            .join(build_type_windows(&os, &cmake_profile)),
     );
     link_lib("mcl");
     let arch = env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH was not set");
@@ -131,7 +127,7 @@ fn main() {
         link_search(
             &dynarmic_out
                 .join("build/externals/zydis")
-                .join(build_type_windows()),
+                .join(build_type_windows(&os, &cmake_profile)),
         );
         link_lib("Zydis");
     }

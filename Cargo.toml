@@ -131,6 +131,10 @@ cc = { workspace = true }
 cmake = { workspace = true }
 gl_generator = { workspace = true }
 
+# Game startup is CPU-bound, so optimize Dynarmic in debug runs without optimizing all Rust code.
+[profile.dev.package.touchHLE_dynarmic_wrapper]
+opt-level = 1
+
 [profile.release]
 opt-level = 3
 codegen-units = 1
