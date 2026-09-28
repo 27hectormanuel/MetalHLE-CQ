@@ -12,6 +12,8 @@
 //! window system interaction in general, because it is assumed only one window
 //! will be needed for the runtime of the app.
 
+mod geometry;
+
 use crate::gles::present::present_frame;
 use crate::gles::{
     create_gles1_ctx_no_parent_stack, create_gles2_ctx_no_parent_stack, GLESContext,
@@ -1130,23 +1132,8 @@ impl Window {
             } else {
                 window.viewport()
             };
-            // Clamp into the viewport. On hosts (Android, large desktops) the
-            // SDL drawable is bigger than the iPhone's virtual screen and is
-            // letterboxed inside the viewport. Touches landing in the
-            // letterbox bars used to produce out-of-window iOS coordinates
-            // (e.g. y == -91 or y == 570 for a 320x460 portrait window),
-            // which made -[UIWindow hitTest:withEvent:] return nil for every
-            // such touch. The "SUPER HACK" fallback in ui_touch then forced
-            // the touch directly into the window object, bypassing all
-            // subviews — so taps near the very top/bottom of a landscape
-            // screen never reached overlay UI like CreateNewWorld dialogs
-            // or the in-game chat field. Clamping to the viewport keeps the
-            // touch on the nearest visible edge instead.
-            let in_x = in_x.clamp(vx as f32, (vx + vw) as f32);
-            let in_y = in_y.clamp(vy as f32, (vy + vh) as f32);
-            // normalize to unit square centred on origin
-            let x = (in_x - vx as f32) / vw as f32 - 0.5;
-            let y = (in_y - vy as f32) / vh as f32 - 0.5;
+            // Clamp touches in letterbox bars to the nearest visible edge.
+            let (x, y) = geometry::normalize_viewport_coords((in_x, in_y), (vx, vy, vw, vh));
             // rotate
             //
             // If the final EAGL presentation is not being rotated, the touch
@@ -1201,10 +1188,9 @@ impl Window {
             (out_x.round(), out_y.round())
         }
         fn transform_virt_accel_coords(window: &Window, (in_x, in_y): (i32, i32)) -> (f32, f32) {
-            let (_, _, vw, vh) = window.viewport();
-            let out_x = ((in_x as f32 / vw as f32) * 2.0 - 1.0).clamp(-1.0, 1.0);
-            let out_y = ((in_y as f32 / vh as f32) * 2.0 - 1.0).clamp(-1.0, 1.0);
-            (out_x, out_y)
+            let coords = window.mouse_drawable_coords((in_x, in_y));
+            let (x, y) = geometry::normalize_viewport_coords(coords, window.viewport());
+            (x * 2.0, y * 2.0)
         }
         fn translate_button(button: sdl2::controller::Button) -> Option<crate::options::Button> {
             match button {
@@ -1290,14 +1276,16 @@ impl Window {
                     mouse_btn: MouseButton::Left,
                     ..
                 } => {
-                    let coords = transform_input_coords(self, (x as f32, y as f32), false);
+                    let coords = self.mouse_drawable_coords((x, y));
+                    let coords = transform_input_coords(self, coords, false);
                     log_dbg!("MouseButtonDown x {}, y {}, coords {:?}", x, y, coords);
                     Event::TouchesDown(HashMap::from([(FingerId::Mouse, coords)]))
                 }
                 E::MouseMotion {
                     x, y, mousestate, ..
                 } if mousestate.left() => {
-                    let coords = transform_input_coords(self, (x as f32, y as f32), false);
+                    let coords = self.mouse_drawable_coords((x, y));
+                    let coords = transform_input_coords(self, coords, false);
                     log_dbg!("MouseMotion x {}, y {}, coords {:?}", x, y, coords);
                     Event::TouchesMove(HashMap::from([(FingerId::Mouse, coords)]))
                 }
@@ -1307,7 +1295,8 @@ impl Window {
                     mouse_btn: MouseButton::Left,
                     ..
                 } => {
-                    let coords = transform_input_coords(self, (x as f32, y as f32), false);
+                    let coords = self.mouse_drawable_coords((x, y));
+                    let coords = transform_input_coords(self, coords, false);
                     log_dbg!("MouseButtonUp x {}, y {}, coords {:?}", x, y, coords);
                     Event::TouchesUp(HashMap::from([(FingerId::Mouse, coords)]))
                 }
@@ -2329,28 +2318,25 @@ impl Window {
             self.device_orientation,
             self.scale_hack,
         );
-        if !self.fullscreen && !Self::rotatable_fullscreen() {
+        // Preserve the macOS resize workaround in rotate_device(), which
+        // positions an app-sized viewport using viewport_y_offset().
+        #[cfg(target_os = "macos")]
+        if !self.fullscreen {
             return (0, 0, app_width, app_height);
         }
 
-        let (screen_width, screen_height) = self.window.drawable_size();
+        // Fit the actual drawable in windowed mode too: the compositor may
+        // resize the window or give it more pixels than its logical size.
+        geometry::fit_viewport((app_width, app_height), self.window.drawable_size())
+    }
 
-        let app_aspect = app_width as f32 / app_height as f32;
-        let screen_aspect = screen_width as f32 / screen_height as f32;
-        let (scaled_width, scaled_height) = if app_aspect < screen_aspect {
-            (
-                (screen_height as f32 * app_aspect).round() as u32,
-                screen_height,
-            )
-        } else {
-            (
-                screen_width,
-                (screen_width as f32 / app_aspect).round() as u32,
-            )
-        };
-        let x = (screen_width - scaled_width) / 2;
-        let y = (screen_height - scaled_height) / 2;
-        (x, y, scaled_width, scaled_height)
+    /// SDL mouse coordinates must use the same pixel space as the viewport.
+    fn mouse_drawable_coords(&self, (x, y): (i32, i32)) -> (f32, f32) {
+        geometry::window_to_drawable(
+            (x as f32, y as f32),
+            self.window.size(),
+            self.window.drawable_size(),
+        )
     }
 
     /// Map a guest-space `CGRect` (points, possibly rotated/letterboxed) to
