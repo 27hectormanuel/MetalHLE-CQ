@@ -56,7 +56,27 @@ symphonia = { version = "0.6.0", default-features = false, features = [
     # formats
     "aiff", "caf", "isomp4", "wav",
     # codecs
-    "aac", "adpcm", "alac", "mp3", "pcm"
+    "aac", "adpcm", "alac", "mp3", "pcm",
+    # standalone metadata readers
+    #
+    # These MUST be enabled explicitly because `default-features = false`
+    # drops upstream's `all-meta` (which is part of Symphonia's own default
+    # feature set). Without `id3v2` the `Id3v2Reader` is never registered
+    # with the default `Probe` (`symphonia/src/lib.rs` gates the
+    # registration behind `#[cfg(feature = "id3v2")]`), and probing an
+    # ID3v2-tagged MP3 then degenerates into a byte-by-byte scan of the raw
+    # tag looking for an MPEG frame sync. That scan is capped by
+    # `ProbeOptions::max_probe_depth` (1 MiB) and false-matches freely
+    # inside embedded cover art, so tagged MP3s frequently fail to open at
+    # all. Note that `Probe::next()` ignores its `Hint` argument entirely in
+    # 0.6.0, so this cannot be worked around by hinting the format at the
+    # call site — the reader has to be registered.
+    #
+    # Enabling these adds no new crates to the dependency graph:
+    # `symphonia-metadata` is an unconditional dependency of `symphonia`
+    # (its `embedded` module is always re-exported) and `ape`/`id3v1`/`id3v2`
+    # are plain cfg flags inside it, so `Cargo.lock` is unchanged.
+    "ape", "id3v1", "id3v2"
 ] }
 quick-xml = "0.38.4"
 # PERF: use mimalloc as the global allocator (see src/lib.rs).

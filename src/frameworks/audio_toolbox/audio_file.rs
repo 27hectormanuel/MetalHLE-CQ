@@ -112,6 +112,13 @@ fn audiofile_soft_eof_enabled() -> bool {
     std::env::var_os("TOUCHHLE_AUDIOFILE_SOFT_EOF").is_some()
 }
 
+/// When set, restores the legacy behaviour of substituting a two-second
+/// silent dummy `AudioFile` when the data handed to us cannot be decoded,
+/// instead of reporting a genuine error to the guest.
+fn audiofile_dummy_on_error_enabled() -> bool {
+    std::env::var_os("TOUCHHLE_AUDIOFILE_DUMMY_ON_ERROR").is_some()
+}
+
 type AudioFilePermissions = i8;
 pub const kAudioFileReadPermission: AudioFilePermissions = 1;
 pub const kAudioFileWritePermission: AudioFilePermissions = 2;
@@ -564,13 +571,59 @@ pub fn AudioFileOpenWithCallbacks(
         return final_status;
     }
 
+    // Diagnostics: what exactly the guest's callbacks handed us. Without
+    // this it is impossible to tell "the guest delivered no data" apart
+    // from "we could not decode the data it delivered", and the latter used
+    // to turn into silence without a trace.
+    let data_len = data_vec.len();
+    let preview: Vec<u8> = data_vec.iter().take(8).copied().collect();
+    log_dbg!(
+        "AudioFileOpenWithCallbacks(): callbacks delivered {} bytes, first bytes {:02x?}",
+        data_len,
+        preview
+    );
+
     let host_object = match audio::AudioFile::read_from_vec(data_vec) {
-        Ok(file) => AudioFileHostObject::Real(file),
+        Ok(file) => {
+            let desc = file.audio_description();
+            log!(
+                "AudioFileOpenWithCallbacks(): decoded {} bytes -> {:?}, \
+                 {:.0} Hz, {} ch, {} bytes of PCM, {} packets",
+                data_len,
+                desc.format,
+                desc.sample_rate,
+                desc.channels_per_frame,
+                file.byte_count(),
+                file.packet_count()
+            );
+            AudioFileHostObject::Real(file)
+        }
         Err(e) => {
             log!(
-                "Внимание: Ошибка парсинга в AudioFileOpenWithCallbacks(): \
-                 {:?}. Dummy AudioFile.",
-                e
+                "Warning: parse error in AudioFileOpenWithCallbacks(): {:?} \
+                 (callbacks delivered {} bytes, first bytes {:02x?}).",
+                e,
+                data_len,
+                preview
+            );
+            if !audiofile_dummy_on_error_enabled() {
+                // The real Audio File Services returns an error in this
+                // situation, not "success". Substituting a stub that reports
+                // two seconds of 44.1 kHz stereo and serves zeros makes the
+                // guest (FMOD in particular) consider the stream valid and
+                // silently "play" silence instead of falling back to its own
+                // decoder for the format. That is exactly how the completely
+                // mute music in Geometry Dash 2.11 looked: the ID3v2-tagged
+                // MP3 failed to open, and the success code hid the failure
+                // from both the game and the user.
+                if !out_audio_file.is_null() {
+                    env.mem.write(out_audio_file, MutPtr::null());
+                }
+                return kAudioFileUnsupportedFileTypeError;
+            }
+            log!(
+                "TOUCHHLE_AUDIOFILE_DUMMY_ON_ERROR: substituting a dummy \
+                 AudioFile (2 seconds of silence) instead of an error."
             );
             create_dummy_audio_file()
         }
