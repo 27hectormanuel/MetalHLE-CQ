@@ -7,7 +7,7 @@
 
 use crate::dyld::FunctionExports;
 use crate::libc::netdb::socklen_t;
-use crate::libc::sys::socket::AF_INET;
+use crate::libc::sys::socket::{AF_INET, AF_INET6};
 use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr, MutVoidPtr, SafeRead};
 use crate::{export_c_func, Environment};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -24,8 +24,6 @@ const INADDR_BROADCAST: in_addr_t = 0xFFFFFFFF;
 #[allow(dead_code)]
 const INADDR_LOOPBACK: in_addr_t = 0x7F000001;
 
-/// AF_INET6 — we don't support IPv6 but accept the constant gracefully.
-const AF_INET6: i32 = 30;
 const INET6_ADDRSTRLEN: u32 = 46;
 
 #[derive(Copy, Clone, Debug)]

@@ -17,6 +17,7 @@ Changes are categorised as follows:
 
 Compatibility:
 
+- Guest DNS resolution and TCP/UDP socket handling now support IPv6 results and `AF_INET6` addresses, including IPv4-mapped IPv6 addresses.
 - Android soft-keyboard requests from UIKit responders now reach the host IME after the editor view is attached; private `UIKeyboard` activation is bridged to SDL text input, and repeated focus requests retry the keyboard.
 - `UISearchBar` now participates in first-responder handling and routes text, backspace, and Search-key events to its delegate.
 - Cocos2d's `EAGLView` `UIKeyInput` responder now opens the host keyboard and receives text, delete, and Return events through the guest's IME dispatcher.

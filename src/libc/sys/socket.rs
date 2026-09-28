@@ -6,7 +6,7 @@
  */
 //! sys/socket.h (Sockets)
 //!
-//! We currently support blocking TCP and UDP guest sockets on IPv4 addresses.
+//! We currently support blocking TCP and UDP guest sockets on IPv4 and IPv6 addresses.
 //!
 //! Because fine grain control is needed, those are implemented as
 //! _non-blocking_ host sockets. Moreover, app usage of select() is
@@ -29,8 +29,8 @@ use crate::libc::errno::{
     ENOTTY, EPROTONOSUPPORT, ESOCKTNOSUPPORT, ETIMEDOUT,
 };
 use crate::libc::posix_io::{
-    close, find_or_create_socket, is_socket, FileDescriptor, POLLERR, POLLHUP, POLLIN, POLLPRI,
-    POLLOUT, POLLRDNORM, POLLWRNORM,
+    close, find_or_create_socket, is_socket, FileDescriptor, POLLERR, POLLHUP, POLLIN, POLLOUT,
+    POLLPRI, POLLRDNORM, POLLWRNORM,
 };
 use crate::libc::time::timeval;
 use crate::mem::{
@@ -43,9 +43,12 @@ use crate::libc::netdb::{socklen_t, IPPROTO_TCP, IPPROTO_UDP};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
+use std::net::{
+    Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, TcpStream, UdpSocket,
+};
 
 pub const AF_INET: i32 = 2;
+pub const AF_INET6: i32 = 30;
 pub const SOCK_STREAM: i32 = 1;
 pub const SOCK_DGRAM: i32 = 2;
 
@@ -103,22 +106,15 @@ impl sockaddr {
     ///
     /// Port is returned in the native endian format.
     fn to_ipv4_parts(self) -> ([u8; 4], u16) {
-        // Real iOS apps sometimes pass an sa_len other than 16 or 0, or an
-        // address family other than AF_INET (e.g. when an IPv6 address
-        // slipped through higher-level name resolution). Rather than
-        // panicking, log a warning; for a non-IPv4 family fall back to the
-        // wildcard address, which keeps the app's fallback logic working.
         if !(self.sa_len == 16 || self.sa_len == 0) {
             log!(
-                "Warning: sockaddr with sa_len {} (expected 16 or 0); \
-                 treating as IPv4 address",
+                "Warning: sockaddr with sa_len {} (expected 16 or 0); treating as IPv4 address",
                 self.sa_len
             );
         }
         if self.sa_family != AF_INET as u8 {
             log!(
-                "Warning: sockaddr with unsupported sa_family {}; \
-                 treating as IPv4 wildcard address",
+                "Warning: sockaddr with unsupported sa_family {}; treating as IPv4 wildcard address",
                 self.sa_family
             );
             return ([0, 0, 0, 0], 0);
@@ -132,38 +128,10 @@ impl sockaddr {
         ];
         (ip, port)
     }
-    fn from_sockaddr_v4(addr: &SocketAddr) -> Self {
-        // Only IPV4 for the moment
-        match addr {
-            SocketAddr::V4(ipv4addr) => {
-                sockaddr::from_ipv4_parts(ipv4addr.ip().octets(), ipv4addr.port())
-            }
-            SocketAddr::V6(_) => {
-                // Host resolved the peer to an IPv6 address but we don't
-                // model AF_INET6 yet. Return an all-zero IPv4 sockaddr so the
-                // guest sees a well-formed but obviously-invalid address
-                // instead of crashing the host.
-                log!(
-                    "Warning: from_sockaddr_v4(): host returned IPv6 address {:?} but only AF_INET is modelled; returning 0.0.0.0:0.",
-                    addr
-                );
-                sockaddr::from_ipv4_parts([0; 4], 0)
-            }
-        }
-    }
     pub fn to_sockaddr_v4(self) -> SocketAddrV4 {
         let (ip, port) = self.to_ipv4_parts();
         SocketAddrV4::new(ip.into(), port)
     }
-}
-
-/// Byte representation of a guest sockaddr (packed layout).
-fn sockaddr_bytes(addr: sockaddr) -> [u8; 16] {
-    let mut out = [0u8; 16];
-    out[0] = addr.sa_len;
-    out[1] = addr.sa_family;
-    out[2..].copy_from_slice(&addr.sa_data);
-    out
 }
 
 /// Write a guest sockaddr to `address`, truncating the copy to the buffer
@@ -174,22 +142,26 @@ fn write_sockaddr_bounded(
     env: &mut Environment,
     address: MutPtr<sockaddr>,
     address_len: MutPtr<socklen_t>,
-    value: sockaddr,
+    value: SocketAddr,
+    domain: i32,
 ) {
-    let full_len = guest_size_of::<sockaddr>();
+    if address.is_null() {
+        return;
+    }
+    let bytes = socket_addr_to_sockaddr_bytes(socket_addr_for_domain(value, domain));
+    let full_len = bytes.len() as u32;
     let provided = if address_len.is_null() {
         full_len
     } else {
         env.mem.read(address_len)
     };
-    if provided >= full_len {
-        env.mem.write(address, value);
-    } else if provided > 0 {
-        // Copy only as many bytes as the caller's buffer can hold.
-        let bytes = sockaddr_bytes(value);
-        let slice = env.mem.bytes_at_mut(address.cast(), provided);
-        let n = slice.len().min(full_len as usize);
-        slice.copy_from_slice(&bytes[..n]);
+    if !address.is_null() {
+        let copy_len = provided.min(full_len);
+        if copy_len > 0 {
+            env.mem
+                .bytes_at_mut(address.cast::<u8>(), copy_len)
+                .copy_from_slice(&bytes[..copy_len as usize]);
+        }
     }
     if !address_len.is_null() {
         env.mem.write(address_len, full_len);
@@ -218,6 +190,8 @@ struct SocketHostObject {
     tcp_stream: Option<TcpStream>,
     /// UDP socket
     udp_socket: Option<UdpSocket>,
+    /// Domain of the socket
+    domain: i32,
 }
 
 #[derive(Default)]
@@ -247,7 +221,7 @@ fn socket(env: &mut Environment, domain: i32, type_: i32, protocol: i32) -> File
         return -1;
     }
 
-    if domain != AF_INET {
+    if domain != AF_INET && domain != AF_INET6 {
         set_errno(env, EAFNOSUPPORT);
         return -1;
     }
@@ -279,6 +253,7 @@ fn socket(env: &mut Environment, domain: i32, type_: i32, protocol: i32) -> File
         pending_tcp_stream: None,
         tcp_stream: None,
         udp_socket: None,
+        domain,
     };
     State::get_mut(env).sockets.insert(fd, host_object);
 
@@ -665,29 +640,31 @@ fn bind(
         return -1;
     };
     let type_ = sock.type_;
+    let domain = sock.domain;
 
     if type_ != SOCK_STREAM && type_ != SOCK_DGRAM {
         set_errno(env, ESOCKTNOSUPPORT);
         return -1;
     }
 
-    if address_len < guest_size_of::<sockaddr>() {
-        set_errno(env, EINVAL);
-        return -1;
-    }
-
-    let sockaddr_val = env.mem.read(address);
-    let socket_address = sockaddr_val.to_sockaddr_v4();
+    let socket_address = match read_socket_addr(env, address, address_len)
+        .and_then(|address| host_socket_addr_for_domain(address, domain))
+    {
+        Ok(address) => address,
+        Err(error) => {
+            set_errno(env, error);
+            return -1;
+        }
+    };
     let type_str = match type_ {
         SOCK_STREAM => "TCP",
         SOCK_DGRAM => "UDP",
         _ => "<unknown socket type>",
     };
     log_dbg!(
-        "bind({}, {:?} ({:?}), {}) -> {} {:?}",
+        "bind({}, {:?}, {}) -> {} {:?}",
         socket,
         address,
-        sockaddr_val,
         address_len,
         type_str,
         socket_address
@@ -846,25 +823,27 @@ fn connect(
         return -1;
     };
     let type_ = sock.type_;
+    let domain = sock.domain;
     if type_ != SOCK_STREAM {
         set_errno(env, ESOCKTNOSUPPORT);
         return -1;
     }
 
-    if address_len < guest_size_of::<sockaddr>() {
-        set_errno(env, EINVAL);
-        return -1;
-    }
-
-    let sockaddr_val = env.mem.read(address);
+    let socket_address = match read_socket_addr(env, address, address_len)
+        .and_then(|address| host_socket_addr_for_domain(address, domain))
+    {
+        Ok(address) => address,
+        Err(error) => {
+            set_errno(env, error);
+            return -1;
+        }
+    };
     log_dbg!(
-        "connect({:?} ({:?}), {})",
+        "connect({:?}, {}) -> {:?}",
         address,
-        sockaddr_val,
-        address_len
+        address_len,
+        socket_address
     );
-    let socket_address = sockaddr_val.to_sockaddr_v4();
-    log_dbg!("connect: socket address {:?}", socket_address);
 
     if State::get(env)
         .sockets
@@ -1354,6 +1333,7 @@ fn accept(
         return -1;
     };
     let type_ = socket_host_object.type_;
+    let domain = socket_host_object.domain;
     if type_ != SOCK_STREAM {
         // accept(2) is only defined for stream sockets; some apps probe
         // other types, so fail with POSIX semantics instead of aborting.
@@ -1378,7 +1358,7 @@ fn accept(
         // of crashing.
         let addr = stream
             .peer_addr()
-            .unwrap_or_else(|_| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
+            .unwrap_or_else(|_| unspecified_socket_addr(domain));
         // We have already accepted TCP socket, we now need to
         // let guest know as well!
         let new_fd = find_or_create_socket(env);
@@ -1392,11 +1372,11 @@ fn accept(
             pending_tcp_stream: None,
             tcp_stream: Some(stream),
             udp_socket: None,
+            domain,
         };
         State::get_mut(env).sockets.insert(new_fd, host_object);
-        let peer_guest_addr = sockaddr::from_sockaddr_v4(&addr);
         if !address.is_null() {
-            write_sockaddr_bounded(env, address, address_len, peer_guest_addr);
+            write_sockaddr_bounded(env, address, address_len, addr, domain);
         }
         return new_fd;
     }
@@ -1424,11 +1404,11 @@ fn accept(
                 pending_tcp_stream: None,
                 tcp_stream: Some(stream),
                 udp_socket: None,
+                domain,
             };
             State::get_mut(env).sockets.insert(new_fd, host_object);
             if !address.is_null() {
-                let peer_guest_addr = sockaddr::from_sockaddr_v4(&addr);
-                write_sockaddr_bounded(env, address, address_len, peer_guest_addr);
+                write_sockaddr_bounded(env, address, address_len, addr, domain);
             }
             new_fd
         }
@@ -1507,6 +1487,7 @@ fn recvfrom(
             return -1;
         }
     };
+    let domain = State::get(env).sockets.get(&socket).unwrap().domain;
     if type_ != SOCK_STREAM && type_ != SOCK_DGRAM {
         set_errno(env, ESOCKTNOSUPPORT);
         return -1;
@@ -1588,8 +1569,7 @@ fn recvfrom(
                 }
             };
             if !address.is_null() {
-                let guest_addr = sockaddr::from_sockaddr_v4(&addr);
-                write_sockaddr_bounded(env, address, address_len, guest_addr);
+                write_sockaddr_bounded(env, address, address_len, addr, domain);
             }
             (read, Ok(addr))
         }
@@ -1647,8 +1627,7 @@ fn recvfrom(
             };
             if !address.is_null() {
                 if let Some(peer) = peer {
-                    let guest_addr = sockaddr::from_sockaddr_v4(&peer);
-                    write_sockaddr_bounded(env, address, address_len, guest_addr);
+                    write_sockaddr_bounded(env, address, address_len, peer, domain);
                 }
             }
             (read, peer.ok_or(()))
@@ -1783,6 +1762,7 @@ fn sendto(
             return -1;
         }
     };
+    let domain = State::get(env).sockets.get(&socket).unwrap().domain;
     if type_ != SOCK_DGRAM {
         log!(
             "sendto: socket fd={} is not SOCK_DGRAM, returning ESOCKTNOSUPPORT",
@@ -1796,26 +1776,22 @@ fn sendto(
         log!("sendto: flags={} ignored", flags);
     }
 
-    if dest_address_len < guest_size_of::<sockaddr>() {
-        set_errno(env, EINVAL);
-        return -1;
-    }
-    if dest_address.is_null() {
-        // sendto() on an unconnected socket requires a destination
-        // address; report EINVAL rather than reading a null pointer.
-        set_errno(env, EINVAL);
-        return -1;
-    }
-    let sockaddr_val = env.mem.read(dest_address);
-    let socket_address = sockaddr_val.to_sockaddr_v4();
+    let socket_address = match read_socket_addr(env, dest_address.cast_const(), dest_address_len)
+        .and_then(|address| host_socket_addr_for_domain(address, domain))
+    {
+        Ok(address) => address,
+        Err(error) => {
+            set_errno(env, error);
+            return -1;
+        }
+    };
     log_dbg!(
-        "sendto({}, {:?}, {}, {}, {:?} ({:?}, {:?}), {})",
+        "sendto({}, {:?}, {}, {}, {:?}, {:?}, {})",
         socket,
         buffer,
         length,
         flags,
         dest_address,
-        sockaddr_val,
         socket_address,
         dest_address_len
     );
@@ -1832,7 +1808,11 @@ fn sendto(
                 // an ephemeral port matches what a fresh BSD socket does on
                 // the first sendto(2). This must work for any destination,
                 // not just broadcast ones.
-                let host_socket = match UdpSocket::bind("0.0.0.0:0") {
+                let host_socket = match UdpSocket::bind(if socket_address.is_ipv4() {
+                    "0.0.0.0:0"
+                } else {
+                    "[::]:0"
+                }) {
                     Ok(s) => s,
                     Err(e) => {
                         log!("sendto: lazy UdpSocket::bind failed: {}", e);
@@ -1878,7 +1858,7 @@ fn sendto(
                     return -1;
                 }
             };
-            if socket_address.ip().is_broadcast() {
+            if matches!(socket_address, SocketAddr::V4(address) if address.ip().is_broadcast()) {
                 match udp_socket.local_addr() {
                     Ok(local) if !local.ip().is_unspecified() => {
                         log!(
@@ -1974,6 +1954,7 @@ fn getsockname(
         set_errno(env, EBADF);
         return -1;
     };
+    let domain = sock.domain;
     let local_addr: SocketAddr = match sock.type_ {
         SOCK_STREAM => {
             if let Some(stream) = &sock.tcp_stream {
@@ -2021,12 +2002,7 @@ fn getsockname(
     };
 
     if !address.is_null() {
-        write_sockaddr_bounded(
-            env,
-            address,
-            address_len,
-            sockaddr::from_sockaddr_v4(&local_addr),
-        );
+        write_sockaddr_bounded(env, address, address_len, local_addr, domain);
     }
     0
 }
@@ -2042,6 +2018,7 @@ fn getpeername(
         set_errno(env, EBADF);
         return -1;
     };
+    let domain = sock.domain;
     let peer_addr: SocketAddr = match &sock.tcp_stream {
         Some(stream) => match stream.peer_addr() {
             Ok(addr) => addr,
@@ -2058,12 +2035,7 @@ fn getpeername(
     };
 
     if !address.is_null() {
-        write_sockaddr_bounded(
-            env,
-            address,
-            address_len,
-            sockaddr::from_sockaddr_v4(&peer_addr),
-        );
+        write_sockaddr_bounded(env, address, address_len, peer_addr, domain);
     }
     0
 }
@@ -2236,4 +2208,167 @@ pub fn close_socket(env: &mut Environment, socket: i32) -> bool {
     // True when the socket existed and was removed (the old is_none()
     // check had the sense inverted).
     State::get_mut(env).sockets.remove(&socket).is_some()
+}
+
+pub fn socket_addr_to_sockaddr_bytes(address: SocketAddr) -> Vec<u8> {
+    match address {
+        SocketAddr::V4(address) => {
+            let mut bytes = vec![0; 16];
+            bytes[0] = 16;
+            bytes[1] = AF_INET as u8;
+            bytes[2..4].copy_from_slice(&address.port().to_be_bytes());
+            bytes[4..8].copy_from_slice(&address.ip().octets());
+            bytes
+        }
+        SocketAddr::V6(address) => {
+            let mut bytes = vec![0; 28];
+            bytes[0] = 28;
+            bytes[1] = AF_INET6 as u8;
+            bytes[2..4].copy_from_slice(&address.port().to_be_bytes());
+            bytes[4..8].copy_from_slice(&address.flowinfo().to_be_bytes());
+            bytes[8..24].copy_from_slice(&address.ip().octets());
+            bytes[24..28].copy_from_slice(&address.scope_id().to_ne_bytes());
+            bytes
+        }
+    }
+}
+
+pub fn socket_addr_from_sockaddr_bytes(bytes: &[u8]) -> Result<SocketAddr, i32> {
+    if bytes.len() < 2 {
+        return Err(EINVAL);
+    }
+    match bytes[1] as i32 {
+        AF_INET => {
+            if bytes.len() < 16 || (bytes[0] != 0 && bytes[0] < 16) {
+                return Err(EINVAL);
+            }
+            let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+            let ip = Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]);
+            Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
+        }
+        AF_INET6 => {
+            if bytes.len() < 28 || (bytes[0] != 0 && bytes[0] < 28) {
+                return Err(EINVAL);
+            }
+            let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+            let flowinfo = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
+            let ip = Ipv6Addr::from(<[u8; 16]>::try_from(&bytes[8..24]).unwrap());
+            let scope_id = u32::from_ne_bytes(bytes[24..28].try_into().unwrap());
+            Ok(SocketAddr::V6(SocketAddrV6::new(
+                ip, port, flowinfo, scope_id,
+            )))
+        }
+        _ => Err(EAFNOSUPPORT),
+    }
+}
+
+pub fn read_socket_addr(
+    env: &mut Environment,
+    address: ConstPtr<sockaddr>,
+    address_len: socklen_t,
+) -> Result<SocketAddr, i32> {
+    if address.is_null() || address_len < 2 {
+        return Err(EINVAL);
+    }
+    let address_bytes = address.cast::<u8>();
+    let family = env.mem.read(address_bytes + 1) as i32;
+    let required_len = match family {
+        AF_INET => 16,
+        AF_INET6 => 28,
+        _ => return Err(EAFNOSUPPORT),
+    };
+    if address_len < required_len {
+        return Err(EINVAL);
+    }
+    let bytes = env.mem.bytes_at(address_bytes, required_len).to_vec();
+    socket_addr_from_sockaddr_bytes(&bytes)
+}
+
+fn socket_addr_for_domain(address: SocketAddr, domain: i32) -> SocketAddr {
+    match (domain, address) {
+        (AF_INET6, SocketAddr::V4(address)) => SocketAddr::V6(SocketAddrV6::new(
+            address.ip().to_ipv6_mapped(),
+            address.port(),
+            0,
+            0,
+        )),
+        (AF_INET, SocketAddr::V6(address)) => match address.ip().to_ipv4_mapped() {
+            Some(ip) => SocketAddr::V4(SocketAddrV4::new(ip, address.port())),
+            None => SocketAddr::V6(address),
+        },
+        (_, address) => address,
+    }
+}
+
+fn host_socket_addr_for_domain(address: SocketAddr, domain: i32) -> Result<SocketAddr, i32> {
+    match (domain, address) {
+        (AF_INET, SocketAddr::V4(address)) | (AF_INET6, SocketAddr::V4(address)) => {
+            Ok(SocketAddr::V4(address))
+        }
+        (AF_INET, SocketAddr::V6(address)) | (AF_INET6, SocketAddr::V6(address)) => {
+            match address.ip().to_ipv4_mapped() {
+                Some(ip) => Ok(SocketAddr::V4(SocketAddrV4::new(ip, address.port()))),
+                None if domain == AF_INET6 => Ok(SocketAddr::V6(address)),
+                None => Err(EAFNOSUPPORT),
+            }
+        }
+        _ => Err(EAFNOSUPPORT),
+    }
+}
+
+fn unspecified_socket_addr(domain: i32) -> SocketAddr {
+    if domain == AF_INET6 {
+        SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0))
+    } else {
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+    }
+}
+
+#[cfg(test)]
+mod ipv6_socket_tests {
+    use super::*;
+
+    #[test]
+    fn ipv4_sockaddr_round_trips() {
+        let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 443));
+        let bytes = socket_addr_to_sockaddr_bytes(address);
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(bytes[0], 16);
+        assert_eq!(bytes[1], AF_INET as u8);
+        assert_eq!(socket_addr_from_sockaddr_bytes(&bytes), Ok(address));
+    }
+
+    #[test]
+    fn ipv6_sockaddr_round_trips() {
+        let address = SocketAddr::V6(SocketAddrV6::new(
+            "2001:db8::1234".parse().unwrap(),
+            443,
+            0x1234,
+            7,
+        ));
+        let bytes = socket_addr_to_sockaddr_bytes(address);
+        assert_eq!(bytes.len(), 28);
+        assert_eq!(bytes[0], 28);
+        assert_eq!(bytes[1], AF_INET6 as u8);
+        assert_eq!(socket_addr_from_sockaddr_bytes(&bytes), Ok(address));
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_addresses_use_the_host_ipv4_stack() {
+        let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 443));
+        let guest_address = socket_addr_for_domain(address, AF_INET6);
+        assert!(
+            matches!(guest_address, SocketAddr::V6(value) if value.ip().to_ipv4_mapped() == Some(Ipv4Addr::new(192, 0, 2, 1)))
+        );
+        assert_eq!(
+            host_socket_addr_for_domain(guest_address, AF_INET6),
+            Ok(address)
+        );
+        let native_ipv6 =
+            SocketAddr::V6(SocketAddrV6::new("2001:db8::1".parse().unwrap(), 443, 0, 0));
+        assert_eq!(
+            host_socket_addr_for_domain(native_ipv6, AF_INET),
+            Err(EAFNOSUPPORT)
+        );
+    }
 }
