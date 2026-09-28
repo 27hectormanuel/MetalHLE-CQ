@@ -1018,13 +1018,6 @@ pub struct State {
     ui_touch: ui_touch::State,
     pub ui_view: ui_view::State,
     ui_responder: ui_responder::State,
-    /// Set when `-[UIWindow addSubview:]` actually applied a rotation
-    /// transform to the root view because the app said yes to
-    /// `shouldAutorotateToInterfaceOrientation:`. Apps that rotate their
-    /// own drawing answer no and never get a transform; the EAGL present
-    /// path uses this to decide whether it must replicate the transform
-    /// (Core Animation composition is bypassed for direct presenters).
-    pub autorotation_transform_applied: bool,
 }
 
 /// For use by `NSRunLoop`: handles any events that have queued up.

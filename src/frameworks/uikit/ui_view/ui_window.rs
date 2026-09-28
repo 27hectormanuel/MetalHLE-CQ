@@ -462,10 +462,6 @@ pub const CLASSES: ClassExports = objc_classes! {
             log_dbg!("Old view frame: {view_frame:?}");
 
             () = msg![env; view setTransform:transform];
-            // Record that the app opted into UIKit auto-rotation: the EAGL
-            // present path must replicate this transform for direct
-            // presenters (see `present_renderbuffer` in eagl.rs).
-            env.framework_state.uikit.autorotation_transform_applied = true;
 
             // Re-apply the view's old frame to compensate for the rotation
             // effectively offseting its center position and changing the size.

@@ -2302,30 +2302,28 @@ unsafe fn present_renderbuffer(
 
     // Save these for when we need to draw the frame
     let viewport = env.window.as_mut().unwrap().viewport();
+    let device_family = env.window.as_mut().unwrap().device_family();
     let device_orientation = env.window.as_mut().unwrap().current_rotation();
-    // When an app opts into UIKit auto-rotation, `-[UIWindow addSubview:]`
-    // (ui_window.rs) applies a rotation transform to the root
-    // view controller's view, so the app — which typically draws content
-    // "upright" inside the EAGL layer's portrait bounds — ends up rotated
-    // for landscape display when Core Animation composites it. touchHLE
-    // bypasses CA composition for EAGL apps that call `presentRenderbuffer:`
-    // directly, so we have to replicate that additional rotation here.
-    // Without it, auto-rotating iPad landscape games (e.g. Plants vs.
-    // Zombies HD) render upside-down.
-    //
-    // This used to be a device-family heuristic ("iPad and non-portrait"),
-    // but that broke apps that rotate their drawing themselves — they
-    // answer NO to `shouldAutorotateToInterfaceOrientation:`, never get a
-    // view transform, and then got an unwanted extra 180° (seen with
-    // Gangstar Rio on iPad: the whole image, and with it the controls,
-    // came out upside-down/mirrored). Gate on whether the transform was
-    // actually applied instead.
-    let needs_autorotation_compensation =
-        env.framework_state.uikit.autorotation_transform_applied
-            && !matches!(
-                device_orientation,
-                crate::window::DeviceOrientation::Portrait
-            );
+    // For iPad apps in a non-portrait orientation, the UIKit auto-rotation
+    // path (`UIWindow addSubview:` in ui_window.rs) applies a rotation
+    // transform to the rootViewController's view so that the app, which
+    // typically draws content "upright" inside the EAGL layer's portrait
+    // bounds, ends up rotated for landscape display when Core Animation
+    // composites it. touchHLE bypasses CA composition for EAGL apps that
+    // call `presentRenderbuffer:` directly, so we have to replicate that
+    // additional rotation here. Without it, iPad landscape games (e.g.
+    // Plants vs. Zombies HD) render upside-down. iPhone-only landscape
+    // games (e.g. Plants vs. Zombies, the iPhone version) typically rotate
+    // their drawing themselves, so we must NOT apply the extra rotation
+    // for them.
+    // FIXME: A cleaner solution would be to read the actual transform from
+    //        the EAGL layer's view hierarchy and apply it here, instead of
+    //        using a device-family heuristic.
+    let needs_autorotation_compensation = device_family.is_ipad()
+        && !matches!(
+            device_orientation,
+            crate::window::DeviceOrientation::Portrait
+        );
     // PERF: cached read-once flag; present_renderbuffer runs every frame.
     let rotation_matrix = if crate::env_flag_cached!("TOUCHHLE_DISABLE_PRESENT_ROTATION") {
         log_once!(
