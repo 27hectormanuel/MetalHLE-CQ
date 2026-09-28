@@ -379,3 +379,39 @@ pub fn decode_pvrtc_with_alpha(
 
     rgba8_data
 }
+
+#[cfg(test)]
+mod tests {
+    use super::decode_pvrtc_with_alpha;
+
+    fn decode_checksum(width: u32, height: u32, is_2bit: bool) -> u64 {
+        let compressed_size = width as usize * height as usize / if is_2bit { 4 } else { 2 };
+        let mut state = 0x1234_5678u32;
+        let compressed: Vec<u8> = (0..compressed_size)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        let pixels = decode_pvrtc_with_alpha(&compressed, is_2bit, width, height, false);
+
+        let mut checksum = 14_695_981_039_346_656_037u64;
+        for pixel in pixels {
+            for byte in pixel.to_le_bytes() {
+                checksum ^= u64::from(byte);
+                checksum = checksum.wrapping_mul(1_099_511_628_211);
+            }
+        }
+        checksum
+    }
+
+    #[test]
+    fn pvrtc_parallel_decoding_matches_reference_output() {
+        assert_eq!(decode_checksum(64, 64, false), 0x3d39_b466_115e_383c);
+        assert_eq!(decode_checksum(512, 512, false), 0xabfa_9dae_71e5_095d);
+        assert_eq!(decode_checksum(512, 512, true), 0xd44a_a11d_f63a_0446);
+        assert_eq!(decode_checksum(1024, 512, true), 0x99ac_697d_389a_6a2a);
+    }
+}

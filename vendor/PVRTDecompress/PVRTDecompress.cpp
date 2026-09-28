@@ -8,12 +8,15 @@
 
 #include <cstdlib>
 #include <cstdio>
+#include <cstddef>
 #include <climits>
 #include <cmath>
 #include <algorithm>
 #include <cstring>
 #include "PVRTDecompress.h"
 #include <cassert>
+#include <system_error>
+#include <thread>
 #include <vector>
 
 namespace pvr {
@@ -509,50 +512,89 @@ static uint32_t pvrtcDecompress(uint8_t* pCompressedData, Pixel32* pDecompressed
 	int i32NumXWords = static_cast<int>(width / wordWidth);
 	int i32NumYWords = static_cast<int>(height / wordHeight);
 
-	// Structs used for decompression
-	PVRTCWordIndices indices;
-	std::vector<Pixel32> pPixels(wordWidth * wordHeight * sizeof(Pixel32));
+	constexpr unsigned int maxThreadCount = 4;
+	constexpr std::size_t minimumParallelWords = 8192;
+	const std::size_t totalWords = static_cast<std::size_t>(i32NumXWords) * i32NumYWords;
+	// Each iteration writes disjoint halves of neighboring output rows.
+	auto decompressRows = [&](int32_t firstRow, int32_t lastRow) {
+		PVRTCWordIndices indices;
+		Pixel32 pPixels[32];
 
-	// For each row of words
-	for (int32_t wordY = -1; wordY < i32NumYWords - 1; wordY++)
-	{
-		// for each column of words
-		for (int32_t wordX = -1; wordX < i32NumXWords - 1; wordX++)
+		for (int32_t row = firstRow; row < lastRow; ++row)
 		{
-			indices.P[0] = static_cast<int>(wrapWordIndex(i32NumXWords, wordX));
-			indices.P[1] = static_cast<int>(wrapWordIndex(i32NumYWords, wordY));
-			indices.Q[0] = static_cast<int>(wrapWordIndex(i32NumXWords, wordX + 1));
-			indices.Q[1] = static_cast<int>(wrapWordIndex(i32NumYWords, wordY));
-			indices.R[0] = static_cast<int>(wrapWordIndex(i32NumXWords, wordX));
-			indices.R[1] = static_cast<int>(wrapWordIndex(i32NumYWords, wordY + 1));
-			indices.S[0] = static_cast<int>(wrapWordIndex(i32NumXWords, wordX + 1));
-			indices.S[1] = static_cast<int>(wrapWordIndex(i32NumYWords, wordY + 1));
+			const int32_t wordY = row - 1;
+			for (int32_t wordX = -1; wordX < i32NumXWords - 1; ++wordX)
+			{
+				indices.P[0] = static_cast<int>(wrapWordIndex(i32NumXWords, wordX));
+				indices.P[1] = static_cast<int>(wrapWordIndex(i32NumYWords, wordY));
+				indices.Q[0] = static_cast<int>(wrapWordIndex(i32NumXWords, wordX + 1));
+				indices.Q[1] = static_cast<int>(wrapWordIndex(i32NumYWords, wordY));
+				indices.R[0] = static_cast<int>(wrapWordIndex(i32NumXWords, wordX));
+				indices.R[1] = static_cast<int>(wrapWordIndex(i32NumYWords, wordY + 1));
+				indices.S[0] = static_cast<int>(wrapWordIndex(i32NumXWords, wordX + 1));
+				indices.S[1] = static_cast<int>(wrapWordIndex(i32NumYWords, wordY + 1));
 
-			// Work out the offsets into the twiddle structs, multiply by two as there are two members per word.
-			uint32_t WordOffsets[4] = {
-				TwiddleUV(i32NumXWords, i32NumYWords, indices.P[0], indices.P[1]) * 2,
-				TwiddleUV(i32NumXWords, i32NumYWords, indices.Q[0], indices.Q[1]) * 2,
-				TwiddleUV(i32NumXWords, i32NumYWords, indices.R[0], indices.R[1]) * 2,
-				TwiddleUV(i32NumXWords, i32NumYWords, indices.S[0], indices.S[1]) * 2,
-			};
+				uint32_t WordOffsets[4] = {
+					TwiddleUV(i32NumXWords, i32NumYWords, indices.P[0], indices.P[1]) * 2,
+					TwiddleUV(i32NumXWords, i32NumYWords, indices.Q[0], indices.Q[1]) * 2,
+					TwiddleUV(i32NumXWords, i32NumYWords, indices.R[0], indices.R[1]) * 2,
+					TwiddleUV(i32NumXWords, i32NumYWords, indices.S[0], indices.S[1]) * 2,
+				};
 
-			// Access individual elements to fill out PVRTCWord
-			PVRTCWord P, Q, R, S;
-			P.colorData = static_cast<uint32_t>(pWordMembers[WordOffsets[0] + 1]);
-			P.modulationData = static_cast<uint32_t>(pWordMembers[WordOffsets[0]]);
-			Q.colorData = static_cast<uint32_t>(pWordMembers[WordOffsets[1] + 1]);
-			Q.modulationData = static_cast<uint32_t>(pWordMembers[WordOffsets[1]]);
-			R.colorData = static_cast<uint32_t>(pWordMembers[WordOffsets[2] + 1]);
-			R.modulationData = static_cast<uint32_t>(pWordMembers[WordOffsets[2]]);
-			S.colorData = static_cast<uint32_t>(pWordMembers[WordOffsets[3] + 1]);
-			S.modulationData = static_cast<uint32_t>(pWordMembers[WordOffsets[3]]);
+				PVRTCWord P, Q, R, S;
+				P.colorData = static_cast<uint32_t>(pWordMembers[WordOffsets[0] + 1]);
+				P.modulationData = static_cast<uint32_t>(pWordMembers[WordOffsets[0]]);
+				Q.colorData = static_cast<uint32_t>(pWordMembers[WordOffsets[1] + 1]);
+				Q.modulationData = static_cast<uint32_t>(pWordMembers[WordOffsets[1]]);
+				R.colorData = static_cast<uint32_t>(pWordMembers[WordOffsets[2] + 1]);
+				R.modulationData = static_cast<uint32_t>(pWordMembers[WordOffsets[2]]);
+				S.colorData = static_cast<uint32_t>(pWordMembers[WordOffsets[3] + 1]);
+				S.modulationData = static_cast<uint32_t>(pWordMembers[WordOffsets[3]]);
 
-			// assemble 4 words into struct to get decompressed pixels from
-			pvrtcGetDecompressedPixels(P, Q, R, S, pPixels.data(), bpp);
-			mapDecompressedData(pOutData, width, pPixels.data(), indices, bpp);
+				pvrtcGetDecompressedPixels(P, Q, R, S, pPixels, bpp);
+				mapDecompressedData(pOutData, width, pPixels, indices, bpp);
+			}
+		}
+	};
 
-		} // for each word
-	} // for each row of words
+	if (totalWords < minimumParallelWords)
+	{
+		decompressRows(0, i32NumYWords);
+	}
+	else
+	{
+		unsigned int threadCount = std::thread::hardware_concurrency();
+		threadCount = std::min(threadCount, maxThreadCount);
+		threadCount = std::min(threadCount, static_cast<unsigned int>(i32NumYWords));
+		if (threadCount <= 1)
+		{
+			decompressRows(0, i32NumYWords);
+		}
+		else
+		{
+			const int32_t rowsPerThread =
+				(i32NumYWords + static_cast<int32_t>(threadCount) - 1) / static_cast<int32_t>(threadCount);
+			std::vector<std::thread> workers;
+			workers.reserve(threadCount - 1);
+			int32_t nextRow = 0;
+			for (unsigned int i = 1; i < threadCount; ++i)
+			{
+				const int32_t endRow = std::min(i32NumYWords, nextRow + rowsPerThread);
+				if (endRow == nextRow) { break; }
+				try
+				{
+					workers.emplace_back(decompressRows, nextRow, endRow);
+				}
+				catch (const std::system_error&)
+				{
+					break;
+				}
+				nextRow = endRow;
+			}
+			decompressRows(nextRow, i32NumYWords);
+			for (std::thread& worker : workers) { worker.join(); }
+		}
+	}
 
 	// Return the data size
 	return width * height / static_cast<uint32_t>((wordWidth / 2));
