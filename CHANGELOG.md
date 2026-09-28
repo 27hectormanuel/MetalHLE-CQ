@@ -97,6 +97,7 @@ Compatibility:
 
 Quality and performance:
 
+- Debug builds now use an optimized Dynarmic CPU backend while retaining Rust debug assertions and the wrapper's memory-access abort checks; release builds are unchanged. This reduces guest CPU initialization time during game launches. (@j92580498-max)
 - Large PVRTC textures are now decompressed in parallel (up to four workers) on hosts without native PVRTC support, reducing game texture-load time without retaining decoded textures. (@j92580498-max)
 - The main emulation loop now skips trainer setup and app-ID allocation when the optional trainer is disabled; enabled-trainer behavior is unchanged. (@j92580498-max)
 - Fullscreen `CAEAGLLayer` detection now evaluates nested layer geometry in screen space and accepts a single exact UIKit device-orientation rotation when the transformed layer still covers the screen. Landscape games that use UIKit autorotation were incorrectly sent through `glReadPixels()` plus software Core Animation composition even on GPU-present configurations; they can now use the existing GPU presenter. The existing native ES 1.1 `auto` readback policy and explicit readback mode are unchanged, and arbitrary transforms/non-fullscreen layers still use the safe compositor path.
