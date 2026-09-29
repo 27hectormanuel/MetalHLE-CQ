@@ -670,6 +670,9 @@ pub struct Window {
     event_pump: sdl2::EventPump,
     event_queue: VecDeque<Event>,
     last_polled: Instant,
+    /// TEST HOOK: injected tap coordinates for the GD music-bypass autoplay
+    /// test ( TOUCHHLE_GD_AUTOPLAY ), scheduled in popped-frame counts.
+    auto_taps: Vec<(u64, f32, f32)>,
     /// Separate queue for extremely high-priority events (e.g. app about to
     /// terminate).
     high_priority_event: Option<Event>,
@@ -933,6 +936,20 @@ impl Window {
             window,
             event_pump,
             event_queue: VecDeque::new(),
+            auto_taps: {
+                let mut taps = Vec::new();
+                if std::env::var_os("TOUCHHLE_GD_AUTOPLAY").is_some() {
+                    // (frame, x, y) in window-drawable coordinates. GD flow:
+                    // main menu centre = play button; level select centre =
+                    // level 1 card / Normal Mode.
+                    taps = vec![
+                        (600, -1.0, -1.0),
+                        (660, -1.0, -1.0),
+                        (760, -1.0, -1.0),
+                    ];
+                }
+                taps
+            },
             last_polled: Instant::now() - Duration::from_secs(1),
             high_priority_event: None,
             enable_event_polling: true,
@@ -1709,6 +1726,36 @@ impl Window {
     /// Pop an event from the queue (in FIFO order, except for high priority
     /// events)
     pub fn pop_event(&mut self) -> Option<Event> {
+        // TEST HOOK: GD autoplay taps for verifying level music headlessly.
+        if !self.auto_taps.is_empty() {
+            static POP_FRAMES: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let frame = POP_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let due: Vec<(f32, f32)> = self
+                .auto_taps
+                .iter()
+                .filter(|(tap_frame, _, _)| *tap_frame == frame)
+                .map(|(_, x, y)| (*x, *y))
+                .collect();
+            for (x, y) in due {
+                let (w, h) = self.window.drawable_size();
+                let x = if x < 0.0 { w as f32 / 2.0 } else { x };
+                let y = if y < 0.0 { h as f32 / 2.0 } else { y };
+                let coords = (x, y);
+                log!(
+                    "GD autoplay tap at frame {} -> drawable ({:.0},{:.0}) coords {:?}",
+                    frame,
+                    x,
+                    y,
+                    coords
+                );
+                self.event_queue
+                    .push_back(Event::TouchesDown(HashMap::from([(FingerId::Mouse, coords)])));
+                self.event_queue
+                    .push_back(Event::TouchesUp(HashMap::from([(FingerId::Mouse, coords)])));
+            }
+            self.auto_taps.retain(|(tap_frame, _, _)| *tap_frame > frame);
+        }
         self.high_priority_event
             .take()
             .or_else(|| self.event_queue.pop_front())

@@ -29,12 +29,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// Number of touch-down diagnostics to print at `log!` level (always visible)
 /// before going quiet. Helps diagnose "game ignores taps" reports without
 /// requiring the user to enable debug logging.
-static TOUCH_DIAGS_LEFT: AtomicUsize = AtomicUsize::new(12);
 
 /// Number of touch-end summaries to print at `log!` level. Shows how many
 /// Moved events reached the view and the total displacement, which
 /// distinguishes "host lost the moves" from "game ignored a complete gesture".
-static TOUCH_END_DIAGS_LEFT: AtomicUsize = AtomicUsize::new(12);
 
 /// Number of warnings for Move/Up events naming an untracked finger (its Down
 /// never arrived). Proof of lost Downs in "swipes randomly dead" reports.
@@ -887,39 +885,6 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             );
         }
 
-        // Compact always-visible diagnostic for the first few touch-downs:
-        // shows which window/view received the tap so "game ignores taps"
-        // reports can be diagnosed from a normal log.
-        if TOUCH_DIAGS_LEFT.load(Ordering::Relaxed) > 0 {
-            TOUCH_DIAGS_LEFT.fetch_sub(1, Ordering::Relaxed);
-            let diag_x = location.x;
-            let diag_y = location.y;
-            let windows_count = env.framework_state.uikit.ui_view.ui_window.windows.len();
-            let win_class: crate::objc::Class = msg![env; window class];
-            let win_name = env.objc.get_class_name(win_class).to_owned();
-            let hit_name = if view != nil {
-                let c: crate::objc::Class = msg![env; view class];
-                env.objc.get_class_name(c).to_owned()
-            } else {
-                "(nil)".to_string()
-            };
-            let enabled: bool = if view != nil {
-                msg![env; view isUserInteractionEnabled]
-            } else {
-                false
-            };
-            log!(
-                "TOUCH-DIAG #{}: tap ({:.0},{:.0}) windows={} window={} -> view={} interactionEnabled={}",
-                12 - TOUCH_DIAGS_LEFT.load(Ordering::Relaxed),
-                diag_x,
-                diag_y,
-                windows_count,
-                win_name,
-                hit_name,
-                enabled,
-            );
-        }
-
         let is_multi_touch_enabled: bool = msg![env; view isMultipleTouchEnabled];
         if !is_multi_touch_enabled
             && !touchhle_cocos_should_allow_multitouch(env, view)
@@ -1229,41 +1194,6 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             v.timestamp = timestamp;
             v.phase = UITouchPhaseEnded;
         });
-
-        // Compact always-visible end-of-gesture summary for the first few
-        // touches: how many Moved updates reached the view and the total
-        // displacement. A swipe with moves=0 means the host lost the moves;
-        // a large delta that the game still ignores points at game-side
-        // interpretation instead.
-        if TOUCH_END_DIAGS_LEFT.load(Ordering::Relaxed) > 0 {
-            TOUCH_END_DIAGS_LEFT.fetch_sub(1, Ordering::Relaxed);
-            let gesture_cancelled = env
-                .framework_state
-                .uikit
-                .ui_touch
-                .cancelled_by_gesture
-                .contains(&touch);
-            let (start, moves) = {
-                let host = env.objc.borrow::<UITouchHostObject>(touch);
-                (host.start_location, host.move_count)
-            };
-            let (dx, dy) = (location.x - start.x, location.y - start.y);
-            let view_name = if view != nil {
-                let view_class: crate::objc::Class = msg![env; view class];
-                env.objc.get_class_name(view_class).to_owned()
-            } else {
-                "(nil view)".to_owned()
-            };
-            log!(
-                "TOUCH-END #{}: view={} moves={} delta=({:+.0},{:+.0}) gesture_cancelled={}",
-                12 - TOUCH_END_DIAGS_LEFT.load(Ordering::Relaxed),
-                view_name,
-                moves,
-                dx,
-                dy,
-                gesture_cancelled
-            );
-        }
 
         let _: () = msg![env;
             touches addObject:touch];

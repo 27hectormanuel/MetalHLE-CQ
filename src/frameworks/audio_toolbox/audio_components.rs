@@ -153,6 +153,13 @@ pub struct AudioComponentInstanceHostObject {
     /// Флаги `kAudioUnitProperty_ShouldAllocateBuffer` (property 51),
     /// ключ — (scope, element); GET без SET отвечает 1 (как раньше).
     pub should_allocate_buffers: HashMap<(u32, u32), u32>,
+
+    /// Render notify callbacks registered through
+    /// `AudioUnitAddRenderNotify`. Real CoreAudio calls these before and
+    /// after every render operation (with the corresponding action flag
+    /// set); engines like FMOD use them to drive their mixing from inside
+    /// the render cycle, so they must actually be invoked.
+    pub render_notifies: Vec<(AURenderCallback, ConstVoidPtr)>,
 }
 
 impl Default for AudioComponentInstanceHostObject {
@@ -188,6 +195,7 @@ impl Default for AudioComponentInstanceHostObject {
             component_desc: None,
             audio_channel_layouts: HashMap::new(),
             should_allocate_buffers: HashMap::new(),
+            render_notifies: Vec::new(),
         }
     }
 }

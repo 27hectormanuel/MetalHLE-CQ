@@ -1526,11 +1526,6 @@ impl Environment {
         let mut host_sem = (*host_sem_rc).borrow_mut();
 
         if host_sem.value > 0 {
-            log_dbg!(
-                "sem_decrement: semaphore {:?} is now {}",
-                sem,
-                host_sem.value
-            );
             host_sem.value -= 1;
             return true;
         }
@@ -1542,11 +1537,6 @@ impl Environment {
             );
             return false;
         }
-        log_dbg!(
-            "Thread {} is blocking on semaphore {:?}",
-            self.current_thread,
-            sem
-        );
         host_sem.waiting.insert(self.current_thread);
         std::mem::drop(host_sem);
         // The scheduler will decrement the semaphore value when it unblocks.

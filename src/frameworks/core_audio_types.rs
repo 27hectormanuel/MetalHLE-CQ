@@ -175,3 +175,4 @@ pub const kAudioFormatFlagIsBigEndian: AudioFormatFlags = 1 << 1;
 pub const kAudioFormatFlagIsSignedInteger: AudioFormatFlags = 1 << 2;
 pub const kAudioFormatFlagIsPacked: AudioFormatFlags = 1 << 3;
 pub const kAudioFormatFlagIsAlignedHigh: AudioFormatFlags = 1 << 4;
+pub const kAudioFormatFlagIsNonInterleaved: AudioFormatFlags = 1 << 5;

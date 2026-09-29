@@ -100,6 +100,15 @@ impl State {
 type fpos_t = off_t;
 
 fn fopen(env: &mut Environment, filename: ConstPtr<u8>, mode: ConstPtr<u8>) -> MutPtr<FILE> {
+    // Geometry Dash music bypass: FMOD's streaming pipeline livelocks inside
+    // the emulator (see audio::music_bypass), so watch for the game opening
+    // its MP3 tracks and hand them to a host-side player instead.
+    if env.options.gd_music_bypass {
+        let guest_path = crate::fs::GuestPathBuf::from(
+            String::from_utf8_lossy(env.mem.cstr_at(filename)).into_owned(),
+        );
+        crate::audio::music_bypass::on_music_file_open(env, &guest_path);
+    }
     // Some testing on macOS suggests Apple's implementation will just ignore
     // flags it doesn't know about, and unfortunately real-world apps seem to
     // rely on this, e.g. using "wt" to mean open for writing in text mode,

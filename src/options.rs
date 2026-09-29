@@ -248,6 +248,10 @@ pub struct Options {
     pub fix_texture_min_filter: bool,
     pub zero_stack_after_guest_to_host_call: Option<u32>,
     pub corruption: CorruptionOptions,
+    /// Play intercepted MP3 "music" `fopen()`s on a dedicated host OpenAL
+    /// device (FMOD streaming bypass). Enabled by default; can be disabled
+    /// with `TOUCHHLE_GD_MUSIC_BYPASS=0`.
+    pub gd_music_bypass: bool,
 }
 
 impl Default for Options {
@@ -332,6 +336,9 @@ impl Default for Options {
             fix_texture_min_filter: cfg!(target_os = "android"),
             zero_stack_after_guest_to_host_call: None,
             corruption: CorruptionOptions::default(),
+            gd_music_bypass: std::env::var_os("TOUCHHLE_GD_MUSIC_BYPASS")
+                .map(|value| value != "0")
+                .unwrap_or(true),
         }
     }
 }

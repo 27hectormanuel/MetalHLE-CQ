@@ -129,6 +129,24 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     crash_handler::install();
     crash_handler::install_panic_hook();
 
+    // Headless CI boxes have no sound devices; when asked, point OpenAL
+    // Soft's wave writer at a capture file before any OpenAL call happens.
+    if std::env::var_os("TOUCHHLE_CAPTURE_AUDIO").is_some()
+        && std::env::var_os("ALSOFT_DRIVERS").is_none()
+    {
+        let path = std::env::var_os("TOUCHHLE_CAPTURE_AUDIO").unwrap();
+        let conf = std::env::temp_dir().join("touchhle-wave-capture.conf");
+        // openal-soft's wave backend only reads its output path from the
+        // config key `wave/file`; it does not honour an env override, so
+        // generate a minimal config file and point ALSOFT_CONF at it.
+        std::fs::write(&conf, format!("[wave]\nfile = {}\n", path.to_string_lossy())).ok();
+        // SAFETY: runs before any thread spawn or OpenAL call in this process.
+        unsafe {
+            std::env::set_var("ALSOFT_DRIVERS", "wave");
+            std::env::set_var("ALSOFT_CONF", &conf);
+        }
+    }
+
     #[cfg(target_os = "android")]
     {
         // PERF: raise the scheduling priority of the thread that runs the

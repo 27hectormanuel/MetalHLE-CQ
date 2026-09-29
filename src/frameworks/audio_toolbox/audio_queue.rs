@@ -220,6 +220,7 @@ pub fn AudioQueueNewOutput(
     in_flags: u32,
     out_aq: MutPtr<AudioQueueRef>,
 ) -> OSStatus {
+    log!("AudioQueueNewOutput(format={:?})", env.mem.read(in_format));
     // reserved: real Audio Queue Services ignores non-zero flags as a
     // forward-compatibility measure. Don't panic if a game passes garbage.
     if in_flags != 0 {
@@ -1227,7 +1228,14 @@ pub fn decode_buffer(
     packet_descs: &[(u32, u32)],
 ) -> (ALenum, ALsizei, Vec<u8>) {
     let data_slice = mem.bytes_at(audio_data, audio_data_byte_size);
+    decode_buffer_from_bytes(format, data_slice, packet_descs)
+}
 
+pub fn decode_buffer_from_bytes(
+    format: &AudioStreamBasicDescription,
+    data_slice: &[u8],
+    packet_descs: &[(u32, u32)],
+) -> (ALenum, ALsizei, Vec<u8>) {
     if !is_supported_audio_format(format) {
         // Real CoreAudio would refuse the buffer back at
         // AudioQueueNewOutput, but if a previously valid queue is fed an
