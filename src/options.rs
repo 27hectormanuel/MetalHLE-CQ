@@ -248,10 +248,11 @@ pub struct Options {
     pub fix_texture_min_filter: bool,
     pub zero_stack_after_guest_to_host_call: Option<u32>,
     pub corruption: CorruptionOptions,
-    /// Play intercepted MP3 "music" `fopen()`s on a dedicated host OpenAL
     /// device (FMOD streaming bypass). Opt in with `--fix-music` or
-    /// `TOUCHHLE_GD_MUSIC_BYPASS=1`; it desyncs from pause/death and doubles
-    /// up with the game's own music once the in-game FMOD pipeline works.
+    /// `TOUCHHLE_GD_MUSIC_BYPASS=1`; off by default so the bypass only
+    /// affects Geometry Dash sessions where the user asked for it.
+    // TODO: flip to opt-out once track-switch/pause/reset handling is
+    // validated against a real run of the game.
     pub gd_music_bypass: bool,
 }
 

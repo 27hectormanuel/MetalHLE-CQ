@@ -103,11 +103,12 @@ fn fopen(env: &mut Environment, filename: ConstPtr<u8>, mode: ConstPtr<u8>) -> M
     // Geometry Dash music bypass: FMOD's streaming pipeline livelocks inside
     // the emulator (see audio::music_bypass), so watch for the game opening
     // its MP3 tracks and hand them to a host-side player instead.
+    let mut music_track = None;
     if env.options.gd_music_bypass {
         let guest_path = crate::fs::GuestPathBuf::from(
             String::from_utf8_lossy(env.mem.cstr_at(filename)).into_owned(),
         );
-        crate::audio::music_bypass::on_music_file_open(env, &guest_path);
+        music_track = crate::audio::music_bypass::on_music_file_open(env, &guest_path);
     }
     // Some testing on macOS suggests Apple's implementation will just ignore
     // flags it doesn't know about, and unfortunately real-world apps seem to
@@ -178,6 +179,9 @@ fn fopen(env: &mut Environment, filename: ConstPtr<u8>, mode: ConstPtr<u8>) -> M
                     error: false,
                 },
             );
+            if let Some(name) = music_track {
+                crate::audio::music_bypass::register_music_file(res.to_bits(), name);
+            }
             res
         }
     }
@@ -282,6 +286,8 @@ fn fread(
     // errno is cleared at entry; posix_io (and explicit error paths)
     // set the real errno when an operation fails.
     set_errno(env, 0);
+
+    crate::audio::music_bypass::note_stdio_activity(file_ptr.to_bits());
 
     if item_size == 0 {
         return 0;
@@ -589,6 +595,11 @@ fn fseeko(env: &mut Environment, file_ptr: MutPtr<FILE>, offset: off_t, whence: 
         set_errno(env, EINVAL);
         return -1;
     }
+    if offset == 0 && whence == SEEK_SET {
+        // A music stream rewound to the start: GD restarted the track
+        // (death + respawn, level retry).
+        crate::audio::music_bypass::note_stdio_rewind(file_ptr.to_bits());
+    }
     match posix_io::lseek(env, fd, offset, whence) {
         -1 => -1,
         _cur_pos => {
@@ -672,6 +683,7 @@ fn fclose(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
         set_errno(env, EBADF);
         return EOF;
     }
+    crate::audio::music_bypass::unregister_music_file(file_ptr.to_bits());
 
     env.mem.free(file_ptr.cast());
 

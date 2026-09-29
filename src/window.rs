@@ -946,6 +946,9 @@ impl Window {
                         (600, -1.0, -1.0),
                         (660, -1.0, -1.0),
                         (760, -1.0, -1.0),
+                        // Level select: tap the level card to start the level.
+                        (1100, 240.0, 150.0),
+                        (1250, 240.0, 150.0),
                     ];
                 }
                 taps

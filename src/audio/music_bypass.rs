@@ -20,6 +20,7 @@
 use crate::audio::AudioFile;
 use crate::environment::Environment;
 use crate::fs::GuestPath;
+use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Mutex;
 use touchHLE_openal_soft_wrapper::{al_defines as aldef, al_types as altypes};
@@ -42,9 +43,83 @@ enum PlayerCommand {
         channels: u32,
         name: String,
     },
+    /// FMOD rewound a tracked music stream back to offset 0 (GD does this
+    /// when restarting a level after death): restart the track from the top.
+    Restart { name: String },
+    /// FMOD read more data from a tracked music stream. Sustained reads mean
+    /// the guest is consuming the track; a long read drought means the stream
+    /// is paused (GD pause menu) and playback should pause too.
+    Activity { name: String },
+    /// FMOD closed a tracked music stream's `FILE*` (`fclose`): GD stopped
+    /// the track (leaving a level, entering a level after the level-select
+    /// preview, death + respawn re-opens the file). Stop immediately so the
+    /// next `Play` for the same track starts from the top and stays in sync
+    /// with the game, instead of layering over the old playback.
+    Stop { name: String },
 }
 
 static PLAYER_SENDER: Mutex<Option<Sender<PlayerCommand>>> = Mutex::new(None);
+
+/// Guest `FILE*` addresses of music streams currently opened by FMOD, mapped
+/// to the track name they belong to. Used by the stdio hooks (`fread`/
+/// `fseek`) to attribute stream activity to the bypass track.
+static TRACKED_FILES: std::sync::OnceLock<Mutex<HashMap<u32, String>>> =
+    std::sync::OnceLock::new();
+
+fn tracked_files() -> &'static Mutex<HashMap<u32, String>> {
+    TRACKED_FILES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Remember the guest `FILE*` behind a bypassed track so stdio hooks can
+/// report activity for it.
+pub fn register_music_file(file_ptr: u32, name: String) {
+    tracked_files().lock().unwrap().insert(file_ptr, name);
+}
+
+pub fn unregister_music_file(file_ptr: u32) {
+    let mut tracked = tracked_files().lock().unwrap();
+    let removed = tracked.remove(&file_ptr);
+    // GD frequently opens a fresh stream for a track before closing the
+    // stale one; closing the duplicate must not silence the fresh copy
+    // (this caused overlapping-then-dead menu music on scene changes).
+    let still_open = removed
+        .as_ref()
+        .is_some_and(|name| tracked.values().any(|other| other == name));
+    drop(tracked);
+    if let Some(name) = removed {
+        if !still_open {
+            let sender = PLAYER_SENDER.lock().unwrap().clone();
+            if let Some(sender) = sender {
+                let _ = sender.send(PlayerCommand::Stop { name });
+            }
+        }
+    }
+}
+
+fn tracked_name(file_ptr: u32) -> Option<String> {
+    tracked_files().lock().unwrap().get(&file_ptr).cloned()
+}
+
+/// Called from `fread()` for every guest read; only tracked music streams
+/// produce a command.
+pub fn note_stdio_activity(file_ptr: u32) {
+    if let Some(name) = tracked_name(file_ptr) {
+        let sender = PLAYER_SENDER.lock().unwrap().clone();
+        if let Some(sender) = sender {
+            let _ = sender.send(PlayerCommand::Activity { name });
+        }
+    }
+}
+
+/// Called from `fseeko()` when a tracked stream is rewound to offset 0.
+pub fn note_stdio_rewind(file_ptr: u32) {
+    if let Some(name) = tracked_name(file_ptr) {
+        let sender = PLAYER_SENDER.lock().unwrap().clone();
+        if let Some(sender) = sender {
+            let _ = sender.send(PlayerCommand::Restart { name });
+        }
+    }
+}
 
 /// Last decoded track. GD re-opens the same MP3 (especially the menu loop)
 /// many times per session; re-decoding megabytes of PCM on the guest main
@@ -53,7 +128,9 @@ static PLAYER_SENDER: Mutex<Option<Sender<PlayerCommand>>> = Mutex::new(None);
 static PCM_CACHE: Mutex<Option<(String, std::sync::Arc<Vec<u8>>, u32, u32)>> = Mutex::new(None);
 
 /// Called from `fopen()` for every guest-opened audio file while running GD.
-pub fn on_music_file_open(env: &mut Environment, filename: &GuestPath) {
+/// Returns the bypassed track's name when the file was taken over, so the
+/// caller can register the resulting `FILE*` with `register_music_file`.
+pub fn on_music_file_open(env: &mut Environment, filename: &GuestPath) -> Option<String> {
     // Cheap suffix check first, so unrelated callers only pay a string
     // compare.
     let path_str = filename.as_str().to_ascii_lowercase();
@@ -61,7 +138,7 @@ pub fn on_music_file_open(env: &mut Environment, filename: &GuestPath) {
         .iter()
         .any(|suffix| path_str.ends_with(suffix))
     {
-        return;
+        return None;
     }
 
     let name = filename
@@ -85,7 +162,7 @@ pub fn on_music_file_open(env: &mut Environment, filename: &GuestPath) {
         Some(data) => data,
         None => {
             let Some((pcm, sample_rate, channels)) = decode_track(env, filename, &name) else {
-                return;
+                return None;
             };
             let pcm = std::sync::Arc::new(pcm);
             *PCM_CACHE.lock().unwrap() =
@@ -99,10 +176,11 @@ pub fn on_music_file_open(env: &mut Environment, filename: &GuestPath) {
         pcm,
         sample_rate,
         channels,
-        name,
+        name: name.clone(),
     }) {
         log!("music bypass: player thread died: {:?}", err);
     }
+    Some(name)
 }
 
 fn decode_track(
@@ -131,22 +209,23 @@ fn ensure_player_thread() -> Sender<PlayerCommand> {
     if let Some(sender) = guard.as_ref() {
         return sender.clone();
     }
+    // Claim the sender slot BEFORE spawning: two FMOD threads can open the
+    // same MP3 concurrently (loading screen + main menu both trigger
+    // menuLoop.mp3), and if both see an empty slot they each spawn a player
+    // thread, producing two overlapping copies of the track.
     let (sender, receiver) = channel::<PlayerCommand>();
+    *guard = Some(sender.clone());
     std::thread::Builder::new()
         .name("GD music bypass".to_string())
         .spawn(move || {
             player_thread(receiver);
         })
         .expect("music bypass: failed to spawn player thread");
-    *guard = Some(sender.clone());
     sender
 }
 
 fn player_thread(receiver: Receiver<PlayerCommand>) {
     const AL_BUFFER: altypes::ALenum = 0x1009;
-    const AL_LOOPING: altypes::ALenum = 0x1007;
-    const AL_SOURCE_RELATIVE: altypes::ALenum = 0x0202;
-    const AL_TRUE: altypes::ALint = 1;
     const AL_STOPPED: altypes::ALint = 0x1014;
     const AL_BUFFERS_QUEUED: altypes::ALenum = 0x1015;
     const AL_BUFFERS_PROCESSED: altypes::ALenum = 0x1016;
@@ -169,9 +248,18 @@ fn player_thread(receiver: Receiver<PlayerCommand>) {
             return;
         }
 
+        const AL_PLAYING: altypes::ALint = 0x1012;
+        // If the guest stops reading from the track's file for this long, FMOD
+        // has paused/stopped the stream (GD pause menu, death screen): silence
+        // the bypass too, and resume as soon as reads pick back up.
+        const PAUSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
         let mut source: altypes::ALuint = 0;
         let mut buffers: Vec<altypes::ALuint> = Vec::new();
         let mut current_name = String::new();
+        let mut paused = false;
+        let mut stopped = false;
+        let mut last_activity = std::time::Instant::now();
 
         loop {
             match receiver.recv_timeout(std::time::Duration::from_millis(25)) {
@@ -180,8 +268,12 @@ fn player_thread(receiver: Receiver<PlayerCommand>) {
                         let mut state = 0;
                         al::alGetSourcei(source, aldef::AL_SOURCE_STATE, &mut state);
                         if state != AL_STOPPED {
+                            // GD re-opens the same track on scene changes while
+                            // it should keep playing; treat that as activity.
+                            last_activity = std::time::Instant::now();
                             continue;
                         }
+                        stopped = false;
                     }
                     if source != 0 {
                         al::alSourceStop(source);
@@ -259,6 +351,9 @@ fn player_thread(receiver: Receiver<PlayerCommand>) {
                     }
                     al::alSourcePlay(source);
                     current_name = name.clone();
+                    paused = false;
+                    stopped = false;
+                    last_activity = std::time::Instant::now();
                     log!(
                         "music bypass: playing {} ({} Hz, {}ch, {} KiB PCM, {} chunks)",
                         name,
@@ -268,6 +363,50 @@ fn player_thread(receiver: Receiver<PlayerCommand>) {
                         buffers.len()
                     );
                 }
+                Ok(PlayerCommand::Activity { name }) => {
+                    if name == current_name && source != 0 {
+                        last_activity = std::time::Instant::now();
+                        if paused {
+                            al::alSourcePlay(source);
+                            paused = false;
+                            log!("music bypass: guest resumed; unpausing {}", name);
+                        }
+                    }
+                }
+                Ok(PlayerCommand::Restart { name }) => {
+                    if name == current_name && source != 0 && !buffers.is_empty() {
+                        al::alSourceStop(source);
+                        let mut detach = 0;
+                        al::alGetSourcei(source, AL_BUFFERS_QUEUED, &mut detach);
+                        while detach > 0 {
+                            let done = detach.min(64);
+                            let mut scratch = vec![0u32; done as usize];
+                            al::alSourceUnqueueBuffers(source, done, scratch.as_mut_ptr());
+                            if al::alGetError() != aldef::AL_NO_ERROR {
+                                break;
+                            }
+                            detach -= done;
+                        }
+                        al::alSourceQueueBuffers(
+                            source,
+                            buffers.len() as altypes::ALsizei,
+                            buffers.as_ptr(),
+                        );
+                        al::alSourcePlay(source);
+                        paused = false;
+                        stopped = false;
+                        last_activity = std::time::Instant::now();
+                        log!("music bypass: restarted {} from the top", name);
+                    }
+                }
+                Ok(PlayerCommand::Stop { name }) => {
+                    if name == current_name && source != 0 {
+                        al::alSourceStop(source);
+                        paused = false;
+                        stopped = true;
+                        log!("music bypass: guest stopped {}", name);
+                    }
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if source == 0 || buffers.is_empty() {
                         continue;
@@ -276,7 +415,15 @@ fn player_thread(receiver: Receiver<PlayerCommand>) {
                     let mut queued = 0;
                     let mut processed = 0;
                     al::alGetSourcei(source, aldef::AL_SOURCE_STATE, &mut state);
-                    if state != AL_STOPPED {
+                    if state == AL_PLAYING && last_activity.elapsed() >= PAUSE_TIMEOUT {
+                        // No stream reads for a while: the guest paused (or
+                        // stopped consuming) this track.
+                        al::alSourcePause(source);
+                        paused = true;
+                        log!("music bypass: guest went quiet; pausing {}", current_name);
+                        continue;
+                    }
+                    if stopped || state != AL_STOPPED {
                         continue;
                     }
                     al::alGetSourcei(source, AL_BUFFERS_QUEUED, &mut queued);
