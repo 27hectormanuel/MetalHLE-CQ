@@ -338,7 +338,7 @@ impl Default for Options {
             corruption: CorruptionOptions::default(),
             gd_music_bypass: std::env::var_os("TOUCHHLE_GD_MUSIC_BYPASS")
                 .map(|value| value != "0")
-                .unwrap_or(true),
+                .unwrap_or(false),
         }
     }
 }
