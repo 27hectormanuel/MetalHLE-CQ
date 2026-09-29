@@ -252,6 +252,7 @@ fn player_thread(receiver: Receiver<PlayerCommand>) {
         // If the guest stops reading from the track's file for this long, FMOD
         // has paused/stopped the stream (GD pause menu, death screen): silence
         // the bypass too, and resume as soon as reads pick back up.
+        const STREAM_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
         const PAUSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
         let mut source: altypes::ALuint = 0;
@@ -259,6 +260,8 @@ fn player_thread(receiver: Receiver<PlayerCommand>) {
         let mut current_name = String::new();
         let mut paused = false;
         let mut stopped = false;
+        let mut streaming = false;
+        let mut play_started = std::time::Instant::now();
         let mut last_activity = std::time::Instant::now();
 
         loop {
@@ -270,7 +273,7 @@ fn player_thread(receiver: Receiver<PlayerCommand>) {
                         if state != AL_STOPPED {
                             // GD re-opens the same track on scene changes while
                             // it should keep playing; treat that as activity.
-                            last_activity = std::time::Instant::now();
+                            play_started = std::time::Instant::now();
                             continue;
                         }
                         stopped = false;
@@ -353,7 +356,11 @@ fn player_thread(receiver: Receiver<PlayerCommand>) {
                     current_name = name.clone();
                     paused = false;
                     stopped = false;
-                    last_activity = std::time::Instant::now();
+                    // A track is only "streaming" (pausable on guest silence)
+                    // once reads keep arriving after the load-time grace
+                    // window; fully-buffered FMOD tracks stop reading at all.
+                    streaming = false;
+                    play_started = std::time::Instant::now();
                     log!(
                         "music bypass: playing {} ({} Hz, {}ch, {} KiB PCM, {} chunks)",
                         name,
@@ -365,16 +372,31 @@ fn player_thread(receiver: Receiver<PlayerCommand>) {
                 }
                 Ok(PlayerCommand::Activity { name }) => {
                     if name == current_name && source != 0 {
-                        last_activity = std::time::Instant::now();
+                        // Reads still arriving well after the play started
+                        // mean FMOD is genuinely streaming this track; those
+                        // tracks may pause when reads dry up. Reads within the
+                        // grace window are just the initial load burst.
+                        if !streaming && play_started.elapsed() >= STREAM_GRACE {
+                            streaming = true;
+                        }
+                        if streaming {
+                            last_activity = std::time::Instant::now();
+                        }
                         if paused {
                             al::alSourcePlay(source);
                             paused = false;
+                            streaming = false;
+                            play_started = std::time::Instant::now();
                             log!("music bypass: guest resumed; unpausing {}", name);
                         }
                     }
                 }
                 Ok(PlayerCommand::Restart { name }) => {
-                    if name == current_name && source != 0 && !buffers.is_empty() {
+                    // FMOD seeks back to offset 0 right after opening a file
+                    // (skipping metadata); that is not a track restart. Only
+                    // honor rewinds of playback that has actually progressed.
+                    let progressed = play_started.elapsed() >= STREAM_GRACE;
+                    if name == current_name && source != 0 && !buffers.is_empty() && progressed {
                         al::alSourceStop(source);
                         let mut detach = 0;
                         al::alGetSourcei(source, AL_BUFFERS_QUEUED, &mut detach);
@@ -395,7 +417,8 @@ fn player_thread(receiver: Receiver<PlayerCommand>) {
                         al::alSourcePlay(source);
                         paused = false;
                         stopped = false;
-                        last_activity = std::time::Instant::now();
+                        streaming = false;
+                        play_started = std::time::Instant::now();
                         log!("music bypass: restarted {} from the top", name);
                     }
                 }
@@ -404,6 +427,7 @@ fn player_thread(receiver: Receiver<PlayerCommand>) {
                         al::alSourceStop(source);
                         paused = false;
                         stopped = true;
+                        streaming = false;
                         log!("music bypass: guest stopped {}", name);
                     }
                 }
@@ -415,9 +439,12 @@ fn player_thread(receiver: Receiver<PlayerCommand>) {
                     let mut queued = 0;
                     let mut processed = 0;
                     al::alGetSourcei(source, aldef::AL_SOURCE_STATE, &mut state);
-                    if state == AL_PLAYING && last_activity.elapsed() >= PAUSE_TIMEOUT {
-                        // No stream reads for a while: the guest paused (or
-                        // stopped consuming) this track.
+                    if state == AL_PLAYING
+                        && streaming
+                        && last_activity.elapsed() >= PAUSE_TIMEOUT
+                    {
+                        // Streaming tracks pause when reads dry up (GD pause
+                        // menu); fully-buffered tracks keep looping forever.
                         al::alSourcePause(source);
                         paused = true;
                         log!("music bypass: guest went quiet; pausing {}", current_name);
