@@ -30,7 +30,7 @@ The titles below have been tested with HyperHLE-Fork and are known to run. Compa
 - Real Racing 1
 - Silent Ops
 - Need For Speed: Most Wanted (2012)
-- Minecraft 0.14.2
+- Minecraft 0.14.2-0.16.2
 - Oceanhorn
 - And more more games
 
