@@ -767,6 +767,12 @@ impl GLES for GLES2Native<'_> {
         }
         gles2::TexParameterfv(target, pname, params)
     }
+    unsafe fn GetTexParameteriv(&mut self, target: GLenum, pname: GLenum, params: *mut GLint) {
+        gles2::GetTexParameteriv(target, pname, params)
+    }
+    unsafe fn GetTexParameterfv(&mut self, target: GLenum, pname: GLenum, params: *mut GLfloat) {
+        gles2::GetTexParameterfv(target, pname, params)
+    }
     #[allow(clippy::too_many_arguments)]
     unsafe fn TexImage2D(
         &mut self,

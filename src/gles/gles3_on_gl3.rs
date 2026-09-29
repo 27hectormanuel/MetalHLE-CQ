@@ -553,6 +553,12 @@ impl GLES for GLES3OnGL3<'_> {
         }
         gl33::TexParameterfv(target, pname, params)
     }
+    unsafe fn GetTexParameteriv(&mut self, target: GLenum, pname: GLenum, params: *mut GLint) {
+        gl33::GetTexParameteriv(target, pname, params)
+    }
+    unsafe fn GetTexParameterfv(&mut self, target: GLenum, pname: GLenum, params: *mut GLfloat) {
+        gl33::GetTexParameterfv(target, pname, params)
+    }
     #[allow(clippy::too_many_arguments)]
     unsafe fn TexImage2D(
         &mut self,
