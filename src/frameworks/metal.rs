@@ -11,11 +11,9 @@
 //! it does not pretend to execute Metal command streams on non-Apple hosts.
 
 use crate::dyld::{ConstantExports, HostDylib};
+use crate::frameworks::core_graphics::cg_geometry::CGRect;
 use crate::frameworks::foundation::{ns_string, NSUInteger};
-use crate::frameworks::core_animation::ca_layer::CALayerHostObject;
-use crate::frameworks::core_graphics::cg_geometry::{CGRect, CGSize};
 use crate::mem::{ConstPtr, ConstVoidPtr, GuestUSize, MutPtr, MutVoidPtr};
-use crate::frameworks::core_graphics::CGFloat;
 use crate::objc::{id, msg, msg_class, nil, objc_classes, ClassExports, HostObject, NSZonePtr};
 use crate::Environment;
 
@@ -59,13 +57,6 @@ struct MetalObjectHostObject {
     layouts: id,
     attributes: id,
     stride: NSUInteger,
-    s_address_mode: NSUInteger,
-    t_address_mode: NSUInteger,
-    r_address_mode: NSUInteger,
-    lod_min_clamp: f32,
-    lod_max_clamp: f32,
-    max_anisotropy: NSUInteger,
-    normalized_coordinates: bool,
     front_stencil: id,
     back_stencil: id,
     step_function: NSUInteger,
@@ -92,6 +83,125 @@ struct MetalObjectHostObject {
     color_attachments: [id; MAX_COLOR_ATTACHMENTS],
 }
 impl HostObject for MetalObjectHostObject {}
+
+#[derive(Clone, Copy)]
+struct SamplerDescriptorSettings {
+    label: id,
+    min_filter: NSUInteger,
+    mag_filter: NSUInteger,
+    mip_filter: NSUInteger,
+    max_anisotropy: NSUInteger,
+    s_address_mode: NSUInteger,
+    t_address_mode: NSUInteger,
+    r_address_mode: NSUInteger,
+    border_color: NSUInteger,
+    normalized_coordinates: bool,
+    lod_min_clamp: f32,
+    lod_max_clamp: f32,
+    lod_bias: f32,
+    lod_average: bool,
+    compare_function: NSUInteger,
+    support_argument_buffers: bool,
+    reduction_mode: NSUInteger,
+}
+
+impl Default for SamplerDescriptorSettings {
+    fn default() -> Self {
+        Self {
+            label: nil,
+            min_filter: 0,
+            mag_filter: 0,
+            mip_filter: 0,
+            max_anisotropy: 1,
+            s_address_mode: 0,
+            t_address_mode: 0,
+            r_address_mode: 0,
+            border_color: 0,
+            normalized_coordinates: true,
+            lod_min_clamp: 0.0,
+            lod_max_clamp: f32::MAX,
+            lod_bias: 0.0,
+            lod_average: false,
+            compare_function: 0,
+            support_argument_buffers: false,
+            reduction_mode: 0,
+        }
+    }
+}
+
+struct SamplerDescriptorHostObject {
+    settings: SamplerDescriptorSettings,
+}
+
+impl Default for SamplerDescriptorHostObject {
+    fn default() -> Self {
+        Self {
+            settings: SamplerDescriptorSettings::default(),
+        }
+    }
+}
+
+impl HostObject for SamplerDescriptorHostObject {}
+
+struct SamplerStateHostObject {
+    device: id,
+    settings: SamplerDescriptorSettings,
+    gpu_resource_id: u64,
+}
+
+impl Default for SamplerStateHostObject {
+    fn default() -> Self {
+        Self {
+            device: nil,
+            settings: SamplerDescriptorSettings::default(),
+            gpu_resource_id: 0,
+        }
+    }
+}
+
+impl HostObject for SamplerStateHostObject {}
+
+#[cfg(test)]
+mod sampler_tests {
+    use super::{SamplerDescriptorSettings, SamplerStateHostObject};
+    use crate::objc::nil;
+
+    #[test]
+    fn descriptor_defaults_match_metal() {
+        let settings = SamplerDescriptorSettings::default();
+        assert_eq!(settings.min_filter, 0);
+        assert_eq!(settings.mag_filter, 0);
+        assert_eq!(settings.mip_filter, 0);
+        assert_eq!(settings.max_anisotropy, 1);
+        assert_eq!(settings.s_address_mode, 0);
+        assert_eq!(settings.t_address_mode, 0);
+        assert_eq!(settings.r_address_mode, 0);
+        assert_eq!(settings.border_color, 0);
+        assert!(settings.normalized_coordinates);
+        assert_eq!(settings.lod_min_clamp, 0.0);
+        assert_eq!(settings.lod_max_clamp, f32::MAX);
+        assert_eq!(settings.lod_bias, 0.0);
+        assert!(!settings.lod_average);
+        assert_eq!(settings.compare_function, 0);
+        assert!(!settings.support_argument_buffers);
+        assert_eq!(settings.reduction_mode, 0);
+    }
+
+    #[test]
+    fn sampler_state_keeps_descriptor_snapshot_and_device() {
+        let mut settings = SamplerDescriptorSettings::default();
+        settings.min_filter = 1;
+        settings.label = nil;
+        let state = SamplerStateHostObject {
+            device: nil,
+            settings,
+            gpu_resource_id: 42,
+        };
+        settings.min_filter = 0;
+        assert_eq!(state.settings.min_filter, 1);
+        assert_eq!(state.gpu_resource_id, 42);
+    }
+}
 
 fn metal_string(env: &mut Environment, value: &'static str) -> id {
     ns_string::get_static_str(env, value)
@@ -232,7 +342,21 @@ const CLASSES: ClassExports = objc_classes! {
 }
 - (id)newLibraryWithData:(ConstVoidPtr)_data error:(MutPtr<id>)_error { msg_class![env; MTLLibrary new] }
 - (id)newLibraryWithFile:(ConstPtr<u8>)_path error:(MutPtr<id>)_error { msg_class![env; MTLLibrary new] }
-- (id)newSamplerStateWithDescriptor:(id)_descriptor { msg_class![env; MTLSamplerState new] }
+- (id)newSamplerStateWithDescriptor:(id)descriptor {
+    let settings = if descriptor == nil {
+        SamplerDescriptorSettings::default()
+    } else {
+        env.objc
+            .borrow::<SamplerDescriptorHostObject>(descriptor)
+            .settings
+    };
+    let state = msg_class![env; TouchHLEMTLSamplerState new];
+    let host = env.objc.borrow_mut::<SamplerStateHostObject>(state);
+    host.device = this;
+    host.settings = settings;
+    host.gpu_resource_id = state.to_bits() as u64;
+    state
+}
 - (id)newRenderPipelineStateWithDescriptor:(id)_descriptor error:(MutPtr<id>)_error { msg_class![env; MTLRenderPipelineState new] }
 - (id)newDepthStencilStateWithDescriptor:(id)_descriptor { msg_class![env; MTLDepthStencilState new] }
 - (bool)supportsFeatureSet:(NSUInteger)_feature_set {
@@ -243,6 +367,76 @@ const CLASSES: ClassExports = objc_classes! {
     _feature_set <= 5
 }
 
+@end
+
+@implementation MTLSamplerDescriptor: NSObject
++ (id)allocWithZone:(NSZonePtr)_zone {
+    env.objc.alloc_object(this, Box::new(SamplerDescriptorHostObject::default()), &mut env.mem)
+}
+- (id)init { this }
+- (id)copyWithZone:(NSZonePtr)_zone {
+    let copy = msg_class![env; MTLSamplerDescriptor new];
+    let settings = env.objc.borrow::<SamplerDescriptorHostObject>(this).settings;
+    env.objc.borrow_mut::<SamplerDescriptorHostObject>(copy).settings = settings;
+    copy
+}
+- (id)label { env.objc.borrow::<SamplerDescriptorHostObject>(this).settings.label }
+- (())setLabel:(id)label {
+    let label = if label == nil { nil } else { msg![env; label copy] };
+    env.objc.borrow_mut::<SamplerDescriptorHostObject>(this).settings.label = label;
+}
+- (NSUInteger)minFilter { env.objc.borrow::<SamplerDescriptorHostObject>(this).settings.min_filter }
+- (())setMinFilter:(NSUInteger)filter { env.objc.borrow_mut::<SamplerDescriptorHostObject>(this).settings.min_filter = filter }
+- (NSUInteger)magFilter { env.objc.borrow::<SamplerDescriptorHostObject>(this).settings.mag_filter }
+- (())setMagFilter:(NSUInteger)filter { env.objc.borrow_mut::<SamplerDescriptorHostObject>(this).settings.mag_filter = filter }
+- (NSUInteger)mipFilter { env.objc.borrow::<SamplerDescriptorHostObject>(this).settings.mip_filter }
+- (())setMipFilter:(NSUInteger)filter { env.objc.borrow_mut::<SamplerDescriptorHostObject>(this).settings.mip_filter = filter }
+- (NSUInteger)maxAnisotropy { env.objc.borrow::<SamplerDescriptorHostObject>(this).settings.max_anisotropy }
+- (())setMaxAnisotropy:(NSUInteger)anisotropy { env.objc.borrow_mut::<SamplerDescriptorHostObject>(this).settings.max_anisotropy = anisotropy }
+- (NSUInteger)sAddressMode { env.objc.borrow::<SamplerDescriptorHostObject>(this).settings.s_address_mode }
+- (())setSAddressMode:(NSUInteger)mode { env.objc.borrow_mut::<SamplerDescriptorHostObject>(this).settings.s_address_mode = mode }
+- (NSUInteger)addressModeS { env.objc.borrow::<SamplerDescriptorHostObject>(this).settings.s_address_mode }
+- (())setAddressModeS:(NSUInteger)mode { env.objc.borrow_mut::<SamplerDescriptorHostObject>(this).settings.s_address_mode = mode }
+- (NSUInteger)tAddressMode { env.objc.borrow::<SamplerDescriptorHostObject>(this).settings.t_address_mode }
+- (())setTAddressMode:(NSUInteger)mode { env.objc.borrow_mut::<SamplerDescriptorHostObject>(this).settings.t_address_mode = mode }
+- (NSUInteger)addressModeT { env.objc.borrow::<SamplerDescriptorHostObject>(this).settings.t_address_mode }
+- (())setAddressModeT:(NSUInteger)mode { env.objc.borrow_mut::<SamplerDescriptorHostObject>(this).settings.t_address_mode = mode }
+- (NSUInteger)rAddressMode { env.objc.borrow::<SamplerDescriptorHostObject>(this).settings.r_address_mode }
+- (())setRAddressMode:(NSUInteger)mode { env.objc.borrow_mut::<SamplerDescriptorHostObject>(this).settings.r_address_mode = mode }
+- (NSUInteger)addressModeR { env.objc.borrow::<SamplerDescriptorHostObject>(this).settings.r_address_mode }
+- (())setAddressModeR:(NSUInteger)mode { env.objc.borrow_mut::<SamplerDescriptorHostObject>(this).settings.r_address_mode = mode }
+- (NSUInteger)borderColor { env.objc.borrow::<SamplerDescriptorHostObject>(this).settings.border_color }
+- (())setBorderColor:(NSUInteger)color { env.objc.borrow_mut::<SamplerDescriptorHostObject>(this).settings.border_color = color }
+- (bool)normalizedCoordinates { env.objc.borrow::<SamplerDescriptorHostObject>(this).settings.normalized_coordinates }
+- (())setNormalizedCoordinates:(bool)normalized { env.objc.borrow_mut::<SamplerDescriptorHostObject>(this).settings.normalized_coordinates = normalized }
+- (f32)lodMinClamp { env.objc.borrow::<SamplerDescriptorHostObject>(this).settings.lod_min_clamp }
+- (())setLodMinClamp:(f32)clamp { env.objc.borrow_mut::<SamplerDescriptorHostObject>(this).settings.lod_min_clamp = clamp }
+- (f32)lodMaxClamp { env.objc.borrow::<SamplerDescriptorHostObject>(this).settings.lod_max_clamp }
+- (())setLodMaxClamp:(f32)clamp { env.objc.borrow_mut::<SamplerDescriptorHostObject>(this).settings.lod_max_clamp = clamp }
+- (f32)lodBias { env.objc.borrow::<SamplerDescriptorHostObject>(this).settings.lod_bias }
+- (())setLodBias:(f32)bias { env.objc.borrow_mut::<SamplerDescriptorHostObject>(this).settings.lod_bias = bias }
+- (bool)lodAverage { env.objc.borrow::<SamplerDescriptorHostObject>(this).settings.lod_average }
+- (())setLodAverage:(bool)average { env.objc.borrow_mut::<SamplerDescriptorHostObject>(this).settings.lod_average = average }
+- (NSUInteger)compareFunction { env.objc.borrow::<SamplerDescriptorHostObject>(this).settings.compare_function }
+- (())setCompareFunction:(NSUInteger)function { env.objc.borrow_mut::<SamplerDescriptorHostObject>(this).settings.compare_function = function }
+- (bool)supportArgumentBuffers { env.objc.borrow::<SamplerDescriptorHostObject>(this).settings.support_argument_buffers }
+- (())setSupportArgumentBuffers:(bool)supported { env.objc.borrow_mut::<SamplerDescriptorHostObject>(this).settings.support_argument_buffers = supported }
+- (NSUInteger)reductionMode { env.objc.borrow::<SamplerDescriptorHostObject>(this).settings.reduction_mode }
+- (())setReductionMode:(NSUInteger)mode { env.objc.borrow_mut::<SamplerDescriptorHostObject>(this).settings.reduction_mode = mode }
+@end
+
+@implementation TouchHLEMTLSamplerState: NSObject
++ (id)allocWithZone:(NSZonePtr)_zone {
+    env.objc.alloc_object(this, Box::new(SamplerStateHostObject::default()), &mut env.mem)
+}
+- (id)init { this }
+- (id)label { env.objc.borrow::<SamplerStateHostObject>(this).settings.label }
+- (())setLabel:(id)label {
+    let label = if label == nil { nil } else { msg![env; label copy] };
+    env.objc.borrow_mut::<SamplerStateHostObject>(this).settings.label = label;
+}
+- (id)device { env.objc.borrow::<SamplerStateHostObject>(this).device }
+- (u64)gpuResourceID { env.objc.borrow::<SamplerStateHostObject>(this).gpu_resource_id }
 @end
 
 @implementation MTLCommandQueue: NSObject
