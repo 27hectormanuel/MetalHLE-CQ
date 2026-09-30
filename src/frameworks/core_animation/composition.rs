@@ -11,7 +11,7 @@
 #![allow(clippy::zero_ptr)] // alas, as you know, opengl
 
 use super::ca_eagl_layer::find_fullscreen_eagl_layer;
-use super::ca_layer::CALayerHostObject;
+use super::ca_layer::{kCAGravityResizeAspect, kCAGravityResizeAspectFill, CALayerHostObject};
 use crate::frameworks::core_animation::animation;
 use crate::frameworks::core_graphics::cg_color::CGColorHostObject;
 use crate::frameworks::core_graphics::{cg_bitmap_context, cg_image, CGFloat, CGRect};
@@ -930,17 +930,54 @@ unsafe fn composite_layer_recursive(
         gles.VertexPointer(2, gles11::FLOAT, 0, 0 as *const GLvoid);
 
         gles.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
-        // Normal images will have top-to-bottom row order, but OpenGL ES
-        // expects bottom-to-top, so flip the UVs in that case.
-        gles.BindBuffer(
-            gles11::ARRAY_BUFFER,
-            if host_obj.contents != nil {
-                misc.basic_square_buffer
+        let (content_scale, uv_crop) = texture_size
+            .map(|size| {
+                content_gravity_layout(
+                    size,
+                    (
+                        host_obj.bounds.size.width as f32,
+                        host_obj.bounds.size.height as f32,
+                    ),
+                    &host_obj.contents_gravity,
+                )
+            })
+            .unwrap_or(((1.0, 1.0), None));
+        let scaled_content = content_scale != (1.0, 1.0);
+        if scaled_content {
+            gles.MatrixMode(gles11::MODELVIEW);
+            gles.PushMatrix();
+            gles.Translatef(
+                (1.0 - content_scale.0) / 2.0,
+                (1.0 - content_scale.1) / 2.0,
+                0.0,
+            );
+            gles.Scalef(content_scale.0, content_scale.1, 1.0);
+        }
+
+        if let Some([u0, v0, u1, v1]) = uv_crop {
+            let base = if host_obj.contents != nil {
+                BASIC_SQUARE_POINTS
             } else {
-                misc.flipped_square_buffer
-            },
-        );
-        gles.TexCoordPointer(2, gles11::FLOAT, 0, 0 as *const GLvoid);
+                FLIPPED_SQUARE_POINTS
+            };
+            let mut coordinates = base;
+            for point in coordinates.chunks_exact_mut(2) {
+                point[0] = u0 + point[0] * (u1 - u0);
+                point[1] = v0 + point[1] * (v1 - v0);
+            }
+            gles.BindBuffer(gles11::ARRAY_BUFFER, 0);
+            gles.TexCoordPointer(2, gles11::FLOAT, 0, coordinates.as_ptr() as *const GLvoid);
+        } else {
+            gles.BindBuffer(
+                gles11::ARRAY_BUFFER,
+                if host_obj.contents != nil {
+                    misc.basic_square_buffer
+                } else {
+                    misc.flipped_square_buffer
+                },
+            );
+            gles.TexCoordPointer(2, gles11::FLOAT, 0, 0 as *const GLvoid);
+        }
         gles.Enable(gles11::TEXTURE_2D);
         gles.DrawElements(
             gles11::TRIANGLES,
@@ -948,6 +985,20 @@ unsafe fn composite_layer_recursive(
             gles11::UNSIGNED_BYTE,
             0 as *const GLvoid,
         );
+        if uv_crop.is_some() {
+            gles.BindBuffer(
+                gles11::ARRAY_BUFFER,
+                if host_obj.contents != nil {
+                    misc.basic_square_buffer
+                } else {
+                    misc.flipped_square_buffer
+                },
+            );
+            gles.TexCoordPointer(2, gles11::FLOAT, 0, 0 as *const GLvoid);
+        }
+        if scaled_content {
+            gles.PopMatrix();
+        }
     }
     std::mem::drop(gles);
 
@@ -976,6 +1027,67 @@ unsafe fn composite_layer_recursive(
             cumulative_transform,
             opacity,
         )
+    }
+}
+
+fn content_gravity_layout(
+    source_size: (u32, u32),
+    bounds_size: (f32, f32),
+    gravity: &str,
+) -> ((f32, f32), Option<[f32; 4]>) {
+    let (source_width, source_height) = (source_size.0 as f32, source_size.1 as f32);
+    let (bounds_width, bounds_height) = bounds_size;
+    if source_width <= 0.0 || source_height <= 0.0 || bounds_width <= 0.0 || bounds_height <= 0.0 {
+        return ((1.0, 1.0), None);
+    }
+    let source_aspect = source_width / source_height;
+    let bounds_aspect = bounds_width / bounds_height;
+    match gravity {
+        kCAGravityResizeAspect => {
+            if source_aspect > bounds_aspect {
+                ((1.0, bounds_aspect / source_aspect), None)
+            } else {
+                ((source_aspect / bounds_aspect, 1.0), None)
+            }
+        }
+        kCAGravityResizeAspectFill => {
+            if source_aspect > bounds_aspect {
+                let visible_width = bounds_aspect / source_aspect;
+                let left = (1.0 - visible_width) / 2.0;
+                ((1.0, 1.0), Some([left, 0.0, 1.0 - left, 1.0]))
+            } else {
+                let visible_height = source_aspect / bounds_aspect;
+                let bottom = (1.0 - visible_height) / 2.0;
+                ((1.0, 1.0), Some([0.0, bottom, 1.0, 1.0 - bottom]))
+            }
+        }
+        _ => ((1.0, 1.0), None),
+    }
+}
+
+#[cfg(test)]
+mod contents_gravity_tests {
+    use super::*;
+
+    #[test]
+    fn aspect_fit_letterboxes_16_9_content_in_4_3_bounds() {
+        let (scale, crop) =
+            content_gravity_layout((1920, 1080), (640.0, 480.0), kCAGravityResizeAspect);
+        assert!((scale.0 - 1.0).abs() < f32::EPSILON);
+        assert!((scale.1 - 0.75).abs() < f32::EPSILON);
+        assert_eq!(crop, None);
+    }
+
+    #[test]
+    fn aspect_fill_crops_centered_sides_for_16_9_in_4_3_bounds() {
+        let (scale, crop) =
+            content_gravity_layout((1920, 1080), (640.0, 480.0), kCAGravityResizeAspectFill);
+        assert_eq!(scale, (1.0, 1.0));
+        let crop = crop.unwrap();
+        assert!((crop[0] - 0.125).abs() < f32::EPSILON);
+        assert_eq!(crop[1], 0.0);
+        assert!((crop[2] - 0.875).abs() < f32::EPSILON);
+        assert_eq!(crop[3], 1.0);
     }
 }
 

@@ -37,6 +37,16 @@ struct NIBArchiveDecoderHostObject {
 }
 impl HostObject for NIBArchiveDecoderHostObject {}
 
+pub(crate) fn unarchived_objects(env: &Environment, decoder: id) -> Vec<id> {
+    env.objc
+        .borrow::<NIBArchiveDecoderHostObject>(decoder)
+        .already_unarchived
+        .iter()
+        .flatten()
+        .copied()
+        .collect()
+}
+
 /// NIB archive's binary value marker for float-encoded numbers (4 bytes each
 /// in little-endian). This is the canonical encoding used by UIKit when it
 /// archives a CGFloat/CGPoint/CGRect on a 32-bit ABI.

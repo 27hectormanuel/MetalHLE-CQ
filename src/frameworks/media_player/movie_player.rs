@@ -6,32 +6,20 @@
  */
 //! `MPMoviePlayerController` and `MPMoviePlayerViewController`.
 //!
-//! touchHLE does not yet ship an H.264 decoder, so we cannot actually render
-//! the movie's video frames. We do however reproduce the asynchronous lifecycle
-//! that Apple's MediaPlayer framework guarantees, so that guest code which
-//! waits for the documented notifications proceeds correctly. The lifecycle is
-//! modelled after Apple's `MPMoviePlayerController` documentation:
+//! When ffmpeg is available, movie frames are decoded and presented in the
+//! player's view. The controller also reproduces Apple's asynchronous lifecycle
+//! so guest code waiting for the documented notifications can proceed correctly:
 //!
-//! 1. After `initWithContentURL:` or `setContentURL:` the player asynchronously
-//!    posts `MPMoviePlayerLoadStateDidChangeNotification` once the content is
-//!    determined to be playable (transitioning `loadState` from `Unknown` to
-//!    `Playable | PlaythroughOK`).
-//! 2. The player then posts `MPMovieNaturalSizeAvailableNotification`,
-//!    `MPMovieDurationAvailableNotification` and
-//!    `MPMoviePlayerReadyForDisplayDidChangeNotification` so callers that
-//!    listen for them know the metadata is now valid.
-//! 3. For backwards compatibility with apps written against the
-//!    `MPMoviePlayerController` introduced in iPhone OS 2 the player also
-//!    posts the (now deprecated) `MPMoviePlayerContentPreloadDidFinishNotification`.
-//! 4. If `shouldAutoplay` is `YES`, playback transitions to
-//!    `MPMoviePlaybackStatePlaying`, posting
-//!    `MPMoviePlayerNowPlayingMovieDidChangeNotification` and
-//!    `MPMoviePlayerPlaybackStateDidChangeNotification`.
-//! 5. Finally `MPMoviePlayerPlaybackDidFinishNotification` is posted with a
-//!    `userInfo` dictionary containing
-//!    `MPMoviePlayerPlaybackDidFinishReasonUserInfoKey` set to either
-//!    `MPMovieFinishReasonPlaybackEnded` (file existed) or
-//!    `MPMovieFinishReasonPlaybackError` (file was missing on disk).
+//! 1. After `initWithContentURL:` or `setContentURL:` the player posts
+//!    `MPMoviePlayerLoadStateDidChangeNotification` when the content is playable.
+//! 2. The player posts natural-size, duration, and ready-for-display
+//!    notifications when the corresponding metadata is available.
+//! 3. For backwards compatibility, the player posts
+//!    `MPMoviePlayerContentPreloadDidFinishNotification`.
+//! 4. If `shouldAutoplay` is `YES`, playback becomes `Playing` and the player
+//!    posts its now-playing and playback-state notifications.
+//! 5. At the end, `MPMoviePlayerPlaybackDidFinishNotification` includes a
+//!    reason of `PlaybackEnded` or `PlaybackError`.
 //!
 //! See:
 //! * <https://developer.apple.com/documentation/mediaplayer/mpmoviefinishreason>
@@ -44,6 +32,9 @@ use crate::frameworks::foundation::{ns_string, ns_url, NSInteger, NSUInteger};
 use crate::frameworks::uikit::ui_device::UIDeviceOrientation;
 use crate::objc::{
     id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
+};
+use crate::frameworks::core_animation::ca_layer::{
+    self, kCAGravityResize, kCAGravityResizeAspect, kCAGravityResizeAspectFill,
 };
 use crate::Environment;
 use super::movie_video::MovieVideo;
@@ -132,6 +123,10 @@ impl State {
 }
 
 type MPMovieScalingMode = NSInteger;
+const MPMovieScalingModeNone: MPMovieScalingMode = 0;
+const MPMovieScalingModeAspectFit: MPMovieScalingMode = 1;
+const MPMovieScalingModeAspectFill: MPMovieScalingMode = 2;
+const MPMovieScalingModeFill: MPMovieScalingMode = 3;
 type MPMovieControlStyle = NSInteger;
 type MPMovieSourceType = NSInteger;
 type MPMovieRepeatMode = NSInteger;
@@ -307,15 +302,13 @@ struct MPMoviePlayerControllerHostObject {
     initial_playback_time: f64,
     playback_state: MPMoviePlaybackState,
     load_state: MPMovieLoadState,
-    /// `naturalSize` reported to the app. We don't have a real decoder so we
-    /// fall back to a 4:3 placeholder that comfortably fits within an iPhone
-    /// screen; this prevents `division by zero` aspect-ratio code paths.
+    /// `naturalSize` reported to the app. The decoded track dimensions replace
+    /// the 3:2 iPhone placeholder when a host decoder is available.
     natural_size: CGSize,
     duration: f64,
     /// Playback clock: position (seconds) accumulated before the current
     /// play run, and when the current run started (`None` unless playing).
-    /// We can't decode the video, but apps still time their UI against
-    /// `currentPlaybackTime` (e.g. fading a menu in over a background movie).
+    /// This remains available even if ffmpeg is not installed.
     clock_offset: f64,
     clock_started: Option<Instant>,
     ready_for_display: bool,
@@ -329,8 +322,8 @@ struct MPMoviePlayerControllerHostObject {
 }
 impl HostObject for MPMoviePlayerControllerHostObject {}
 
-/// Default natural size for movies we cannot decode. Matches the 480x320 frame
-/// of the iPhone (4:3 letterboxed).
+/// Default natural size for movies that cannot be decoded. Matches the 480x320
+/// landscape dimensions of an older iPhone display.
 const PLACEHOLDER_NATURAL_SIZE: CGSize = CGSize {
     width: 480.0,
     height: 320.0,
@@ -440,6 +433,8 @@ fn ensure_view(env: &mut Environment, this: id) -> id {
     let view_alloc: id = msg_class![env; UIView alloc];
     let view: id = msg![env; view_alloc init];
     retain(env, view);
+    let black: id = msg_class![env; UIColor blackColor];
+    () = msg![env; view setBackgroundColor:black];
     env.objc
         .borrow_mut::<MPMoviePlayerControllerHostObject>(this)
         .view = view;
@@ -457,6 +452,8 @@ fn ensure_background_view(env: &mut Environment, this: id) -> id {
     let view_alloc: id = msg_class![env; UIView alloc];
     let view: id = msg![env; view_alloc init];
     retain(env, view);
+    let black: id = msg_class![env; UIColor blackColor];
+    () = msg![env; view setBackgroundColor:black];
     env.objc
         .borrow_mut::<MPMoviePlayerControllerHostObject>(this)
         .background_view = view;
@@ -677,7 +674,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         content_url: nil,
         view: nil,
         background_view: nil,
-        scaling_mode: 0,
+        scaling_mode: MPMovieScalingModeAspectFit,
         control_style: 0,
         source_type: 0,
         repeat_mode: 0,
@@ -804,9 +801,15 @@ pub const CLASSES: ClassExports = objc_classes! {
         .scaling_mode
 }
 - (())setScalingMode:(MPMovieScalingMode)mode {
-    env.objc
-        .borrow_mut::<MPMoviePlayerControllerHostObject>(this)
-        .scaling_mode = mode;
+    let view = {
+        let host = env.objc.borrow_mut::<MPMoviePlayerControllerHostObject>(this);
+        host.scaling_mode = mode;
+        host.view
+    };
+    if view != nil {
+        let layer: id = msg![env; view layer];
+        set_movie_layer_scaling_mode(env, layer, mode);
+    }
 }
 
 // --- Control style ---
@@ -1085,6 +1088,12 @@ fn start_video_if_playing(env: &mut Environment, player: id) {
         return;
     };
     if let Some(video) = MovieVideo::start(&bytes, looping) {
+        env.objc
+            .borrow_mut::<MPMoviePlayerControllerHostObject>(player)
+            .natural_size = CGSize {
+            width: video.width as _,
+            height: video.height as _,
+        };
         State::get(env).videos.insert(player, video);
     }
 }
@@ -1101,14 +1110,15 @@ fn present_video_frames(env: &mut Environment) {
         })
         .collect();
     for (player, frame, width, height) in frames {
-        let view = env
-            .objc
-            .borrow::<MPMoviePlayerControllerHostObject>(player)
-            .view;
+        let (view, scaling_mode) = {
+            let host = env.objc.borrow::<MPMoviePlayerControllerHostObject>(player);
+            (host.view, host.scaling_mode)
+        };
         if view == nil {
             continue;
         }
         let layer: id = msg![env; view layer];
+        set_movie_layer_scaling_mode(env, layer, scaling_mode);
         crate::frameworks::core_animation::ca_eagl_layer::present_pixels(
             env, layer, frame, width, height,
         );
@@ -1204,4 +1214,17 @@ pub(super) fn handle_players(env: &mut Environment) {
         // Release the retain we took when queuing this notification.
         release(env, player);
     }
+}
+
+fn movie_layer_contents_gravity(mode: MPMovieScalingMode) -> &'static str {
+    match mode {
+        MPMovieScalingModeAspectFit => kCAGravityResizeAspect,
+        MPMovieScalingModeAspectFill => kCAGravityResizeAspectFill,
+        MPMovieScalingModeNone | MPMovieScalingModeFill => kCAGravityResize,
+        _ => kCAGravityResizeAspect,
+    }
+}
+
+fn set_movie_layer_scaling_mode(env: &mut Environment, layer: id, mode: MPMovieScalingMode) {
+    ca_layer::set_contents_gravity(env, layer, movie_layer_contents_gravity(mode));
 }
