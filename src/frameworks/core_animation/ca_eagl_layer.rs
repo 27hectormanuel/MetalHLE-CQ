@@ -223,11 +223,13 @@ fn classify_fullscreen_layer_transform(
         return Some(FullscreenLayerTransform::Identity);
     }
 
+    // UIInterfaceOrientation is inverse to UIDeviceOrientation, so UIKit's
+    // root-view transform is opposite to the device rotation.
     let angle = match orientation {
         crate::window::DeviceOrientation::Portrait => return None,
         crate::window::DeviceOrientation::PortraitUpsideDown => std::f32::consts::PI,
-        crate::window::DeviceOrientation::LandscapeLeft => -std::f32::consts::FRAC_PI_2,
-        crate::window::DeviceOrientation::LandscapeRight => std::f32::consts::FRAC_PI_2,
+        crate::window::DeviceOrientation::LandscapeLeft => std::f32::consts::FRAC_PI_2,
+        crate::window::DeviceOrientation::LandscapeRight => -std::f32::consts::FRAC_PI_2,
     };
     nearly_equal_transform(transform, CGAffineTransform::make_rotation(angle))
         .then_some(FullscreenLayerTransform::DeviceRotation)
@@ -285,10 +287,8 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
         // assert!(layer != nil);
 
         let layer_host_obj: &CALayerHostObject = env.objc.borrow(layer);
-        let transform_kind = classify_fullscreen_layer_transform(
-            layer_host_obj.affine_transform,
-            orientation,
-        );
+        let transform_kind =
+            classify_fullscreen_layer_transform(layer_host_obj.affine_transform, orientation);
         let layer_bounds = layer_host_obj.bounds;
         let layer_to_screen = layer_host_obj
             .superlayer_to_layer_transform()
@@ -352,7 +352,7 @@ mod fullscreen_layer_tests {
     use crate::window::DeviceOrientation;
 
     #[test]
-    fn accepts_identity_and_the_current_device_rotation_only() {
+    fn accepts_identity_and_the_matching_interface_rotation_only() {
         assert_eq!(
             classify_fullscreen_layer_transform(
                 CGAffineTransformIdentity,
@@ -362,21 +362,21 @@ mod fullscreen_layer_tests {
         );
         assert_eq!(
             classify_fullscreen_layer_transform(
-                CGAffineTransform::make_rotation(-std::f32::consts::FRAC_PI_2),
+                CGAffineTransform::make_rotation(std::f32::consts::FRAC_PI_2),
                 DeviceOrientation::LandscapeLeft,
             ),
             Some(FullscreenLayerTransform::DeviceRotation),
         );
         assert_eq!(
             classify_fullscreen_layer_transform(
-                CGAffineTransform::make_rotation(std::f32::consts::FRAC_PI_2),
+                CGAffineTransform::make_rotation(-std::f32::consts::FRAC_PI_2),
                 DeviceOrientation::LandscapeLeft,
             ),
             None,
         );
         assert_eq!(
             classify_fullscreen_layer_transform(
-                CGAffineTransform::make_rotation(std::f32::consts::FRAC_PI_2),
+                CGAffineTransform::make_rotation(-std::f32::consts::FRAC_PI_2),
                 DeviceOrientation::LandscapeRight,
             ),
             Some(FullscreenLayerTransform::DeviceRotation),
@@ -435,7 +435,7 @@ mod fullscreen_layer_tests {
         root_view_layer.position = CGPoint { x: 160.0, y: 284.0 };
         root_view_layer.anchor_point = CGPoint { x: 0.5, y: 0.5 };
         root_view_layer.affine_transform =
-            CGAffineTransform::make_rotation(-std::f32::consts::FRAC_PI_2);
+            CGAffineTransform::make_rotation(std::f32::consts::FRAC_PI_2);
         let root_view_to_screen = root_view_layer
             .superlayer_to_layer_transform()
             .concat(window_to_screen);
@@ -483,7 +483,10 @@ mod fullscreen_layer_tests {
             },
         };
         let almost_fullscreen = CGRect {
-            origin: CGPoint { x: -0.002, y: 0.003 },
+            origin: CGPoint {
+                x: -0.002,
+                y: 0.003,
+            },
             size: crate::frameworks::core_graphics::CGSize {
                 width: 320.001,
                 height: 567.999,
