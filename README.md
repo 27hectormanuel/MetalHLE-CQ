@@ -32,6 +32,7 @@ The titles below have been tested with HyperHLE-Fork and are known to run. Compa
 - Need For Speed: Most Wanted (2012)
 - Minecraft 0.14.2-0.16.2
 - Oceanhorn
+- Asphalt 8 (1.0.0)
 - And more more games
 
 ## Build and documentation
