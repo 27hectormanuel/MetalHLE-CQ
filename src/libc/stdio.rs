@@ -306,7 +306,6 @@ fn fread(
             return 0;
         }
     };
-    let FILE { fd } = env.mem.read(file_ptr);
     let FILEHostObject {
         ref mut pushbacks, ..
     } = env
@@ -323,6 +322,10 @@ fn fread(
             .bytes_at_mut(buffer.cast(), to_copy)
             .copy_from_slice(&pushbacks[offset..]);
         pushbacks.truncate(offset);
+
+        if total_size == to_copy {
+            return total_size;
+        }
         total_size -= to_copy;
         let ptr: MutPtr<u8> = buffer.cast();
         buffer = (ptr + to_copy).cast();
@@ -330,12 +333,7 @@ fn fread(
     } else {
         0
     };
-    if already_read > 0 && posix_io::lseek(env, fd, i64::from(already_read), SEEK_CUR) == -1 {
-        return already_read / item_size;
-    }
-    if total_size == 0 {
-        return already_read / item_size;
-    }
+    let FILE { fd } = env.mem.read(file_ptr);
     // Real stdio `fread` keeps issuing read(2) calls until it has satisfied the
     // full request, hit end-of-file, or hit an error, and it sets the stream's
     // EOF indicator when a read returns 0 before the request is filled. A

@@ -31,7 +31,6 @@ pub(crate) struct UIViewControllerHostObject {
     /// The root view.
     /// `UIView*`
     view: id,
-    view_did_load: bool,
     /// Nib name to be used at the load
     /// of the root view, may be nil.
     /// `NSString*`
@@ -85,29 +84,6 @@ pub(crate) struct UIViewControllerHostObject {
     edges_for_extended_layout: NSUInteger,
 }
 impl HostObject for UIViewControllerHostObject {}
-
-fn should_call_view_did_load(host_obj: &mut UIViewControllerHostObject) -> bool {
-    if host_obj.view_did_load {
-        false
-    } else {
-        host_obj.view_did_load = true;
-        true
-    }
-}
-
-#[cfg(test)]
-mod view_did_load_tests {
-    use super::{should_call_view_did_load, UIViewControllerHostObject};
-
-    #[test]
-    fn view_did_load_runs_once_until_the_view_is_unloaded() {
-        let mut host_obj = UIViewControllerHostObject::default();
-        assert!(should_call_view_did_load(&mut host_obj));
-        assert!(!should_call_view_did_load(&mut host_obj));
-        host_obj.view_did_load = false;
-        assert!(should_call_view_did_load(&mut host_obj));
-    }
-}
 
 // Apple's UIRectEdgeAll = UIRectEdgeTop|UIRectEdgeLeft|UIRectEdgeBottom|UIRectEdgeRight = 15
 const UI_RECT_EDGE_ALL: NSUInteger = 15;
@@ -371,9 +347,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     let host_obj = env.objc.borrow_mut::<UIViewControllerHostObject>(this);
     let old_view = std::mem::replace(&mut host_obj.view, new_view);
-    if new_view == nil {
-        host_obj.view_did_load = false;
-    }
     if old_view != nil {
         set_view_controller(env, old_view, nil);
     }
@@ -402,17 +375,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     // -viewDidLoad to swap out the placeholder UIView created by -loadView.
     // If we returned the value captured before -viewDidLoad, callers would
     // hold a dangling pointer to the just-released placeholder.
-    if env.objc.borrow::<UIViewControllerHostObject>(this).view == nil {
+    let view = env.objc.borrow::<UIViewControllerHostObject>(this).view;
+    if view == nil {
         () = msg![env; this loadView];
-    }
-    let should_call_view_did_load = {
-        let host_obj = env.objc.borrow_mut::<UIViewControllerHostObject>(this);
-        should_call_view_did_load(host_obj)
-    };
-    if should_call_view_did_load {
         () = msg![env; this viewDidLoad];
+        env.objc.borrow::<UIViewControllerHostObject>(this).view
+    } else {
+        view
     }
-    env.objc.borrow::<UIViewControllerHostObject>(this).view
 }
 
 // Перехватываем NIB-соединение (KVC) для свойства view

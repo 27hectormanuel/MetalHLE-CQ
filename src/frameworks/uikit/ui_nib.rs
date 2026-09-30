@@ -21,7 +21,6 @@ use crate::objc::{
     autorelease, id, impl_HostObject_with_superclass, msg, msg_class, msg_super, nil, objc_classes,
     release, retain, Class, ClassExports, HostObject,
 };
-use crate::frameworks::foundation::_nib_archive_decoder;
 use crate::Environment;
 
 // Per Apple's UINib loading documentation, the `options` dictionary passed to
@@ -549,8 +548,9 @@ fn load_nib_file(env: &mut Environment, ui_nib: id, path: GuestPathBuf) -> Resul
 
     let bytes: ConstVoidPtr = msg![env; ns_data bytes];
 
-    let is_nib_archive = env.mem.bytes_at(bytes.cast(), 10) == b"NIBArchive";
-    let unarchiver = if is_nib_archive {
+    // ... дальше без изменений, начиная с let unarchiver = ...
+
+    let unarchiver = if env.mem.bytes_at(bytes.cast(), 10) == b"NIBArchive" {
         let decoder: id = msg_class![env; _touchHLE_NIBArchiveDecoder alloc];
         msg![env; decoder _touchHLE_initForReadingWithData:ns_data]
     } else {
@@ -579,7 +579,6 @@ fn load_nib_file(env: &mut Environment, ui_nib: id, path: GuestPathBuf) -> Resul
         }
     }
 
-    let mut objects_to_awake = Vec::new();
     if objects != nil {
         let enumerator: id = msg![env; objects objectEnumerator];
         if enumerator != nil {
@@ -588,19 +587,9 @@ fn load_nib_file(env: &mut Environment, ui_nib: id, path: GuestPathBuf) -> Resul
                 if next == nil {
                     break;
                 }
-                objects_to_awake.push(next);
+                () = msg![env; next awakeFromNib];
             }
         }
-    }
-    if is_nib_archive {
-        for object in _nib_archive_decoder::unarchived_objects(env, unarchiver) {
-            if object != nil && !objects_to_awake.contains(&object) {
-                objects_to_awake.push(object);
-            }
-        }
-    }
-    for object in objects_to_awake {
-        () = msg![env; object awakeFromNib];
     }
 
     let visibles_key = get_static_str(env, "UINibVisibleWindowsKey");

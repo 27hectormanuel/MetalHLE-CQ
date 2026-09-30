@@ -1376,13 +1376,3 @@ pub fn set_use_implicit_animations(env: &mut Environment, layer: id, enable: boo
         .borrow_mut::<CALayerHostObject>(layer)
         .use_implicit_animations = enable;
 }
-
-pub fn set_contents_gravity(env: &mut Environment, layer: id, gravity: &str) {
-    if layer == nil {
-        return;
-    }
-    let host_obj = env.objc.borrow_mut::<CALayerHostObject>(layer);
-    if host_obj.contents_gravity != gravity {
-        host_obj.contents_gravity = gravity.to_owned();
-    }
-}

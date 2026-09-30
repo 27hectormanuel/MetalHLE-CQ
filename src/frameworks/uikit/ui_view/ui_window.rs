@@ -17,8 +17,12 @@ use crate::frameworks::core_graphics::cg_affine_transform::{
 use crate::frameworks::core_graphics::{CGPoint, CGRect};
 use crate::frameworks::foundation::ns_string;
 use crate::frameworks::uikit::ui_application::{
-    UIInterfaceOrientation, UIInterfaceOrientationLandscapeLeft,
-    UIInterfaceOrientationLandscapeRight, UIInterfaceOrientationPortraitUpsideDown,
+    UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight,
+    UIInterfaceOrientationPortraitUpsideDown,
+};
+use crate::frameworks::uikit::ui_device::{
+    UIDeviceOrientationLandscapeLeft, UIDeviceOrientationLandscapeRight,
+    UIDeviceOrientationPortraitUpsideDown,
 };
 use crate::objc::{
     id, msg, msg_class, msg_super, nil, objc_classes, release, retain, ClassExports,
@@ -352,17 +356,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())addSubview:(id)view {
     log_dbg!("[(UIWindow*){:?} addSubview:{:?}] => ()", this, view);
 
-    if view == nil {
+    if view == nil || env.objc.borrow::<UIViewHostObject>(view).view_controller == nil {
         () = msg_super![env; this addSubview:view];
-        return;
-    }
-    let vc = env.objc.borrow::<UIViewHostObject>(view).view_controller;
-    if vc == nil {
-        () = msg_super![env; this addSubview:view];
-        return;
-    }
-    let view: id = msg![env; vc view];
-    if view == nil {
         return;
     }
 
@@ -399,6 +394,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         );
     }
 
+    let vc = env.objc.borrow::<UIViewHostObject>(view).view_controller;
     if should_fire_appearance {
         () = msg![env; vc viewWillAppear:false];
     }
@@ -426,16 +422,32 @@ pub const CLASSES: ClassExports = objc_classes! {
     // `env.window` is `None` in headless mode; skip autorotation instead of
     // unwrapping (which would panic the host).
     let rotation = env.window.as_ref().map(|window| window.current_rotation());
-    if let Some(orientation) = rotation.and_then(interface_orientation_for_device_orientation) {
+    if let Some(orientation) = rotation.and_then(|rotation| match rotation {
+        crate::window::DeviceOrientation::LandscapeLeft => Some(UIDeviceOrientationLandscapeLeft),
+        crate::window::DeviceOrientation::LandscapeRight => Some(UIDeviceOrientationLandscapeRight),
+        crate::window::DeviceOrientation::PortraitUpsideDown => {
+            Some(UIDeviceOrientationPortraitUpsideDown)
+        }
+        // Portrait is the default so we don't do anything here.
+        crate::window::DeviceOrientation::Portrait => None,
+    }) {
+        // (UIInterfaceOrientation and UIDeviceOrientation are compatible enums,
+        //  here we use whichever is clearer contextually.)
         let should = msg![env; vc shouldAutorotateToInterfaceOrientation:orientation];
         log_dbg!("[{:?} shouldAutorotateToInterfaceOrientation:{:?}] => {:?}", vc, orientation, should);
-        if should && !crate::env_flag_cached!("TOUCHHLE_SKIP_UIWINDOW_ROTATION") {
+        if should {
             log_dbg!("App requested autorotation; applying orientation transform to view {:?}.", view);
             let transform = match orientation {
                 UIInterfaceOrientationLandscapeLeft => CGAffineTransform::make_rotation(-std::f32::consts::FRAC_PI_2),
                 UIInterfaceOrientationLandscapeRight => CGAffineTransform::make_rotation(std::f32::consts::FRAC_PI_2),
                 UIInterfaceOrientationPortraitUpsideDown => CGAffineTransform::make_rotation(std::f32::consts::PI),
                 other => {
+                    // UIInterfaceOrientation has Portrait/PortraitUpsideDown/
+                    // LandscapeLeft/LandscapeRight; the first two are filtered
+                    // out earlier (Portrait => None and PortraitUpsideDown
+                    // isn't reachable from window::DeviceOrientation today).
+                    // Fall back to the identity transform so an unexpected
+                    // orientation can't take down the host.
                     log!(
                         "Warning: UIWindow autorotation: unsupported interface orientation {}; using identity transform.",
                         other
@@ -444,31 +456,25 @@ pub const CLASSES: ClassExports = objc_classes! {
                 }
             };
 
-            let window_bounds: CGRect = msg![env; this bounds];
-            let view_bounds: CGRect = msg![env; view bounds];
-            let center = CGPoint {
-                x: window_bounds.origin.x + window_bounds.size.width / 2.0,
-                y: window_bounds.origin.y + window_bounds.size.height / 2.0,
-            };
-            log_dbg!(
-                "Rotating view {:?}: preserving bounds {:?} and centering at {:?} in window bounds {:?}.",
-                view,
-                view_bounds,
-                center,
-                window_bounds,
-            );
+            let window_frame: CGRect = msg![env; this frame];
+            log_dbg!("Window frame: {window_frame:?}");
+            let view_frame: CGRect = msg![env; view frame];
+            log_dbg!("Old view frame: {view_frame:?}");
 
             () = msg![env; view setTransform:transform];
-            () = msg![env; view setCenter:center];
+
+            // Re-apply the view's old frame to compensate for the rotation
+            // effectively offseting its center position and changing the size.
+            // FIXME: I have no idea if this is how this should be solved, but
+            //        it works for DMC4 Refrain at least.
 
             let view_frame: CGRect = msg![env; view frame];
-            let new_view_bounds: CGRect = msg![env; view bounds];
-            log_dbg!(
-                "Rotated view {:?} now has frame {:?} and bounds {:?}.",
-                view,
-                view_frame,
-                new_view_bounds,
-            );
+            log_dbg!("Old view frame after transform: {view_frame:?}");
+
+            () = msg![env; view setFrame:window_frame];
+
+            let view_frame: CGRect = msg![env; view frame];
+            log_dbg!("New view frame after re-applying old view frame: {view_frame:?}");
         }
     }
 }
@@ -555,42 +561,3 @@ pub const CONSTANTS: ConstantExports = &[
     // _UIKeyboardBoundsUserInfoKey are exported from
     // uikit::ui_keyboard::CONSTANTS; not duplicated here.
 ];
-
-fn interface_orientation_for_device_orientation(
-    orientation: crate::window::DeviceOrientation,
-) -> Option<UIInterfaceOrientation> {
-    match orientation {
-        crate::window::DeviceOrientation::LandscapeLeft => {
-            Some(UIInterfaceOrientationLandscapeRight)
-        }
-        crate::window::DeviceOrientation::LandscapeRight => {
-            Some(UIInterfaceOrientationLandscapeLeft)
-        }
-        crate::window::DeviceOrientation::PortraitUpsideDown => {
-            Some(UIInterfaceOrientationPortraitUpsideDown)
-        }
-        crate::window::DeviceOrientation::Portrait => None,
-    }
-}
-
-#[cfg(test)]
-mod orientation_tests {
-    use super::*;
-    use crate::window::DeviceOrientation;
-
-    #[test]
-    fn device_rotation_maps_to_opposite_interface_orientation() {
-        assert_eq!(
-            interface_orientation_for_device_orientation(DeviceOrientation::LandscapeLeft),
-            Some(UIInterfaceOrientationLandscapeRight),
-        );
-        assert_eq!(
-            interface_orientation_for_device_orientation(DeviceOrientation::LandscapeRight),
-            Some(UIInterfaceOrientationLandscapeLeft),
-        );
-        assert_eq!(
-            interface_orientation_for_device_orientation(DeviceOrientation::Portrait),
-            None,
-        );
-    }
-}

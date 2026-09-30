@@ -272,14 +272,6 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
 
     let app_id = bundle.bundle_identifier();
 
-    if app_id == "com.marvel.ThorAsgard"
-        && std::env::var_os("TOUCHHLE_SKIP_UIWINDOW_ROTATION").is_none()
-    {
-        unsafe {
-            std::env::set_var("TOUCHHLE_SKIP_UIWINDOW_ROTATION", "1");
-        }
-    }
-
     // Gangstar Rio is landscape-only. Keep UIScreen's point and pixel axes
     // aligned with the active orientation; portrait axes leave its EAGL scene
     // occupying only a small portion of the display.
