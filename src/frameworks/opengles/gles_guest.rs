@@ -5044,21 +5044,30 @@ fn log_uniform_array_declarations(program: GLuint) {
     );
 }
 
-/// Last-resort fix-up: if a link still failed, parse the varying names the
-/// driver complained about ("FRAGMENT varying <name> does not match any
-/// VERTEX varying"), look their types up in the recorded fragment source and
-/// inject them into the vertex shader. The caller re-links afterwards.
-unsafe fn inject_driver_reported_varyings(
-    gles: &mut dyn GLES,
-    program: GLuint,
-    info_log: &str,
-) -> bool {
-    const VERTEX_SHADER: GLuint = 0x8B31;
-    const FRAGMENT_SHADER: GLuint = 0x8B30;
-
-    let mut names: Vec<String> = Vec::new();
-    for (i, _) in info_log.match_indices("FRAGMENT varying") {
-        let rest = info_log[i + "FRAGMENT varying".len()..].trim_start();
+/// Last-resort fix-up: if a link still failed, parse varying names reported
+/// by the driver (ANGLE: `FRAGMENT varying <name> does not match any VERTEX
+/// varying`; Mesa: `fragment shader input '<name>' has no matching output in
+/// the previous stage`), look their types up in the recorded fragment source
+/// and inject them into the vertex shader. The caller re-links afterwards.
+fn parse_driver_reported_varying_names(info_log: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in info_log.lines() {
+        let marker = if line.contains("FRAGMENT varying")
+            && line.contains("does not match any VERTEX varying")
+        {
+            "FRAGMENT varying"
+        } else if line.contains("fragment shader input")
+            && line.contains("has no matching output in the previous stage")
+        {
+            "fragment shader input"
+        } else {
+            continue;
+        };
+        let Some(index) = line.find(marker) else {
+            continue;
+        };
+        let rest = line[index + marker.len()..].trim_start();
+        let rest = rest.trim_start_matches(|c| matches!(c, '\'' | '"' | '`'));
         let name: String = rest
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
@@ -5067,6 +5076,18 @@ unsafe fn inject_driver_reported_varyings(
             names.push(name);
         }
     }
+    names
+}
+
+unsafe fn inject_driver_reported_varyings(
+    gles: &mut dyn GLES,
+    program: GLuint,
+    info_log: &str,
+) -> bool {
+    const VERTEX_SHADER: GLuint = 0x8B31;
+    const FRAGMENT_SHADER: GLuint = 0x8B30;
+
+    let names = parse_driver_reported_varying_names(info_log);
     if names.is_empty() {
         return false;
     }
@@ -7851,6 +7872,23 @@ mod uniform_array_reconciliation_tests {
         assert_eq!(defs.len(), 1);
         let (start, end) = defs[0].body_span;
         assert_eq!(&src[start..end], "{ float a; }");
+    }
+
+    #[test]
+    fn fragment_varying_link_errors_are_parsed_for_angle_and_mesa() {
+        let log = "FRAGMENT varying vTexCoord does not match any VERTEX varying\n\
+                   error: fragment shader input `vAlpha` has no matching output in the previous stage\n\
+                   error: fragment shader input `vAlpha` has no matching output in the previous stage";
+        assert_eq!(
+            super::parse_driver_reported_varying_names(log),
+            vec!["vTexCoord".to_string(), "vAlpha".to_string()]
+        );
+    }
+
+    #[test]
+    fn unrelated_link_errors_do_not_trigger_varying_repair() {
+        let log = "error: fragment shader input `vAlpha` has an unsupported type";
+        assert!(super::parse_driver_reported_varying_names(log).is_empty());
     }
 
     #[test]
