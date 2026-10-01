@@ -3225,7 +3225,23 @@ fn glGetBufferParameteriv(
     })
 }
 fn glMapBufferOES(env: &mut Environment, target: GLenum, access: GLenum) -> MutPtr<GLvoid> {
-    if !matches!(target, ARRAY_BUFFER | ELEMENT_ARRAY_BUFFER) || access != WRITE_ONLY_OES {
+    // Real drivers accept the three buffer-access modes; only the target and
+    // the access value have to be legal. Returning nil for anything else (the
+    // previous behaviour) made the caller write vertex/index data through a
+    // NULL pointer, which is exactly the silent nil-page write flood seen in
+    // Asphalt 8's drift events. Accept the full set instead of WRITE_ONLY.
+    const READ_ONLY: GLenum = 0x88B8;
+    const READ_WRITE: GLenum = 0x88BA;
+    if !matches!(target, ARRAY_BUFFER | ELEMENT_ARRAY_BUFFER)
+        || !matches!(access, WRITE_ONLY_OES | READ_ONLY | READ_WRITE)
+    {
+        log!(
+            "Warning: glMapBufferOES(target={:#x}, access={:#x}) is not a supported \
+             combination; returning NULL. If the app then writes through it, expect \
+             nil-page writes.",
+            target,
+            access
+        );
         return nil.cast();
     }
     let buffer_object_name = _get_currently_bound_buffer_object_name(env, target);
@@ -3233,6 +3249,12 @@ fn glMapBufferOES(env: &mut Environment, target: GLenum, access: GLenum) -> MutP
         gles.MapBufferOES(target, access)
     });
     if host_buffer.is_null() {
+        log!(
+            "Warning: host glMapBufferOES(target={:#x}, access={:#x}) returned NULL \
+             (buffer has no data store or the driver refused); the app will see NULL.",
+            target,
+            access
+        );
         nil.cast()
     } else {
         let buffer_size = match usize::try_from(_get_buffer_size(env, target)) {
@@ -3260,6 +3282,11 @@ fn glMapBufferOES(env: &mut Environment, target: GLenum, access: GLenum) -> MutP
             // calls"). Without one, free the temporary guest buffer we
             // just allocated and return NULL, matching the GL spec which
             // says glMapBufferOES returns NULL on failure.
+            log!(
+                "Warning: glMapBufferOES on thread {} with no current EAGLContext; \
+                 returning NULL.",
+                env.current_thread
+            );
             env.mem.free(guest_buffer);
             return nil.cast();
         };
@@ -5745,11 +5772,25 @@ fn glMapBufferRange(
     // buffer of `length` bytes, copy the contents from the host pointer,
     // and remember the pairing.
     if host_ptr.is_null() || length == 0 {
+        log!(
+            "Warning: glMapBufferRange(target={:#x}, offset={}, length={}, access={:#x}) \
+             produced a NULL host pointer or zero length; returning NULL.",
+            target,
+            offset,
+            length,
+            access
+        );
         return Ptr::null();
     }
     let length_usize = match usize::try_from(length) {
         Ok(size) => size,
-        Err(_) => return Ptr::null(),
+        Err(_) => {
+            log!(
+                "Warning: glMapBufferRange with negative/overflowing length {}; returning NULL.",
+                length
+            );
+            return Ptr::null();
+        }
     };
     let guest_buf: MutPtr<GLvoid> = env.mem.alloc(length_usize as GuestUSize).cast();
     unsafe {
@@ -5764,6 +5805,11 @@ fn glMapBufferRange(
         .opengles
         .current_ctx_for_thread(env.current_thread);
     let Some(ctx) = current_ctx else {
+        log!(
+            "Warning: glMapBufferRange on thread {} with no current EAGLContext; \
+             returning NULL.",
+            env.current_thread
+        );
         env.mem.free(guest_buf);
         with_ctx_and_mem(env, |gles, _mem| unsafe {
             gles.UnmapBuffer(target);

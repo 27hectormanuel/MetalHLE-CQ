@@ -307,6 +307,41 @@ pub const PAGE_SIZE: GuestUSize = 4096;
 pub const PAGE_SIZE_ALIGN_MASK: GuestUSize = 0xfff;
 
 /// The type that owns the guest memory and provides accessors for it.
+/// One-shot diagnostic probe. The first guest store into the null segment is
+/// turned into a memory abort so `Environment::debug_cpu_error` can report the
+/// exact faulting PC and stack. Guest stores are the only way to learn which
+/// instruction wrote through NULL: the `LAST_GUEST_PC` snapshot is taken at
+/// host-call boundaries, so for a store made while dynarmic is running it is
+/// stale (Asphalt 8's drift event reports the previous call, `_atan2f`).
+static NULL_WRITE_PROBE_FIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static NULL_WRITE_PROBE_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Claim the one-shot null-write probe. Returns `true` for exactly one caller
+/// in the whole process, which must arrange for the resulting memory abort to
+/// be reported. Two flags rather than one: reusing a single flag let the
+/// reporting side clear it, so every later nil write re-armed the probe and
+/// the full register dump was printed again.
+pub fn null_write_probe_claim() -> bool {
+    use std::sync::atomic::Ordering;
+    if NULL_WRITE_PROBE_FIRED.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    NULL_WRITE_PROBE_PENDING.store(true, Ordering::Relaxed);
+    true
+}
+
+/// Whether a claimed null-write probe is still waiting to be reported.
+pub fn null_write_probe_pending() -> bool {
+    NULL_WRITE_PROBE_PENDING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Mark the claimed probe as reported.
+pub fn null_write_probe_clear() {
+    NULL_WRITE_PROBE_PENDING.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub struct Mem {
     /// This array is 4GiB in size so that it can cover the entire 32-bit
     /// virtual address space, but it should not use that much physical memory,
@@ -349,17 +384,14 @@ pub struct Mem {
     /// See [crate::Environment] for more info.
     pub(super) zero_memory_on_free: bool,
 
-    /// HACK: stub page for null-page READ accesses.
-    /// Filled with zeros so that reading *(void**)NULL returns NULL.
-    /// This page is NEVER written to by guest code — writes go to
-    /// `null_write_sink` instead.
-    null_stub_page: *mut u8,
-
-    /// HACK: separate write-sink page for null-page WRITE accesses.
-    /// Writes to the null page go here and are silently discarded.
-    /// This prevents write operations from corrupting the zero-filled
-    /// read stub page.
-    null_write_sink: *mut u8,
+    /// HACK: backing page for null-page accesses, shared by reads and writes.
+    /// Zero-filled, so reading `*(void**)NULL` still returns NULL. Reads and
+    /// writes must use the *same* page: with separate pages, a guest that
+    /// writes through NULL and then reads the address back gets zeros instead
+    /// of what it just stored, which silently corrupts it. (Asphalt 8's drift
+    /// event writes a 256-byte table through NULL on the main thread and
+    /// later walks off into a data section.)
+    null_page: *mut u8,
 }
 
 impl Drop for Mem {
@@ -367,15 +399,8 @@ impl Drop for Mem {
         unsafe {
             crate::mem::host::free_guest_memory(self.bytes.cast(), std::mem::size_of::<Bytes>())
                 .unwrap();
-            // Free the read stub page
-            if !self.null_stub_page.is_null() {
-                crate::mem::host::free_memory(self.null_stub_page.cast(), PAGE_SIZE as usize)
-                    .unwrap();
-            }
-            // Free the write sink page
-            if !self.null_write_sink.is_null() {
-                crate::mem::host::free_memory(self.null_write_sink.cast(), PAGE_SIZE as usize)
-                    .unwrap();
+            if !self.null_page.is_null() {
+                crate::mem::host::free_memory(self.null_page.cast(), PAGE_SIZE as usize).unwrap();
             }
         }
     }
@@ -386,11 +411,32 @@ impl Mem {
     /// among others, the iPhone OS main thread stack size is 1MiB.
     pub const MAIN_THREAD_STACK_SIZE: GuestUSize = 1024 * 1024;
 
+    /// Unused gap between the top of the main thread's stack and the top of
+    /// the 32-bit address space.
+    ///
+    /// With the stack flush against `0xffffffff`, a stack object anywhere near
+    /// the top of the stack runs off the end of the address space and wraps to
+    /// zero. Asphalt 8's drift event copies a struct into a buffer at
+    /// `0xffffffc8` (`str r4, [r5, #0x20]` and following, 4 bytes at a time);
+    /// the first 24 bytes land at `0xffffffe8..0xfffffffc` and the rest wrap
+    /// around to `0x0..0xfc`, which looked exactly like the guest storing
+    /// through a NULL pointer. iPhone OS does not put the stack flush against
+    /// the top of the address space, so this cannot happen there.
+    pub const MAIN_THREAD_STACK_GUARD: GuestUSize = 1024 * 1024;
+
     /// Address of the lowest byte (not the base) of the main thread's stack.
     ///
     /// We are arbitrarily putting the stack at the top of the virtual address
-    /// space (see also: stack.rs), I have no idea if this matches iPhone OS.
-    pub const MAIN_THREAD_STACK_LOW_END: VAddr = 0u32.wrapping_sub(Self::MAIN_THREAD_STACK_SIZE);
+    /// space (see also: stack.rs), I have no idea if this matches iPhone OS,
+    /// but it is kept [Self::MAIN_THREAD_STACK_GUARD] below the very top so
+    /// that stack objects cannot wrap around the address space.
+    pub const MAIN_THREAD_STACK_LOW_END: VAddr = 0u32
+        .wrapping_sub(Self::MAIN_THREAD_STACK_GUARD)
+        .wrapping_sub(Self::MAIN_THREAD_STACK_SIZE);
+
+    /// Address of the highest byte of the main thread's usable stack.
+    pub const MAIN_THREAD_STACK_HIGH_END: VAddr =
+        Self::MAIN_THREAD_STACK_LOW_END.wrapping_add(Self::MAIN_THREAD_STACK_SIZE - 1);
 
     /// iPhone OS secondary thread stack size.
     pub const SECONDARY_THREAD_DEFAULT_STACK_SIZE: GuestUSize = 512 * 1024;
@@ -407,22 +453,14 @@ impl Mem {
         );
         let bytes = ptr as *mut Bytes;
 
-        // Allocate read stub page for null-page reads (4KB, zero-filled).
-        // Data reads of a NULL pointer (e.g. `*(void**)0`) return NULL.
-        let null_stub_page = unsafe {
+        // Allocate the page backing null-page accesses (4KB, zero-filled).
+        // Data reads of a NULL pointer (e.g. `*(void**)0`) return NULL, and
+        // writes through NULL are kept here so that reading the same address
+        // back returns what was written rather than a zero.
+        let null_page = unsafe {
             let page = crate::mem::host::allocate_memory(PAGE_SIZE as usize).unwrap();
-            let stub_slice = std::slice::from_raw_parts_mut(page as *mut u8, PAGE_SIZE as usize);
-            stub_slice.fill(0);
-            page as *mut u8
-        };
-
-        // Allocate a separate write-sink page for null-page writes (4KB).
-        // Writes to the null page are absorbed here so that they don't
-        // corrupt the read stub page's zeros.
-        let null_write_sink = unsafe {
-            let page = crate::mem::host::allocate_memory(PAGE_SIZE as usize).unwrap();
-            let sink_slice = std::slice::from_raw_parts_mut(page as *mut u8, PAGE_SIZE as usize);
-            sink_slice.fill(0);
+            let page_slice = std::slice::from_raw_parts_mut(page as *mut u8, PAGE_SIZE as usize);
+            page_slice.fill(0);
             page as *mut u8
         };
 
@@ -432,8 +470,7 @@ impl Mem {
             null_segment_size: 0,
             allocator,
             zero_memory_on_free: true,
-            null_stub_page,
-            null_write_sink,
+            null_page,
         }
     }
 
@@ -485,30 +522,41 @@ impl Mem {
     // further occurrences are silently counted. This prevents the log from
     // being flooded when the game repeatedly probes null-page addresses.
     #[cold]
-    fn null_check_fail(at: VAddr, size: GuestUSize, is_write: bool, caller: &str) {
+    fn null_check_fail(at: VAddr, size: GuestUSize, is_write: bool, caller: &str, mem: &Mem) {
         use std::collections::HashSet;
         use std::sync::Mutex;
-        static SEEN: Mutex<Option<HashSet<(VAddr, bool)>>> = Mutex::new(None);
+        // Separate budgets for reads and writes. A single shared budget lets a
+        // burst of nil writes (Asphalt 8's drift event writes 64 words through
+        // NULL) fill it and permanently silence the nil *reads* that follow,
+        // which are exactly the accesses showing what the guest did with the
+        // values it stored.
+        static SEEN_READS: Mutex<Option<HashSet<VAddr>>> = Mutex::new(None);
+        static SEEN_WRITES: Mutex<Option<HashSet<VAddr>>> = Mutex::new(None);
         const MAX_UNIQUE_LOGS: usize = 64;
 
-        let mut guard = SEEN.lock().unwrap();
+        let mut guard = if is_write {
+            SEEN_WRITES.lock().unwrap()
+        } else {
+            SEEN_READS.lock().unwrap()
+        };
         let set = guard.get_or_insert_with(HashSet::new);
-        let key = (at, is_write);
-        if set.contains(&key) {
+        if set.contains(&at) {
             return;
         }
         if set.len() >= MAX_UNIQUE_LOGS {
             if set.len() == MAX_UNIQUE_LOGS {
                 // Insert a sentinel to emit the notice only once.
-                set.insert((0xFFFF_FFFE, false));
+                set.insert(0xFFFF_FFFE);
                 log!(
-                    "touchHLE::mem: further NULL-PAGE warnings silenced after {} unique sites",
+                    "touchHLE::mem: further NULL-PAGE {} warnings silenced \
+                     after {} unique sites",
+                    if is_write { "WRITE" } else { "READ" },
                     MAX_UNIQUE_LOGS
                 );
             }
             return;
         }
-        set.insert(key);
+        set.insert(at);
         if size > 0x1000_0000 {
             // Huge size is almost always a corrupted/-1 length; capture a
             // backtrace to identify the offending host function.
@@ -540,6 +588,83 @@ impl Mem {
             set.len(),
             MAX_UNIQUE_LOGS
         );
+        if !is_write {
+            return;
+        }
+        // For writes, the useful question is *who* dereferenced the nil
+        // pointer. Print the guest side (PC/LR, the r0-r7 snapshot taken at
+        // the host-function dispatch, and the raw code at both addresses)
+        // plus a host backtrace naming the Rust stub that wrote through nil.
+        // Emit all of it once per distinct guest PC: one host call filling a
+        // buffer produces dozens of nil writes from a single site, and
+        // repeating the full context for each one drowns the log.
+        use std::sync::atomic::Ordering;
+        let guest_pc = crate::environment::LAST_GUEST_PC.load(Ordering::Relaxed);
+        let guest_lr = crate::environment::LAST_GUEST_LR.load(Ordering::Relaxed);
+        static LAST_DIAG_GUEST_PC: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(u32::MAX);
+        if LAST_DIAG_GUEST_PC.swap(guest_pc, Ordering::Relaxed) == guest_pc {
+            return;
+        }
+        let mut regs = String::new();
+        for (i, reg) in crate::environment::LAST_HOST_CALL_REGS.iter().enumerate() {
+            regs.push_str(&format!(" r{}={:#x}", i, reg.load(Ordering::Relaxed)));
+        }
+        let thread = crate::environment::LAST_HOST_CALL_THREAD.load(Ordering::Relaxed);
+        let symbol = Self::last_host_call_symbol();
+        log!(
+            "touchHLE::mem:   guest PC={:#x} LR={:#x} (thread {}); host fn \
+             {} called with:{}; code at PC: [{}]; code at LR: [{}]",
+            guest_pc,
+            guest_lr,
+            thread,
+            symbol,
+            regs,
+            Self::guest_code_dump(mem, guest_pc),
+            Self::guest_code_dump(mem, guest_lr)
+        );
+        log!(
+            "touchHLE::mem:   host backtrace:\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+    }
+
+    /// Recover the symbol name recorded at the most recent host-function
+    /// dispatch. The length is clamped and the bytes validated because the
+    /// pointer and length are stored by two separate relaxed stores, so a
+    /// concurrent dispatch can leave them mismatched.
+    fn last_host_call_symbol() -> String {
+        use std::sync::atomic::Ordering;
+        let ptr = crate::environment::LAST_HOST_CALL_SYMBOL_PTR.load(Ordering::Relaxed);
+        let len = crate::environment::LAST_HOST_CALL_SYMBOL_LEN.load(Ordering::Relaxed);
+        const MAX_SYMBOL_LEN: usize = 512;
+        if ptr == 0 || len == 0 || len > MAX_SYMBOL_LEN {
+            return "<unknown>".to_string();
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+        match std::str::from_utf8(bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => "<unparsable>".to_string(),
+        }
+    }
+
+    /// Dump 8 words of guest memory at `addr` as little-endian hex words, for
+    /// logging the code around a fault. Unmapped words read as `????????`.
+    /// Reads the backing array directly, so it cannot re-enter the null-page
+    /// handler that calls it.
+    fn guest_code_dump(mem: &Mem, addr: VAddr) -> String {
+        let mut out = String::new();
+        for word in 0..8u32 {
+            let at = addr.wrapping_add(word * 4) as usize;
+            match mem.bytes().get(at..).and_then(|s| s.get(..4)) {
+                Some(b) => out.push_str(&format!(
+                    "{:02x}{:02x}{:02x}{:02x} ",
+                    b[0], b[1], b[2], b[3]
+                )),
+                None => out.push_str("???????? "),
+            }
+        }
+        out
     }
 
     /// Special version of [Self::bytes_at] that returns [None] rather than
@@ -551,10 +676,7 @@ impl Mem {
             let offset = (addr.to_bits() % PAGE_SIZE) as usize;
             let count_usize = count as usize;
             let stub_slice = unsafe {
-                std::slice::from_raw_parts(
-                    self.null_stub_page.add(offset),
-                    PAGE_SIZE as usize - offset,
-                )
+                std::slice::from_raw_parts(self.null_page.add(offset), PAGE_SIZE as usize - offset)
             };
             return Some(&stub_slice[..count_usize.min(stub_slice.len())]);
         }
@@ -591,7 +713,7 @@ impl Mem {
     pub fn bytes_at<const MUT: bool>(&self, ptr: Ptr<u8, MUT>, count: GuestUSize) -> &[u8] {
         // ХАК: Вместо паники логируем и возвращаем данные из stub-страницы
         if ptr.to_bits() < self.null_segment_size {
-            Self::null_check_fail(ptr.to_bits(), count, false, "bytes_at");
+            Self::null_check_fail(ptr.to_bits(), count, false, "bytes_at", self);
             // Возвращаем данные из stub-страницы вместо реальной памяти
             // Это предотвращает UndefinedInstruction когда игра использует
             // прочитанные значения как указатели на функции
@@ -599,9 +721,7 @@ impl Mem {
             let count_usize = count as usize;
             let available = PAGE_SIZE as usize - offset;
             let actual_count = count_usize.min(available);
-            return unsafe {
-                std::slice::from_raw_parts(self.null_stub_page.add(offset), actual_count)
-            };
+            return unsafe { std::slice::from_raw_parts(self.null_page.add(offset), actual_count) };
         }
         // Guard against out-of-bounds reads near the top of the 32-bit address
         // space. If `ptr + count` wraps around or exceeds the backing array,
@@ -610,14 +730,12 @@ impl Mem {
         let addr = ptr.to_bits() as usize;
         let end = addr.saturating_add(count as usize);
         if end > self.bytes().len() || end < addr {
-            Self::null_check_fail(ptr.to_bits(), count, false, "bytes_at(OOB)");
+            Self::null_check_fail(ptr.to_bits(), count, false, "bytes_at(OOB)", self);
             let offset = (ptr.to_bits() % PAGE_SIZE) as usize;
             let count_usize = count as usize;
             let available = PAGE_SIZE as usize - offset;
             let actual_count = count_usize.min(available);
-            return unsafe {
-                std::slice::from_raw_parts(self.null_stub_page.add(offset), actual_count)
-            };
+            return unsafe { std::slice::from_raw_parts(self.null_page.add(offset), actual_count) };
         }
         &self.bytes()[addr..][..count as usize]
     }
@@ -634,14 +752,12 @@ impl Mem {
         let addr = ptr.to_bits() as usize;
         let end = addr.saturating_add(count as usize);
         if end > self.bytes().len() || end < addr {
-            Self::null_check_fail(ptr.to_bits(), count, false, "unchecked_bytes_at(OOB)");
+            Self::null_check_fail(ptr.to_bits(), count, false, "unchecked_bytes_at(OOB)", self);
             let offset = (ptr.to_bits() % PAGE_SIZE) as usize;
             let count_usize = count as usize;
             let available = PAGE_SIZE as usize - offset;
             let actual_count = count_usize.min(available);
-            return unsafe {
-                std::slice::from_raw_parts(self.null_stub_page.add(offset), actual_count)
-            };
+            return unsafe { std::slice::from_raw_parts(self.null_page.add(offset), actual_count) };
         }
         &self.bytes()[addr..][..count as usize]
     }
@@ -657,16 +773,16 @@ impl Mem {
     pub fn bytes_at_mut(&mut self, ptr: MutPtr<u8>, count: GuestUSize) -> &mut [u8] {
         // ХАК: Вместо паники логируем и возвращаем данные из stub-страницы
         if ptr.to_bits() < self.null_segment_size {
-            Self::null_check_fail(ptr.to_bits(), count, true, "bytes_at_mut");
-            // For writes to null-page, return the write-sink page so that
-            // writes are silently absorbed without corrupting the read stub
-            // page's zeros.
+            Self::null_check_fail(ptr.to_bits(), count, true, "bytes_at_mut", self);
+            // Writes land on the same page reads come from, so a guest that
+            // writes through NULL and reads the address back gets its own
+            // value instead of a zero.
             let offset = (ptr.to_bits() % PAGE_SIZE) as usize;
             let count_usize = count as usize;
             let available = PAGE_SIZE as usize - offset;
             let actual_count = count_usize.min(available);
             return unsafe {
-                std::slice::from_raw_parts_mut(self.null_write_sink.add(offset), actual_count)
+                std::slice::from_raw_parts_mut(self.null_page.add(offset), actual_count)
             };
         }
         // Guard against out-of-bounds writes near the top of the 32-bit
@@ -674,13 +790,13 @@ impl Mem {
         let addr = ptr.to_bits() as usize;
         let end = addr.saturating_add(count as usize);
         if end > self.bytes().len() || end < addr {
-            Self::null_check_fail(ptr.to_bits(), count, true, "bytes_at_mut(OOB)");
+            Self::null_check_fail(ptr.to_bits(), count, true, "bytes_at_mut(OOB)", self);
             let offset = (ptr.to_bits() % PAGE_SIZE) as usize;
             let count_usize = count as usize;
             let available = PAGE_SIZE as usize - offset;
             let actual_count = count_usize.min(available);
             return unsafe {
-                std::slice::from_raw_parts_mut(self.null_write_sink.add(offset), actual_count)
+                std::slice::from_raw_parts_mut(self.null_page.add(offset), actual_count)
             };
         }
         &mut self.bytes_mut()[addr..][..count as usize]
@@ -1142,6 +1258,31 @@ mod mem_tests {
             mem.write(p, 0xAB);
             assert_eq!(mem.read(p.cast_const()), 0xAB);
         }
+    }
+
+    #[test]
+    fn null_page_writes_round_trip() {
+        let mut mem = Mem::new();
+
+        mem.set_null_segment_size(super::PAGE_SIZE);
+
+        // Asphalt 8's drift event writes a 256-byte table through a NULL base
+        // pointer (64 four-byte stores at 0x0..0xfc). Reads and writes must
+        // hit the same backing page, so reading an address back returns what
+        // was stored instead of a zero from a separate stub page.
+        for i in 0..64u32 {
+            let p: MutPtr<u32> = Ptr::from_bits(i * 4);
+            mem.write(p, 0x1000 + i);
+        }
+        for i in 0..64u32 {
+            let p: MutPtr<u32> = Ptr::from_bits(i * 4);
+            assert_eq!(mem.read(p.cast_const()), 0x1000 + i);
+        }
+
+        // Offsets that were never written still read as zero, so
+        // `*(void**)NULL` remains NULL.
+        let untouched: MutPtr<u32> = Ptr::from_bits(0x800);
+        assert_eq!(mem.read(untouched.cast_const()), 0);
     }
 
     #[test]

@@ -11,6 +11,7 @@
 pub mod app_picker;
 mod mutex;
 mod nullable_box;
+mod undecodable;
 
 use crate::abi::{CallFromHost, GuestFunction};
 use crate::audio::openal::OpenALManager;
@@ -99,6 +100,33 @@ pub static GUEST_PC_RING: [std::sync::atomic::AtomicU32; 32] = {
     [ZERO; 32]
 };
 pub static GUEST_PC_RING_IDX: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Guest r0-r7 as of the most recent host-function dispatch, for crash
+/// diagnostics. r0-r3 are the AAPCS argument registers; r4-r7 are included
+/// because a guest loop that repeatedly calls one host function usually keeps
+/// the (nil) destination base in a callee-saved register rather than
+/// reloading it into r0-r3 every iteration.
+pub static LAST_HOST_CALL_REGS: [std::sync::atomic::AtomicU32; 8] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    [ZERO; 8]
+};
+
+/// Thread id as of the most recent host-function dispatch, for crash
+/// diagnostics (the guest PC alone does not say which thread hit it).
+pub static LAST_HOST_CALL_THREAD: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Symbol name of the most recent host-function dispatch, stored as the
+/// (pointer, length) of a `&'static str`, for crash diagnostics. Diagnostics
+/// only: both halves always come from dyld's static symbol table (or a name
+/// that dyld deliberately leaks), so the bytes stay mapped for the whole
+/// process lifetime. Readers must still clamp the length and validate UTF-8,
+/// since the two halves are not stored atomically together.
+pub static LAST_HOST_CALL_SYMBOL_PTR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub static LAST_HOST_CALL_SYMBOL_LEN: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// The struct containing the entire emulator state. Methods are provided for
@@ -197,6 +225,14 @@ enum GuestTrapKind {
     /// surrounding code is still meaningful, so the right thing to do is to
     /// step over it, not to abandon the function.
     UndecodableInstruction { encoding: u32 },
+    /// The PC is inside a code section, but the bytes there are not an
+    /// instruction stream: a literal pool, switch table or other data blob
+    /// inside `__text`, reached through a bad function pointer or a computed
+    /// branch that went wrong. Nothing sensible can be executed from here, and
+    /// stepping over the bytes would only walk the guest deeper into the blob,
+    /// so this is recovered like [GuestTrapKind::OutsideCode]. See
+    /// `undecodable::undecodable_site_is_likely_code`.
+    ExecutionInData { encoding: u32 },
     /// The PC is in a code section but points at the *second* halfword of a
     /// 32-bit `bl`/`blx <label>` (the halfword before it is a valid first
     /// half and the "instruction" at PC is a valid second half). Execution
@@ -910,7 +946,7 @@ impl Environment {
             return_value: None,
             guest_context: None,
             host_context: Some(main_thread_init_routine),
-            stack: Some(mem::Mem::MAIN_THREAD_STACK_LOW_END..=0u32.wrapping_sub(1)),
+            stack: Some(mem::Mem::MAIN_THREAD_STACK_LOW_END..=mem::Mem::MAIN_THREAD_STACK_HIGH_END),
             thread_local_framework_state: Default::default(),
         };
 
@@ -1079,7 +1115,7 @@ impl Environment {
             return_value: None,
             guest_context: None,
             host_context: None,
-            stack: Some(mem::Mem::MAIN_THREAD_STACK_LOW_END..=0u32.wrapping_sub(1)),
+            stack: Some(mem::Mem::MAIN_THREAD_STACK_LOW_END..=mem::Mem::MAIN_THREAD_STACK_HIGH_END),
             thread_local_framework_state: Default::default(),
         };
 
@@ -2122,6 +2158,23 @@ impl Environment {
         )
     }
 
+    /// Dump 8 words of guest code at `addr` as little-endian hex, for crash
+    /// diagnostics. Unmapped words read as `????????`.
+    fn guest_code_words(&self, addr: u32) -> String {
+        let mut out = String::new();
+        for word in 0..8u32 {
+            let at = addr.wrapping_add(word * 4);
+            match self.read_guest_u16_fallible(at) {
+                Some(lo) => match self.read_guest_u16_fallible(at.wrapping_add(2)) {
+                    Some(hi) => out.push_str(&format!("{:04x}{:04x} ", lo, hi)),
+                    None => out.push_str("???????? "),
+                },
+                None => out.push_str("???????? "),
+            }
+        }
+        out
+    }
+
     /// Read a guest halfword without panicking if the address is unmapped.
     fn read_guest_u16_fallible(&self, addr: u32) -> Option<u16> {
         let bytes = self
@@ -2209,7 +2262,18 @@ impl Environment {
                     return GuestTrapKind::MisalignedInstruction { encoding };
                 }
             }
-            GuestTrapKind::UndecodableInstruction { encoding }
+            // Dynarmic implements essentially all of ARMv7-A (including VFP
+            // and NEON), so an undecodable encoding inside a code section is
+            // much more likely to be data the PC has wandered into than an
+            // instruction it genuinely lacks. Only the latter should be
+            // stepped over; the former has to be escaped from instead.
+            if undecodable::undecodable_site_is_likely_code(pc, true, instruction_len, |addr| {
+                self.read_guest_u16_fallible(addr)
+            }) {
+                GuestTrapKind::UndecodableInstruction { encoding }
+            } else {
+                GuestTrapKind::ExecutionInData { encoding }
+            }
         } else {
             let Some(encoding) = self.read_guest_u32_fallible(pc) else {
                 return GuestTrapKind::OutsideCode;
@@ -2744,6 +2808,23 @@ impl Environment {
                 // instruction in a hot loop would otherwise trip the
                 // same-LR runaway panic even though the guest is making
                 // perfectly good progress.
+                //
+                // Stepping over *one* such instruction is right; stepping
+                // over hundreds of different ones is not. A real function
+                // does not contain that many instructions dynarmic cannot
+                // decode, so past `MAX_UNDECODABLE_SITES` distinct sites the
+                // PC is evidently running through a data blob — the case
+                // `classify_guest_trap` reports statically as
+                // `GuestTrapKind::ExecutionInData` — and the recovery below
+                // has to get the guest out of it instead. This is the safety
+                // net for a misclassification: it bounds the damage if that
+                // static check misses one.
+                const MAX_UNDECODABLE_SITES: usize = 128;
+                // How many distinct sites get the full diagnostics dump and
+                // stack trace. A guest walking through a data blob reaches a
+                // new site every few instructions, so one line per site would
+                // flood the log.
+                const MAX_UNDECODABLE_SITE_DIAGNOSTICS: usize = 8;
                 if let GuestTrapKind::UndecodableInstruction { encoding } = trap_kind {
                     let site_count = self
                         .cpu_skipped_instruction_sites
@@ -2751,33 +2832,59 @@ impl Environment {
                         .or_insert(0);
                     *site_count = site_count.saturating_add(1);
                     let site_count = *site_count;
-                    if site_count == 1 || site_count == 1024 || site_count == 1 << 20 {
-                        log_no_panic!(
-                            "Warning: {:?} at {:#x} (encoding {:#x}, thumb={}, {} bytes) \
-                             is inside a code section but is not a trap instruction, \
-                             so dynarmic could not decode it. Skipping it as a no-op \
-                             and continuing at {:#x}. LR={:#x}. (seen {} times at this \
-                             site)",
-                            error,
-                            pc,
-                            encoding,
-                            is_thumb,
-                            instruction_len,
-                            pc.wrapping_add(instruction_len),
-                            lr,
-                            site_count
-                        );
+                    let distinct_sites = self.cpu_skipped_instruction_sites.len();
+                    if distinct_sites > MAX_UNDECODABLE_SITES {
+                        if site_count == 1 {
+                            log_no_panic!(
+                                "Warning: Undecodable instruction at {:#x} (encoding \
+                                 {:#x}) is one of {} distinct sites stepped over in \
+                                 this run, so the PC is being treated as running \
+                                 through data rather than code. Recovering the call \
+                                 instead of skipping it. LR={:#x}.",
+                                pc,
+                                encoding,
+                                distinct_sites,
+                                lr
+                            );
+                        }
+                    } else {
+                        if site_count == 1 || site_count == 1024 || site_count == 1 << 20 {
+                            log_no_panic!(
+                                "Warning: {:?} at {:#x} (encoding {:#x}, thumb={}, {} bytes) \
+                                 is inside a code section but is not a trap instruction, \
+                                 so dynarmic could not decode it. Skipping it as a no-op \
+                                 and continuing at {:#x}. LR={:#x}. (seen {} times at this \
+                                 site)",
+                                error,
+                                pc,
+                                encoding,
+                                is_thumb,
+                                instruction_len,
+                                pc.wrapping_add(instruction_len),
+                                lr,
+                                site_count
+                            );
+                        }
+                        if site_count == 1 {
+                            if distinct_sites <= MAX_UNDECODABLE_SITE_DIAGNOSTICS {
+                                log_no_panic!(
+                                    "Undecodable instruction diagnostics: {}. {}.",
+                                    self.dump_guest_code_around(pc, is_thumb),
+                                    self.describe_call_site_before(lr)
+                                );
+                                self.stack_trace_current();
+                            } else if distinct_sites == MAX_UNDECODABLE_SITE_DIAGNOSTICS + 1 {
+                                log_no_panic!(
+                                    "Warning: Undecodable instructions at {} distinct \
+                                     sites so far; suppressing further per-site \
+                                     diagnostics and stack traces.",
+                                    distinct_sites
+                                );
+                            }
+                        }
+                        self.cpu.regs_mut()[cpu::Cpu::PC] = pc.wrapping_add(instruction_len);
+                        return;
                     }
-                    if site_count == 1 {
-                        log_no_panic!(
-                            "Undecodable instruction diagnostics: {}. {}.",
-                            self.dump_guest_code_around(pc, is_thumb),
-                            self.describe_call_site_before(lr)
-                        );
-                        self.stack_trace_current();
-                    }
-                    self.cpu.regs_mut()[cpu::Cpu::PC] = pc.wrapping_add(instruction_len);
-                    return;
                 }
 
                 // Track repeated occurrences of the same bypass site.
@@ -2870,21 +2977,27 @@ impl Environment {
                 // instead (if one can be validated) long before the
                 // `BYPASS_LIMIT` fall-through-the-trap last resort.
                 //
-                // Outside code sections (wild PC) the instruction bytes and
-                // call-site analysis are meaningless, so only the dynamic
-                // escalation applies on top of the legacy branch-to-LR.
+                // Outside code sections (wild PC), and inside them but in a
+                // data blob rather than an instruction stream, the
+                // instruction bytes and call-site analysis are meaningless,
+                // so only the dynamic escalation applies on top of the legacy
+                // branch-to-LR.
                 const UNWIND_AFTER_REPEATS: u32 = 4;
                 let recovery = match trap_kind {
                     GuestTrapKind::DeliberateTrap { .. }
                     | GuestTrapKind::MisalignedInstruction { .. } => {
                         self.plan_guest_trap_recovery(pc, lr, count >= UNWIND_AFTER_REPEATS)
                     }
-                    GuestTrapKind::OutsideCode if (lr & !1) == pc => {
+                    GuestTrapKind::OutsideCode | GuestTrapKind::ExecutionInData { .. }
+                        if (lr & !1) == pc =>
+                    {
                         GuestTrapRecovery::SkipInstruction {
                             reason: "LR re-enters the same instruction",
                         }
                     }
-                    GuestTrapKind::OutsideCode if count >= UNWIND_AFTER_REPEATS => {
+                    GuestTrapKind::OutsideCode | GuestTrapKind::ExecutionInData { .. }
+                        if count >= UNWIND_AFTER_REPEATS =>
+                    {
                         match self.validated_guest_frame_record() {
                             Some(frame) => GuestTrapRecovery::UnwindFrame {
                                 frame,
@@ -2914,6 +3027,11 @@ impl Environment {
                             "PC is the second halfword of a bl/blx at {:#x}, execution is \
                              misaligned with the instruction stream; encoding {encoding:#x}",
                             pc.wrapping_sub(2)
+                        ),
+                        GuestTrapKind::ExecutionInData { encoding } => format!(
+                            "PC is inside a code section but the bytes there are not an \
+                             instruction stream — a literal pool, switch table or other \
+                             data; encoding {encoding:#x}"
                         ),
                         GuestTrapKind::OutsideCode => "PC is outside any code section".to_string(),
                     };
@@ -2998,12 +3116,42 @@ impl Environment {
                     self.cpu.regs_mut()[cpu::Cpu::PC] = pc.wrapping_add(instruction_len);
                     self.cpu_error_bypass_last = None;
                     self.cpu_error_bypass_count = 0;
-                    self.cpu_error_bypass_last_lr = None;
-                    self.cpu_error_bypass_lr_count = 0;
+                    // Deliberately NOT resetting `cpu_error_bypass_last_lr`
+                    // and `cpu_error_bypass_lr_count` here. Those two are the
+                    // only bound on a guest that keeps trapping at one site,
+                    // and wiping them on every BYPASS_LIMIT-th skip restarted
+                    // the (PC, LR) counter from zero forever: `LR_BYPASS_LIMIT`
+                    // could never be reached and the thread spun indefinitely,
+                    // printing "looped 256 times" hundreds of times over
+                    // (Asphalt 8 drift event, PC 0x2a00c / LR 0x29fe1). Real
+                    // forward progress still clears them in `handle_cpu_state`,
+                    // so a genuinely recovering guest is unaffected.
                     return;
                 }
 
                 self.apply_guest_trap_recovery(recovery, pc, instruction_len);
+                return;
+            }
+
+            // A memory abort raised by the one-shot null-write probe (see
+            // `touchHLE_cpu_write_impl`). This is the only way to learn which
+            // guest instruction stores through NULL, so report it and carry
+            // on: the store already reached the null page, and later nil
+            // writes are absorbed without probing again.
+            if matches!(error, cpu::CpuError::MemoryError) && crate::mem::null_write_probe_pending()
+            {
+                crate::mem::null_write_probe_clear();
+                log_no_panic!(
+                    "NULL-WRITE PROBE: the guest stored into the null page. \
+                     PC={:#x} LR={:#x} (thread {}, thumb={}). Code at PC: [{}]",
+                    self.cpu.regs()[cpu::Cpu::PC],
+                    self.cpu.regs()[cpu::Cpu::LR],
+                    self.current_thread,
+                    is_thumb,
+                    self.guest_code_words(self.cpu.regs()[cpu::Cpu::PC])
+                );
+                self.dump_all_regs();
+                self.stack_trace_current();
                 return;
             }
 
@@ -3079,6 +3227,26 @@ impl Environment {
                             // bypass runaway counter (see `debug_cpu_error`).
                             self.cpu_error_bypass_last_lr = None;
                             self.cpu_error_bypass_lr_count = 0;
+                            // Snapshot r0-r7 before the host function runs, so
+                            // a nil-page write inside it can report the guest
+                            // arguments that produced the nil pointer.
+                            {
+                                std::sync::atomic::AtomicU32::store(
+                                    &crate::environment::LAST_HOST_CALL_THREAD,
+                                    self.current_thread as u32,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                let regs = self.cpu.regs();
+                                for (slot, reg) in
+                                    crate::environment::LAST_HOST_CALL_REGS.iter().enumerate()
+                                {
+                                    std::sync::atomic::AtomicU32::store(
+                                        reg,
+                                        regs[slot],
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                }
+                            }
                             f.call_from_guest(self);
 
                             let guest_control_flow_redirected =
