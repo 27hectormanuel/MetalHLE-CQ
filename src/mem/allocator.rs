@@ -294,8 +294,12 @@ pub struct Allocator {
 
 impl Allocator {
     pub fn new() -> Allocator {
-        let main_thread_stack =
-            Chunk::new(Mem::MAIN_THREAD_STACK_LOW_END, Mem::MAIN_THREAD_STACK_SIZE);
+        // Reserve the guard above the stack too, so it can never be handed
+        // out as an allocation and a stack overflow collides with it.
+        let main_thread_stack = Chunk::new(
+            Mem::MAIN_THREAD_STACK_LOW_END,
+            Mem::MAIN_THREAD_STACK_SIZE + Mem::MAIN_THREAD_STACK_GUARD,
+        );
         let rest = Chunk::new(0, Mem::MAIN_THREAD_STACK_LOW_END);
 
         let mut used_chunks: ChunkMap = Default::default();

@@ -313,14 +313,23 @@ pub const PAGE_SIZE_ALIGN_MASK: GuestUSize = 0xfff;
 /// instruction wrote through NULL: the `LAST_GUEST_PC` snapshot is taken at
 /// host-call boundaries, so for a store made while dynarmic is running it is
 /// stale (Asphalt 8's drift event reports the previous call, `_atan2f`).
+static NULL_WRITE_PROBE_FIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 static NULL_WRITE_PROBE_PENDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Claim the one-shot null-write probe. Returns `true` for exactly one caller,
-/// which must arrange for the resulting memory abort to be reported.
+/// Claim the one-shot null-write probe. Returns `true` for exactly one caller
+/// in the whole process, which must arrange for the resulting memory abort to
+/// be reported. Two flags rather than one: reusing a single flag let the
+/// reporting side clear it, so every later nil write re-armed the probe and
+/// the full register dump was printed again.
 pub fn null_write_probe_claim() -> bool {
     use std::sync::atomic::Ordering;
-    !NULL_WRITE_PROBE_PENDING.swap(true, Ordering::Relaxed)
+    if NULL_WRITE_PROBE_FIRED.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    NULL_WRITE_PROBE_PENDING.store(true, Ordering::Relaxed);
+    true
 }
 
 /// Whether a claimed null-write probe is still waiting to be reported.
@@ -402,11 +411,32 @@ impl Mem {
     /// among others, the iPhone OS main thread stack size is 1MiB.
     pub const MAIN_THREAD_STACK_SIZE: GuestUSize = 1024 * 1024;
 
+    /// Unused gap between the top of the main thread's stack and the top of
+    /// the 32-bit address space.
+    ///
+    /// With the stack flush against `0xffffffff`, a stack object anywhere near
+    /// the top of the stack runs off the end of the address space and wraps to
+    /// zero. Asphalt 8's drift event copies a struct into a buffer at
+    /// `0xffffffc8` (`str r4, [r5, #0x20]` and following, 4 bytes at a time);
+    /// the first 24 bytes land at `0xffffffe8..0xfffffffc` and the rest wrap
+    /// around to `0x0..0xfc`, which looked exactly like the guest storing
+    /// through a NULL pointer. iPhone OS does not put the stack flush against
+    /// the top of the address space, so this cannot happen there.
+    pub const MAIN_THREAD_STACK_GUARD: GuestUSize = 1024 * 1024;
+
     /// Address of the lowest byte (not the base) of the main thread's stack.
     ///
     /// We are arbitrarily putting the stack at the top of the virtual address
-    /// space (see also: stack.rs), I have no idea if this matches iPhone OS.
-    pub const MAIN_THREAD_STACK_LOW_END: VAddr = 0u32.wrapping_sub(Self::MAIN_THREAD_STACK_SIZE);
+    /// space (see also: stack.rs), I have no idea if this matches iPhone OS,
+    /// but it is kept [Self::MAIN_THREAD_STACK_GUARD] below the very top so
+    /// that stack objects cannot wrap around the address space.
+    pub const MAIN_THREAD_STACK_LOW_END: VAddr = 0u32
+        .wrapping_sub(Self::MAIN_THREAD_STACK_GUARD)
+        .wrapping_sub(Self::MAIN_THREAD_STACK_SIZE);
+
+    /// Address of the highest byte of the main thread's usable stack.
+    pub const MAIN_THREAD_STACK_HIGH_END: VAddr =
+        Self::MAIN_THREAD_STACK_LOW_END.wrapping_add(Self::MAIN_THREAD_STACK_SIZE - 1);
 
     /// iPhone OS secondary thread stack size.
     pub const SECONDARY_THREAD_DEFAULT_STACK_SIZE: GuestUSize = 512 * 1024;

@@ -47,9 +47,15 @@ pub fn prep_stack_for_start(
     let argc: i32 = argv.len().try_into().unwrap();
 
     // We are arbitrarily putting the main thread's stack at the top of the
-    // address space (see also: mem::Mem::MAIN_THREAD_STACK_LOW_END).
-    // Since the stack grows downwards, its first byte would be 0xffffffff.
-    let stack_base: usize = 1 << 32;
+    // address space, but not flush against it: there is a guard region above
+    // it, because a stack object that ends at 0xffffffff runs off the end of
+    // the 32-bit address space and wraps around to zero, which looks exactly
+    // like the guest storing through a NULL pointer (see also:
+    // mem::Mem::MAIN_THREAD_STACK_LOW_END and _GUARD).
+    // Since the stack grows downwards, its first byte would be
+    // Mem::MAIN_THREAD_STACK_HIGH_END.
+    let stack_base: usize =
+        Mem::MAIN_THREAD_STACK_LOW_END as usize + Mem::MAIN_THREAD_STACK_SIZE as usize;
 
     // Rust vectors grow upwards but we need to grow this one downwards, so
     // let's push the strings onto it reversed.
