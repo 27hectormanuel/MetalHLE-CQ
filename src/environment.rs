@@ -2158,6 +2158,23 @@ impl Environment {
         )
     }
 
+    /// Dump 8 words of guest code at `addr` as little-endian hex, for crash
+    /// diagnostics. Unmapped words read as `????????`.
+    fn guest_code_words(&self, addr: u32) -> String {
+        let mut out = String::new();
+        for word in 0..8u32 {
+            let at = addr.wrapping_add(word * 4);
+            match self.read_guest_u16_fallible(at) {
+                Some(lo) => match self.read_guest_u16_fallible(at.wrapping_add(2)) {
+                    Some(hi) => out.push_str(&format!("{:04x}{:04x} ", lo, hi)),
+                    None => out.push_str("???????? "),
+                },
+                None => out.push_str("???????? "),
+            }
+        }
+        out
+    }
+
     /// Read a guest halfword without panicking if the address is unmapped.
     fn read_guest_u16_fallible(&self, addr: u32) -> Option<u16> {
         let bytes = self
@@ -3099,12 +3116,42 @@ impl Environment {
                     self.cpu.regs_mut()[cpu::Cpu::PC] = pc.wrapping_add(instruction_len);
                     self.cpu_error_bypass_last = None;
                     self.cpu_error_bypass_count = 0;
-                    self.cpu_error_bypass_last_lr = None;
-                    self.cpu_error_bypass_lr_count = 0;
+                    // Deliberately NOT resetting `cpu_error_bypass_last_lr`
+                    // and `cpu_error_bypass_lr_count` here. Those two are the
+                    // only bound on a guest that keeps trapping at one site,
+                    // and wiping them on every BYPASS_LIMIT-th skip restarted
+                    // the (PC, LR) counter from zero forever: `LR_BYPASS_LIMIT`
+                    // could never be reached and the thread spun indefinitely,
+                    // printing "looped 256 times" hundreds of times over
+                    // (Asphalt 8 drift event, PC 0x2a00c / LR 0x29fe1). Real
+                    // forward progress still clears them in `handle_cpu_state`,
+                    // so a genuinely recovering guest is unaffected.
                     return;
                 }
 
                 self.apply_guest_trap_recovery(recovery, pc, instruction_len);
+                return;
+            }
+
+            // A memory abort raised by the one-shot null-write probe (see
+            // `touchHLE_cpu_write_impl`). This is the only way to learn which
+            // guest instruction stores through NULL, so report it and carry
+            // on: the store already reached the null page, and later nil
+            // writes are absorbed without probing again.
+            if matches!(error, cpu::CpuError::MemoryError) && crate::mem::null_write_probe_pending()
+            {
+                crate::mem::null_write_probe_clear();
+                log_no_panic!(
+                    "NULL-WRITE PROBE: the guest stored into the null page. \
+                     PC={:#x} LR={:#x} (thread {}, thumb={}). Code at PC: [{}]",
+                    self.cpu.regs()[cpu::Cpu::PC],
+                    self.cpu.regs()[cpu::Cpu::LR],
+                    self.current_thread,
+                    is_thumb,
+                    self.guest_code_words(self.cpu.regs()[cpu::Cpu::PC])
+                );
+                self.dump_all_regs();
+                self.stack_trace_current();
                 return;
             }
 

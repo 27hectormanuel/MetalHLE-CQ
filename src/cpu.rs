@@ -50,12 +50,21 @@ fn touchHLE_cpu_read_impl<T: SafeRead + Default>(
 
 fn touchHLE_cpu_write_impl<T: SafeWrite>(mem: *mut touchHLE_Mem, addr: VAddr, value: T) -> bool {
     // See comments above about catch_unwind
+    let mut null_segment_size = 0;
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mem = unsafe { &mut *mem.cast::<Mem>() };
         let ptr: MutPtr<T> = Ptr::from_bits(addr);
+        null_segment_size = mem.null_segment_size();
         mem.write(ptr, value)
     }));
-    res.is_err()
+    if res.is_err() {
+        return true;
+    }
+    // Diagnostic: report a `true` (memory abort) for the first guest store
+    // into the null segment, so the emulator can print the exact faulting PC
+    // and stack. Returning false for it, as before, lets the guest write
+    // through NULL and carry on with no clue where it happened.
+    addr < null_segment_size && crate::mem::null_write_probe_claim()
 }
 
 // Export functions for use by C++

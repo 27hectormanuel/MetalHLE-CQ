@@ -307,6 +307,32 @@ pub const PAGE_SIZE: GuestUSize = 4096;
 pub const PAGE_SIZE_ALIGN_MASK: GuestUSize = 0xfff;
 
 /// The type that owns the guest memory and provides accessors for it.
+/// One-shot diagnostic probe. The first guest store into the null segment is
+/// turned into a memory abort so `Environment::debug_cpu_error` can report the
+/// exact faulting PC and stack. Guest stores are the only way to learn which
+/// instruction wrote through NULL: the `LAST_GUEST_PC` snapshot is taken at
+/// host-call boundaries, so for a store made while dynarmic is running it is
+/// stale (Asphalt 8's drift event reports the previous call, `_atan2f`).
+static NULL_WRITE_PROBE_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Claim the one-shot null-write probe. Returns `true` for exactly one caller,
+/// which must arrange for the resulting memory abort to be reported.
+pub fn null_write_probe_claim() -> bool {
+    use std::sync::atomic::Ordering;
+    !NULL_WRITE_PROBE_PENDING.swap(true, Ordering::Relaxed)
+}
+
+/// Whether a claimed null-write probe is still waiting to be reported.
+pub fn null_write_probe_pending() -> bool {
+    NULL_WRITE_PROBE_PENDING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Mark the claimed probe as reported.
+pub fn null_write_probe_clear() {
+    NULL_WRITE_PROBE_PENDING.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub struct Mem {
     /// This array is 4GiB in size so that it can cover the entire 32-bit
     /// virtual address space, but it should not use that much physical memory,
