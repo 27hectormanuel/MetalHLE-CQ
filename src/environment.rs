@@ -11,6 +11,7 @@
 pub mod app_picker;
 mod mutex;
 mod nullable_box;
+mod undecodable;
 
 use crate::abi::{CallFromHost, GuestFunction};
 use crate::audio::openal::OpenALManager;
@@ -197,6 +198,14 @@ enum GuestTrapKind {
     /// surrounding code is still meaningful, so the right thing to do is to
     /// step over it, not to abandon the function.
     UndecodableInstruction { encoding: u32 },
+    /// The PC is inside a code section, but the bytes there are not an
+    /// instruction stream: a literal pool, switch table or other data blob
+    /// inside `__text`, reached through a bad function pointer or a computed
+    /// branch that went wrong. Nothing sensible can be executed from here, and
+    /// stepping over the bytes would only walk the guest deeper into the blob,
+    /// so this is recovered like [GuestTrapKind::OutsideCode]. See
+    /// `undecodable::undecodable_site_is_likely_code`.
+    ExecutionInData { encoding: u32 },
     /// The PC is in a code section but points at the *second* halfword of a
     /// 32-bit `bl`/`blx <label>` (the halfword before it is a valid first
     /// half and the "instruction" at PC is a valid second half). Execution
@@ -2209,7 +2218,18 @@ impl Environment {
                     return GuestTrapKind::MisalignedInstruction { encoding };
                 }
             }
-            GuestTrapKind::UndecodableInstruction { encoding }
+            // Dynarmic implements essentially all of ARMv7-A (including VFP
+            // and NEON), so an undecodable encoding inside a code section is
+            // much more likely to be data the PC has wandered into than an
+            // instruction it genuinely lacks. Only the latter should be
+            // stepped over; the former has to be escaped from instead.
+            if undecodable::undecodable_site_is_likely_code(pc, true, instruction_len, |addr| {
+                self.read_guest_u16_fallible(addr)
+            }) {
+                GuestTrapKind::UndecodableInstruction { encoding }
+            } else {
+                GuestTrapKind::ExecutionInData { encoding }
+            }
         } else {
             let Some(encoding) = self.read_guest_u32_fallible(pc) else {
                 return GuestTrapKind::OutsideCode;
@@ -2744,6 +2764,23 @@ impl Environment {
                 // instruction in a hot loop would otherwise trip the
                 // same-LR runaway panic even though the guest is making
                 // perfectly good progress.
+                //
+                // Stepping over *one* such instruction is right; stepping
+                // over hundreds of different ones is not. A real function
+                // does not contain that many instructions dynarmic cannot
+                // decode, so past `MAX_UNDECODABLE_SITES` distinct sites the
+                // PC is evidently running through a data blob — the case
+                // `classify_guest_trap` reports statically as
+                // `GuestTrapKind::ExecutionInData` — and the recovery below
+                // has to get the guest out of it instead. This is the safety
+                // net for a misclassification: it bounds the damage if that
+                // static check misses one.
+                const MAX_UNDECODABLE_SITES: usize = 128;
+                // How many distinct sites get the full diagnostics dump and
+                // stack trace. A guest walking through a data blob reaches a
+                // new site every few instructions, so one line per site would
+                // flood the log.
+                const MAX_UNDECODABLE_SITE_DIAGNOSTICS: usize = 8;
                 if let GuestTrapKind::UndecodableInstruction { encoding } = trap_kind {
                     let site_count = self
                         .cpu_skipped_instruction_sites
@@ -2751,33 +2788,59 @@ impl Environment {
                         .or_insert(0);
                     *site_count = site_count.saturating_add(1);
                     let site_count = *site_count;
-                    if site_count == 1 || site_count == 1024 || site_count == 1 << 20 {
-                        log_no_panic!(
-                            "Warning: {:?} at {:#x} (encoding {:#x}, thumb={}, {} bytes) \
-                             is inside a code section but is not a trap instruction, \
-                             so dynarmic could not decode it. Skipping it as a no-op \
-                             and continuing at {:#x}. LR={:#x}. (seen {} times at this \
-                             site)",
-                            error,
-                            pc,
-                            encoding,
-                            is_thumb,
-                            instruction_len,
-                            pc.wrapping_add(instruction_len),
-                            lr,
-                            site_count
-                        );
+                    let distinct_sites = self.cpu_skipped_instruction_sites.len();
+                    if distinct_sites > MAX_UNDECODABLE_SITES {
+                        if site_count == 1 {
+                            log_no_panic!(
+                                "Warning: Undecodable instruction at {:#x} (encoding \
+                                 {:#x}) is one of {} distinct sites stepped over in \
+                                 this run, so the PC is being treated as running \
+                                 through data rather than code. Recovering the call \
+                                 instead of skipping it. LR={:#x}.",
+                                pc,
+                                encoding,
+                                distinct_sites,
+                                lr
+                            );
+                        }
+                    } else {
+                        if site_count == 1 || site_count == 1024 || site_count == 1 << 20 {
+                            log_no_panic!(
+                                "Warning: {:?} at {:#x} (encoding {:#x}, thumb={}, {} bytes) \
+                                 is inside a code section but is not a trap instruction, \
+                                 so dynarmic could not decode it. Skipping it as a no-op \
+                                 and continuing at {:#x}. LR={:#x}. (seen {} times at this \
+                                 site)",
+                                error,
+                                pc,
+                                encoding,
+                                is_thumb,
+                                instruction_len,
+                                pc.wrapping_add(instruction_len),
+                                lr,
+                                site_count
+                            );
+                        }
+                        if site_count == 1 {
+                            if distinct_sites <= MAX_UNDECODABLE_SITE_DIAGNOSTICS {
+                                log_no_panic!(
+                                    "Undecodable instruction diagnostics: {}. {}.",
+                                    self.dump_guest_code_around(pc, is_thumb),
+                                    self.describe_call_site_before(lr)
+                                );
+                                self.stack_trace_current();
+                            } else if distinct_sites == MAX_UNDECODABLE_SITE_DIAGNOSTICS + 1 {
+                                log_no_panic!(
+                                    "Warning: Undecodable instructions at {} distinct \
+                                     sites so far; suppressing further per-site \
+                                     diagnostics and stack traces.",
+                                    distinct_sites
+                                );
+                            }
+                        }
+                        self.cpu.regs_mut()[cpu::Cpu::PC] = pc.wrapping_add(instruction_len);
+                        return;
                     }
-                    if site_count == 1 {
-                        log_no_panic!(
-                            "Undecodable instruction diagnostics: {}. {}.",
-                            self.dump_guest_code_around(pc, is_thumb),
-                            self.describe_call_site_before(lr)
-                        );
-                        self.stack_trace_current();
-                    }
-                    self.cpu.regs_mut()[cpu::Cpu::PC] = pc.wrapping_add(instruction_len);
-                    return;
                 }
 
                 // Track repeated occurrences of the same bypass site.
@@ -2870,21 +2933,27 @@ impl Environment {
                 // instead (if one can be validated) long before the
                 // `BYPASS_LIMIT` fall-through-the-trap last resort.
                 //
-                // Outside code sections (wild PC) the instruction bytes and
-                // call-site analysis are meaningless, so only the dynamic
-                // escalation applies on top of the legacy branch-to-LR.
+                // Outside code sections (wild PC), and inside them but in a
+                // data blob rather than an instruction stream, the
+                // instruction bytes and call-site analysis are meaningless,
+                // so only the dynamic escalation applies on top of the legacy
+                // branch-to-LR.
                 const UNWIND_AFTER_REPEATS: u32 = 4;
                 let recovery = match trap_kind {
                     GuestTrapKind::DeliberateTrap { .. }
                     | GuestTrapKind::MisalignedInstruction { .. } => {
                         self.plan_guest_trap_recovery(pc, lr, count >= UNWIND_AFTER_REPEATS)
                     }
-                    GuestTrapKind::OutsideCode if (lr & !1) == pc => {
+                    GuestTrapKind::OutsideCode | GuestTrapKind::ExecutionInData { .. }
+                        if (lr & !1) == pc =>
+                    {
                         GuestTrapRecovery::SkipInstruction {
                             reason: "LR re-enters the same instruction",
                         }
                     }
-                    GuestTrapKind::OutsideCode if count >= UNWIND_AFTER_REPEATS => {
+                    GuestTrapKind::OutsideCode | GuestTrapKind::ExecutionInData { .. }
+                        if count >= UNWIND_AFTER_REPEATS =>
+                    {
                         match self.validated_guest_frame_record() {
                             Some(frame) => GuestTrapRecovery::UnwindFrame {
                                 frame,
@@ -2914,6 +2983,11 @@ impl Environment {
                             "PC is the second halfword of a bl/blx at {:#x}, execution is \
                              misaligned with the instruction stream; encoding {encoding:#x}",
                             pc.wrapping_sub(2)
+                        ),
+                        GuestTrapKind::ExecutionInData { encoding } => format!(
+                            "PC is inside a code section but the bytes there are not an \
+                             instruction stream — a literal pool, switch table or other \
+                             data; encoding {encoding:#x}"
                         ),
                         GuestTrapKind::OutsideCode => "PC is outside any code section".to_string(),
                     };
