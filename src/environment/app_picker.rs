@@ -548,10 +548,9 @@ fn app_picker_inner(
     );
 
     let mut quick_options_cheat_engine = quick_options_trainer_enabled(&env.options);
-    // "GLES Native" starts out matching the effective option state (OFF by
-    // default, i.e. the bundled ANGLE backend), so the switch always shows
-    // what will actually be used when the app is launched.
-    let mut quick_options_gles_native = quick_options_gles_native_enabled(&env.options);
+    let angle_backend_available = crate::window::angle_backend_available();
+    let (mut quick_options_gles_native, quick_options_gles_native_switch_enabled) =
+        quick_options_gles_native_state(&env.options, angle_backend_available);
     let quick_options_stuff = setup_quick_options(
         env,
         delegate,
@@ -559,6 +558,7 @@ fn app_picker_inner(
         app_frame,
         quick_options_cheat_engine,
         quick_options_gles_native,
+        quick_options_gles_native_switch_enabled,
     );
     let mut quick_options_scale_hack: Option<NonZeroU32> = None;
     let mut quick_options_fullscreen: Option<()> = None;
@@ -823,7 +823,7 @@ fn app_picker_inner(
         } else if let Some(trace_gl_errors) = std::mem::take(&mut host_obj.trace_gl_errors) {
             quick_options_trace_gl_errors = trace_gl_errors;
         } else if let Some(gles_native) = std::mem::take(&mut host_obj.gles_native) {
-            quick_options_gles_native = gles_native;
+            quick_options_gles_native = gles_native || !crate::window::angle_backend_available();
         } else if let Some(fullscreen) = std::mem::take(&mut host_obj.fullscreen) {
             quick_options_fullscreen = match fullscreen {
                 false => None,
@@ -1410,6 +1410,7 @@ fn setup_quick_options(
     app_frame: CGRect,
     cheat_engine_enabled: bool,
     gles_native_enabled: bool,
+    gles_native_switch_enabled: bool,
 ) -> QuickOptionsStuff {
     // UIView*
     let main_frame = CGRect {
@@ -1482,7 +1483,7 @@ fn setup_quick_options(
         Buttons(&'static [(&'static str, &'static str)]),
         /// Dropdown listing every selectable device model.
         DeviceDropdown,
-        Switch(&'static str, bool),
+        Switch(&'static str, bool, bool),
     }
     let rows = [
         RowKind::Label("Scale hack"),
@@ -1503,20 +1504,24 @@ fn setup_quick_options(
         RowKind::Label("Device model"),
         RowKind::DeviceDropdown,
         RowKind::Label("Cheat Engine"),
-        RowKind::Switch("cheatEngine:", cheat_engine_enabled),
+        RowKind::Switch("cheatEngine:", cheat_engine_enabled, true),
         RowKind::Label("Network access"),
-        RowKind::Switch("network:", false),
+        RowKind::Switch("network:", false, true),
         RowKind::Label("Show FPS"),
-        RowKind::Switch("showFPS:", false),
+        RowKind::Switch("showFPS:", false, true),
         RowKind::Label("Trace GL errors"),
-        RowKind::Switch("traceGLErrors:", false),
+        RowKind::Switch("traceGLErrors:", false, true),
         RowKind::Label("GLES Native"),
-        RowKind::Switch("glesNative:", gles_native_enabled),
+        RowKind::Switch(
+            "glesNative:",
+            gles_native_enabled,
+            gles_native_switch_enabled,
+        ),
         RowKind::Label("Use analog sticks for tilt controls"),
-        RowKind::Switch("analogStickTiltControls:", true),
+        RowKind::Switch("analogStickTiltControls:", true, true),
         // ---- (divider for stuff skipped below)
         RowKind::Label("Fullscreen (override)"),
-        RowKind::Switch("fullscreen:", false),
+        RowKind::Switch("fullscreen:", false, true),
     ];
     let rows_len_full = rows.len();
     let rows = if crate::window::Window::rotatable_fullscreen() {
@@ -1580,7 +1585,7 @@ fn setup_quick_options(
                 device_model_items = dropdown.2;
                 device_model_thumb = dropdown.3;
             }
-            RowKind::Switch(selector, default_state) => {
+            RowKind::Switch(selector, default_state, enabled) => {
                 let switch_frame = CGRect {
                     origin: CGPoint {
                         x: main_frame.size.width / 2.0 - 94.0 / 2.0,
@@ -1592,6 +1597,7 @@ fn setup_quick_options(
                 let switch: id = msg_class![env; UISwitch alloc];
                 let switch: id = msg![env; switch initWithFrame:switch_frame];
                 () = msg![env; switch setOn:default_state];
+                () = msg![env; switch setEnabled:enabled];
                 let selector = env.objc.lookup_selector(selector).unwrap();
                 () = msg![env; switch addTarget:delegate
                                          action:selector
@@ -1878,12 +1884,9 @@ fn quick_options_trainer_argument(enabled: bool) -> &'static str {
     }
 }
 
-/// Initial state of the "GLES Native" switch: whatever the effective
-/// [`Options`] say. The app picker runs before the options files are read,
-/// so in practice this is OFF unless `--gles-native` was given on the
-/// command line.
-fn quick_options_gles_native_enabled(options: &Options) -> bool {
-    options.gles_native
+/// Returns `(native_enabled, switch_enabled)` for the probed ANGLE state.
+fn quick_options_gles_native_state(options: &Options, angle_available: bool) -> (bool, bool) {
+    (options.gles_native || !angle_available, angle_available)
 }
 
 /// Launch argument matching the "GLES Native" switch. Always emitted so that
@@ -1925,21 +1928,39 @@ mod quick_options_gles_native_tests {
     use super::*;
 
     #[test]
-    fn gles_native_toggle_defaults_off_and_emits_explicit_launch_option() {
+    fn gles_native_switch_follows_backend_availability_and_option_state() {
         let mut options = Options::default();
 
-        let mut enabled = quick_options_gles_native_enabled(&options);
+        let (mut enabled, mut switch_enabled) = quick_options_gles_native_state(&options, true);
         assert!(!enabled);
-        assert_eq!(quick_options_gles_native_argument(enabled), "--no-gles-native");
+        assert!(switch_enabled);
+        assert_eq!(
+            quick_options_gles_native_argument(enabled),
+            "--no-gles-native"
+        );
 
-        options.parse_argument("--gles-native").unwrap();
-        enabled = quick_options_gles_native_enabled(&options);
+        (enabled, switch_enabled) = quick_options_gles_native_state(&options, false);
         assert!(enabled);
+        assert!(!switch_enabled);
         assert_eq!(quick_options_gles_native_argument(enabled), "--gles-native");
 
+        options.parse_argument("--gles-native").unwrap();
+        (enabled, switch_enabled) = quick_options_gles_native_state(&options, true);
+        assert!(enabled);
+        assert!(switch_enabled);
+        assert_eq!(quick_options_gles_native_argument(enabled), "--gles-native");
+
+        (enabled, switch_enabled) = quick_options_gles_native_state(&options, false);
+        assert!(enabled);
+        assert!(!switch_enabled);
+
         options.parse_argument("--no-gles-native").unwrap();
-        enabled = quick_options_gles_native_enabled(&options);
+        (enabled, switch_enabled) = quick_options_gles_native_state(&options, true);
         assert!(!enabled);
-        assert_eq!(quick_options_gles_native_argument(enabled), "--no-gles-native");
+        assert!(switch_enabled);
+        assert_eq!(
+            quick_options_gles_native_argument(enabled),
+            "--no-gles-native"
+        );
     }
 }

@@ -556,7 +556,7 @@ impl Environment {
                 icon.ok(),
                 launch_image.map(|image| (image, false)),
                 &options,
-            )))
+            )?))
         };
 
         let mut mem = mem::Mem::new();
@@ -995,7 +995,7 @@ impl Environment {
             Some(icon),
             launch_image,
             &options,
-        )));
+        )?));
 
         let mut mem = mem::Mem::new();
 

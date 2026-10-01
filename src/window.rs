@@ -33,7 +33,20 @@ use std::env;
 use std::f32::consts::{FRAC_PI_2, PI};
 use std::num::NonZeroU32;
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+static ANDROID_ANGLE_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+
+/// Whether Quick Options may offer ANGLE; unknown support stays enabled until a context probe fails.
+pub fn angle_backend_available() -> bool {
+    !cfg!(target_os = "android") || !ANDROID_ANGLE_UNAVAILABLE.load(Ordering::Relaxed)
+}
+
+#[cfg(target_os = "android")]
+fn should_attempt_android_angle(gles_native: bool, angle_unavailable: bool) -> bool {
+    !gles_native && !angle_unavailable
+}
 
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -593,22 +606,19 @@ pub fn host_screen_size() -> Option<(u32, u32)> {
 
 /// Configure the host OpenGL ES driver on Android.
 ///
-/// This is done before creating an SDL window/context, because SDL loads EGL
-/// and GLES at context-creation time. With `use_angle == false` (the default,
-/// "GLES Native" ON) the bundled ANGLE override is cleared so SDL uses the
-/// vendor's native OpenGL ES driver (Adreno/Mali), which is the closest match
-/// to real-device behaviour and avoids ANGLE's stricter shader validation.
-/// With `use_angle == true` the bundled ANGLE libraries are preferred; if
-/// ANGLE is not loadable, SDL falls back to the system driver.
+/// This runs before creating an SDL window/context, because SDL loads EGL and
+/// GLES at context-creation time. `false` clears bundled overrides; `true`
+/// stages the ANGLE libraries when they can be loaded. A successful GL context
+/// is still checked separately to ensure ANGLE actually became active.
 #[cfg(target_os = "android")]
-fn configure_android_angle_driver(use_angle: bool) {
+fn configure_android_angle_driver(use_angle: bool) -> bool {
     if !use_angle {
         // Do not leave a stale or user-provided override pointing at the
         // bundled ANGLE; SDL will use Android's system OpenGL ES driver.
         env::remove_var("SDL_VIDEO_EGL_DRIVER");
         env::remove_var("SDL_VIDEO_GL_DRIVER");
         log!("GLES Native requested; using the Android system OpenGL ES driver.");
-        return;
+        return false;
     }
     const CANDIDATES: &[(&str, &str, &str)] = &[
         (
@@ -652,8 +662,12 @@ fn configure_android_angle_driver(use_angle: bool) {
         // ANGLE's ES 1.1 front-end also resolves higher-version entry points
         // through EGL's get-proc-address mechanism.
         env::set_var("SDL_VIDEO_GL_DRIVER", gles1);
-        log!("Using bundled ANGLE for Android OpenGL ES ({} / {}).", egl, gles1);
-        return;
+        log!(
+            "Using bundled ANGLE for Android OpenGL ES ({} / {}).",
+            egl,
+            gles1
+        );
+        return true;
     }
 
     // Do not leave a stale or user-provided override pointing at an unavailable
@@ -661,6 +675,7 @@ fn configure_android_angle_driver(use_angle: bool) {
     env::remove_var("SDL_VIDEO_EGL_DRIVER");
     env::remove_var("SDL_VIDEO_GL_DRIVER");
     log!("Bundled ANGLE is unavailable; using the Android system OpenGL ES driver.");
+    false
 }
 
 pub struct Window {
@@ -758,18 +773,104 @@ impl Window {
         }
     }
 
-    /// Create the window.
+    /// Create the window, retrying with native GLES if bundled ANGLE fails.
     pub fn new(
         title: &str,
         icon: Option<Image>,
         launch_image: Option<(Image, bool)>,
         options: &Options,
-    ) -> Window {
+    ) -> Result<Window, String> {
         #[cfg(target_os = "android")]
-        configure_android_angle_driver(!options.gles_native);
+        {
+            let angle_unavailable = ANDROID_ANGLE_UNAVAILABLE.load(Ordering::Relaxed);
+            if should_attempt_android_angle(options.gles_native, angle_unavailable) {
+                if configure_android_angle_driver(true) {
+                    match Self::new_with_configured_driver(
+                        title,
+                        icon.clone(),
+                        launch_image.clone(),
+                        options,
+                    ) {
+                        Ok(window) if window.is_angle_backend() => {
+                            ANDROID_ANGLE_UNAVAILABLE.store(false, Ordering::Relaxed);
+                            return Ok(window);
+                        }
+                        Ok(window) => {
+                            let driver = window.gl_driver_description().to_owned();
+                            ANDROID_ANGLE_UNAVAILABLE.store(true, Ordering::Relaxed);
+                            log!(
+                                "ANGLE was requested, but SDL activated a non-ANGLE driver ({}). Retrying with native GLES.",
+                                driver
+                            );
+                            drop(window);
+                            configure_android_angle_driver(false);
+                            return Self::new_with_configured_driver(
+                                title,
+                                icon,
+                                launch_image,
+                                options,
+                            )
+                            .map_err(|native_error| {
+                                format!(
+                                    "ANGLE activated a non-ANGLE driver ({}); native GLES fallback failed ({})",
+                                    driver, native_error
+                                )
+                            });
+                        }
+                        Err(angle_error) => {
+                            ANDROID_ANGLE_UNAVAILABLE.store(true, Ordering::Relaxed);
+                            log!(
+                                "Bundled ANGLE initialization failed: {}. Retrying with the Android native GLES driver.",
+                                angle_error
+                            );
+                            configure_android_angle_driver(false);
+                            return Self::new_with_configured_driver(
+                                title,
+                                icon,
+                                launch_image,
+                                options,
+                            )
+                            .map_err(|native_error| {
+                                format!(
+                                    "Bundled ANGLE initialization failed ({}); native GLES fallback failed ({})",
+                                    angle_error, native_error
+                                )
+                            });
+                        }
+                    }
+                }
 
-        let sdl_ctx = sdl2::init().unwrap();
-        let video_ctx = sdl_ctx.video().unwrap();
+                ANDROID_ANGLE_UNAVAILABLE.store(true, Ordering::Relaxed);
+                return Self::new_with_configured_driver(title, icon, launch_image, options)
+                    .map_err(|native_error| {
+                        format!(
+                            "Bundled ANGLE is unavailable and native GLES initialization failed: {}",
+                            native_error
+                        )
+                    });
+            }
+
+            if !options.gles_native && angle_unavailable {
+                log!(
+                    "Bundled ANGLE was previously unavailable; using the Android native GLES driver."
+                );
+            }
+            configure_android_angle_driver(false);
+        }
+
+        Self::new_with_configured_driver(title, icon, launch_image, options)
+    }
+
+    fn new_with_configured_driver(
+        title: &str,
+        icon: Option<Image>,
+        launch_image: Option<(Image, bool)>,
+        options: &Options,
+    ) -> Result<Window, String> {
+        let sdl_ctx = sdl2::init().map_err(|err| format!("SDL initialization failed: {}", err))?;
+        let video_ctx = sdl_ctx
+            .video()
+            .map_err(|err| format!("SDL video initialization failed: {}", err))?;
 
         // The "hidapi" feature of rust-sdl2 is enabled so that sdl2::sensor
         // is available, but we don't want to enable SDL's HIDAPI controller
@@ -827,23 +928,29 @@ impl Window {
         let mut window = if Self::rotatable_fullscreen() {
             // Without this, SDL will force fullscreen mode to be portrait.
             set_sdl2_orientation(device_orientation);
-            let screen_size = video_ctx.display_bounds(0).unwrap().size();
+            let screen_size = video_ctx
+                .display_bounds(0)
+                .map_err(|err| format!("Could not query the display bounds: {}", err))?
+                .size();
             let (width, height) = rotate_fullscreen_size(device_orientation, screen_size);
             let window = video_ctx
                 .window(title, width, height)
                 .fullscreen()
                 .opengl()
                 .build()
-                .unwrap();
+                .map_err(|err| format!("Could not create the SDL OpenGL window: {}", err))?;
             window
         } else if fullscreen {
-            let (width, height) = video_ctx.display_bounds(0).unwrap().size();
+            let (width, height) = video_ctx
+                .display_bounds(0)
+                .map_err(|err| format!("Could not query the display bounds: {}", err))?
+                .size();
             let window = video_ctx
                 .window(title, width, height)
                 .fullscreen_desktop()
                 .opengl()
                 .build()
-                .unwrap();
+                .map_err(|err| format!("Could not create the SDL OpenGL window: {}", err))?;
             window
         } else {
             let (width, height) = size_for_orientation_from_size(
@@ -857,7 +964,7 @@ impl Window {
                 .resizable()
                 .opengl()
                 .build()
-                .unwrap();
+                .map_err(|err| format!("Could not create the SDL OpenGL window: {}", err))?;
             window
         };
 
@@ -872,11 +979,17 @@ impl Window {
             window.set_icon(surface_from_image(&icon));
         }
 
-        let event_pump = sdl_ctx.event_pump().unwrap();
+        let event_pump = sdl_ctx
+            .event_pump()
+            .map_err(|err| format!("Could not initialize the SDL event pump: {}", err))?;
 
-        let controller_ctx = sdl_ctx.game_controller().unwrap();
+        let controller_ctx = sdl_ctx
+            .game_controller()
+            .map_err(|err| format!("Could not initialize SDL game controllers: {}", err))?;
 
-        let sensor_ctx = sdl_ctx.sensor().unwrap();
+        let sensor_ctx = sdl_ctx
+            .sensor()
+            .map_err(|err| format!("Could not initialize SDL sensors: {}", err))?;
         let mut accelerometer: Option<sdl2::sensor::Sensor> = None;
         let mut gyroscope: Option<sdl2::sensor::Sensor> = None;
         if let Ok(num_sensors) = sensor_ctx.num_sensors() {
@@ -1007,7 +1120,8 @@ impl Window {
             create_gles2_ctx_no_parent_stack(&mut window)
         } else {
             create_gles1_ctx_no_parent_stack(&mut window, options)
-        };
+        }
+        .map_err(|err| format!("Could not initialize an OpenGL ES context: {}", err))?;
         if options.trace_gl_errors {
             gl_ins = Box::new(LoggingGLESContext {
                 inner: gl_ins,
@@ -1071,7 +1185,7 @@ impl Window {
             window.display_splash();
         }
 
-        window
+        Ok(window)
     }
 
     /// Whether the host OpenGL stack is Google's ANGLE (OpenGL ES translated to

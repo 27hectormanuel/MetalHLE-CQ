@@ -1574,7 +1574,7 @@ pub fn create_gles1_translator_ctx(env: &mut Environment) -> Box<dyn GLESContext
 /// panicking on failure.
 pub fn create_gles1_ctx(env: &mut Environment) -> Box<dyn GLESContext> {
     env.on_parent_stack_in_coroutine(|window, options| {
-        create_gles1_ctx_no_parent_stack(window, options)
+        create_gles1_ctx_no_parent_stack(window, options).unwrap_or_else(|err| panic!("{}", err))
     })
 }
 
@@ -1722,35 +1722,55 @@ pub fn create_gles3_ctx(env: &mut Environment) -> Box<dyn GLESContext> {
 /// screen, so it must be created before the guest environment exists.
 pub fn create_gles2_ctx_no_parent_stack(
     window: &mut crate::window::Window,
-) -> Box<dyn GLESContext> {
+) -> Result<Box<dyn GLESContext>, String> {
     assert!(window.on_main_stack());
     log!("Creating an OpenGL ES 2.0 context:");
+    let mut failures = Vec::new();
 
-    log!("Trying: {}", GLES2NativeContext::description());
-    if let Ok(ctx) = GLES2NativeContext::new(window) {
-        log!("=> Success!");
-        return Box::new(ctx);
+    let description = GLES2NativeContext::description();
+    log!("Trying: {}", description);
+    match GLES2NativeContext::new(window) {
+        Ok(ctx) => {
+            log!("=> Success!");
+            return Ok(Box::new(ctx));
+        }
+        Err(err) => {
+            log!("=> Failed: {}.", err);
+            failures.push(format!("{}: {}", description, err));
+        }
     }
 
-    log!(
-        "Trying: {} (used for OpenGL ES 2.0)",
-        GLES2OnGL3Context::description()
-    );
-    if let Ok(ctx) = GLES2OnGL3Context::new(window) {
-        log!("=> Success!");
-        return Box::new(ctx);
+    let description = GLES2OnGL3Context::description();
+    log!("Trying: {} (used for OpenGL ES 2.0)", description);
+    match GLES2OnGL3Context::new(window) {
+        Ok(ctx) => {
+            log!("=> Success!");
+            return Ok(Box::new(ctx));
+        }
+        Err(err) => {
+            log!("=> Failed: {}.", err);
+            failures.push(format!("{}: {}", description, err));
+        }
     }
 
+    let description = GLES1OnGL2Context::description();
     log!(
         "Trying: {} (legacy GL 2.1 fallback for OpenGL ES 2.0)",
-        GLES1OnGL2Context::description()
+        description
     );
     match GLES1OnGL2Context::new(window) {
         Ok(ctx) => {
             log!("=> Success!");
-            Box::new(ctx)
+            Ok(Box::new(ctx))
         }
-        Err(err) => panic!("Couldn't create OpenGL ES 2.0 context: {}", err),
+        Err(err) => {
+            log!("=> Failed: {}.", err);
+            failures.push(format!("{}: {}", description, err));
+            Err(format!(
+                "Couldn't create OpenGL ES 2.0 context. Tried: {}",
+                failures.join("; ")
+            ))
+        }
     }
 }
 
@@ -1760,7 +1780,7 @@ pub fn create_gles2_ctx_no_parent_stack(
 pub fn create_gles1_ctx_no_parent_stack(
     window: &mut crate::window::Window,
     options: &crate::options::Options,
-) -> Box<dyn GLESContext> {
+) -> Result<Box<dyn GLESContext>, String> {
     assert!(window.on_main_stack());
     log!("Creating an OpenGL ES 1.1 context:");
     // Hardcoded GPU/backend pin: TOUCHHLE_FORCE_GLES1 overrides everything
@@ -1791,19 +1811,23 @@ pub fn create_gles1_ctx_no_parent_stack(
             None => GLESImplementation::GLES1_IMPLEMENTATIONS,
         },
     };
-    let mut gles1_ctx = None;
+    let mut failures = Vec::new();
     for implementation in list {
-        log!("Trying: {}", implementation.description());
+        let description = implementation.description();
+        log!("Trying: {}", description);
         match implementation.construct(window) {
             Ok(ctx) => {
                 log!("=> Success!");
-                gles1_ctx = Some(ctx);
-                break;
+                return Ok(ctx);
             }
             Err(err) => {
                 log!("=> Failed: {}.", err);
+                failures.push(format!("{}: {}", description, err));
             }
         }
     }
-    gles1_ctx.expect("Couldn't create OpenGL ES 1.1 context!")
+    Err(format!(
+        "Couldn't create OpenGL ES 1.1 context. Tried: {}",
+        failures.join("; ")
+    ))
 }
