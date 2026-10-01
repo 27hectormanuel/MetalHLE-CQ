@@ -108,7 +108,9 @@ const MAX_FRAME_POINTER_UNWIND: usize = 64;
 /// LR at `[fp + 4]`. `fp + 8` is the caller's SP. The caller's SP may be one
 /// byte past a secondary stack's inclusive upper bound, so it is checked
 /// separately from the two readable words.
-fn frame_record_caller_sp(
+///
+/// Also used by the guest-trap recovery in `Environment::debug_cpu_error`.
+pub(crate) fn frame_record_caller_sp(
     stack_range: &std::ops::RangeInclusive<u32>,
     fp: u32,
 ) -> Option<u32> {

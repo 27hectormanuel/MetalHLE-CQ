@@ -149,6 +149,10 @@ pub struct Environment {
     /// pointer. See `debug_cpu_error`.
     cpu_error_bypass_last_lr: Option<u32>,
     cpu_error_bypass_lr_count: u32,
+    /// Per-site counters for instructions dynarmic could not decode inside a
+    /// code section and that were skipped as no-ops (keyed on the fault PC).
+    /// Only used to rate-limit logging. See `debug_cpu_error`.
+    cpu_skipped_instruction_sites: HashMap<u32, u32>,
     /// A guest `exit`/`abort` had no safe frame to recover to. This is consumed
     /// at the existing return-to-host boundary so it cannot terminate the host
     /// process from inside a linked libc function.
@@ -179,6 +183,64 @@ enum ThreadNextAction {
     ReturnToHost,
     /// Debug the current CPU error.
     DebugCpuError(cpu::CpuError),
+}
+
+/// What kind of instruction raised a guest UndefinedInstruction/Breakpoint.
+/// See [Environment::classify_guest_trap].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuestTrapKind {
+    /// `udf`/`trap`/`bkpt`: the compiler or the app placed this on purpose
+    /// (`__builtin_trap()`, assertion failure, unreachable `switch` arm, …).
+    DeliberateTrap { encoding: u32 },
+    /// Some other encoding inside a code section that dynarmic refused to
+    /// decode (unsupported or unimplemented instruction). Executing the
+    /// surrounding code is still meaningful, so the right thing to do is to
+    /// step over it, not to abandon the function.
+    UndecodableInstruction { encoding: u32 },
+    /// The PC is in a code section but points at the *second* halfword of a
+    /// 32-bit `bl`/`blx <label>` (the halfword before it is a valid first
+    /// half and the "instruction" at PC is a valid second half). Execution
+    /// is misaligned with the real instruction stream, e.g. after a jump
+    /// table was indexed with a value the game never expected. Nothing
+    /// sensible can be executed from here, so this is treated like a trap.
+    MisalignedInstruction { encoding: u32 },
+    /// The PC is not inside any code section (wild jump through a bad
+    /// function pointer, execution ran off the end of a function into data,
+    /// …) or the instruction bytes could not be read.
+    OutsideCode,
+}
+
+/// A validated ARM frame record. See
+/// [Environment::validated_guest_frame_record].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GuestFrameRecord {
+    /// Address of the record (the frame pointer, r7).
+    fp: u32,
+    /// `[fp]`: the caller's frame pointer.
+    saved_fp: u32,
+    /// `[fp + 4]`: the return address (with Thumb bit) into the caller.
+    saved_lr: u32,
+    /// `fp + 8`: the caller's stack pointer after the return.
+    caller_sp: u32,
+}
+
+/// How to get the guest past a trap instruction. See
+/// [Environment::plan_guest_trap_recovery].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuestTrapRecovery {
+    /// Branch to LR, leaving SP and the frame pointer alone. This is the
+    /// historical behaviour; it is only right when the trapping function has
+    /// not pushed a frame of its own.
+    ReturnToLr,
+    /// Pop the frame record at r7: restore r7 and SP, and return to the saved
+    /// LR. Equivalent to the trapping function (or, if LR is stale, the
+    /// function that owns the record) returning 0.
+    UnwindFrame {
+        frame: GuestFrameRecord,
+        reason: &'static str,
+    },
+    /// Step over the faulting instruction and continue in the same function.
+    SkipInstruction { reason: &'static str },
 }
 
 /// If/what a thread is blocked by.
@@ -882,6 +944,7 @@ impl Environment {
             cpu_error_bypass_total: 0,
             cpu_error_bypass_last_lr: None,
             cpu_error_bypass_lr_count: 0,
+            cpu_skipped_instruction_sites: HashMap::new(),
             guest_termination_requested: false,
             missing_unity_player_archive: None,
             guest_control_flow_redirected: false,
@@ -1050,6 +1113,7 @@ impl Environment {
             cpu_error_bypass_total: 0,
             cpu_error_bypass_last_lr: None,
             cpu_error_bypass_lr_count: 0,
+            cpu_skipped_instruction_sites: HashMap::new(),
             guest_termination_requested: false,
             missing_unity_player_archive: None,
             guest_control_flow_redirected: false,
@@ -1121,6 +1185,7 @@ impl Environment {
             cpu_error_bypass_total: 0,
             cpu_error_bypass_last_lr: None,
             cpu_error_bypass_lr_count: 0,
+            cpu_skipped_instruction_sites: HashMap::new(),
             guest_termination_requested: false,
             missing_unity_player_archive: None,
             guest_control_flow_redirected: false,
@@ -2057,23 +2122,411 @@ impl Environment {
         )
     }
 
+    /// Read a guest halfword without panicking if the address is unmapped.
+    fn read_guest_u16_fallible(&self, addr: u32) -> Option<u16> {
+        let bytes = self
+            .mem
+            .get_bytes_fallible(mem::ConstVoidPtr::from_bits(addr), 2)?;
+        Some(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    /// Read a guest word without panicking if the address is unmapped.
+    fn read_guest_u32_fallible(&self, addr: u32) -> Option<u32> {
+        let bytes = self
+            .mem
+            .get_bytes_fallible(mem::ConstVoidPtr::from_bits(addr), 4)?;
+        Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    /// Whether `addr` (without Thumb bit) lies inside a machine-code section
+    /// of one of the loaded Mach-O images, or is one of dyld's synthetic
+    /// guest routines. This is used to tell "the app deliberately executed a
+    /// trap" apart from "the PC wandered off into data".
+    fn is_guest_code_address(&self, addr: u32) -> bool {
+        let addr = addr & !1;
+        if addr == 0 {
+            return false;
+        }
+        if addr == self.dyld.return_to_host_routine().addr_without_thumb_bit()
+            || addr == self.dyld.thread_exit_routine().addr_without_thumb_bit()
+        {
+            return true;
+        }
+        self.bins.iter().any(|bin| {
+            bin.sections.iter().any(|section| {
+                let is_code_section = section.type_ == mach_o::SectionType::SymbolStubs
+                    || matches!(
+                        &*section.name,
+                        "__text" | "__textcoal_nt" | "__stub_helper" | "__StaticInit"
+                    );
+                is_code_section
+                    && addr >= section.addr
+                    && addr.wrapping_sub(section.addr) < section.size
+            })
+        })
+    }
+
+    /// Decode what kind of instruction raised an UndefinedInstruction or
+    /// Breakpoint at `pc`.
+    fn classify_guest_trap(&self, pc: u32, thumb: bool, instruction_len: u32) -> GuestTrapKind {
+        if !self.is_guest_code_address(pc) {
+            return GuestTrapKind::OutsideCode;
+        }
+
+        if thumb {
+            let Some(hw1) = self.read_guest_u16_fallible(pc) else {
+                return GuestTrapKind::OutsideCode;
+            };
+            if instruction_len == 2 {
+                // UDF #imm8 (clang's `trap`/`__builtin_trap()` is `udf #0xfe`,
+                // GDB's software breakpoint is `udf #1`) and BKPT #imm8.
+                if (hw1 & 0xff00) == 0xde00 || (hw1 & 0xff00) == 0xbe00 {
+                    return GuestTrapKind::DeliberateTrap {
+                        encoding: hw1 as u32,
+                    };
+                }
+                return GuestTrapKind::UndecodableInstruction {
+                    encoding: hw1 as u32,
+                };
+            }
+            let Some(hw2) = self.read_guest_u16_fallible(pc.wrapping_add(2)) else {
+                return GuestTrapKind::OutsideCode;
+            };
+            let encoding = ((hw1 as u32) << 16) | (hw2 as u32);
+            // UDF.W #imm16: 1111 0111 1111 iiii 1010 iiii iiii iiii
+            if (hw1 & 0xfff0) == 0xf7f0 && (hw2 & 0xf000) == 0xa000 {
+                return GuestTrapKind::DeliberateTrap { encoding };
+            }
+            // Is `pc` actually the second halfword of a `bl`/`blx <label>`
+            // starting at `pc - 2`? (Seen in Asphalt 8: 0xfbea at 0x196cc,
+            // which is not a valid long-multiply encoding but is a perfectly
+            // good BL suffix.)
+            if let Some(previous_hw) = self.read_guest_u16_fallible(pc.wrapping_sub(2)) {
+                let is_bl_prefix = (previous_hw & 0xf800) == 0xf000;
+                let is_bl_suffix = (hw1 & 0xd000) == 0xd000;
+                let is_blx_suffix = (hw1 & 0xd001) == 0xc000;
+                if is_bl_prefix && (is_bl_suffix || is_blx_suffix) {
+                    return GuestTrapKind::MisalignedInstruction { encoding };
+                }
+            }
+            GuestTrapKind::UndecodableInstruction { encoding }
+        } else {
+            let Some(encoding) = self.read_guest_u32_fallible(pc) else {
+                return GuestTrapKind::OutsideCode;
+            };
+            // UDF (any condition): cccc 0111 1111 iiii iiii iiii 1111 iiii.
+            // Clang's ARM `trap` is 0xe7ffdefe, GDB uses 0xe7f001f0.
+            // BKPT: cccc 0001 0010 iiii iiii iiii 0111 iiii.
+            if (encoding & 0x0ff000f0) == 0x07f000f0 || (encoding & 0x0ff000f0) == 0x01200070 {
+                return GuestTrapKind::DeliberateTrap { encoding };
+            }
+            GuestTrapKind::UndecodableInstruction { encoding }
+        }
+    }
+
+    /// Validate the ARM frame record the frame pointer (r7) currently points
+    /// at, without touching CPU state.
+    ///
+    /// Returns `(fp, saved_fp, saved_lr, caller_sp)` if the record is inside
+    /// the current thread's stack, the chain moves toward older frames, and
+    /// the saved return address is plausible guest code (or one of dyld's
+    /// return-to-host/thread-exit sentinels).
+    fn validated_guest_frame_record(&self) -> Option<GuestFrameRecord> {
+        let stack_range = self.threads.get(self.current_thread)?.stack.clone()?;
+        let fp = self.cpu.regs()[abi::FRAME_POINTER];
+        let sp = self.cpu.regs()[cpu::Cpu::SP];
+
+        // The record must be at or above SP: a frame pointer below the stack
+        // pointer is not the live frame (e.g. a stale r7 left behind after a
+        // function that doesn't maintain frame pointers reused the register).
+        if fp < sp {
+            return None;
+        }
+        // The diagnostic frame `call_from_host` builds must not be popped by
+        // us: its saved LR is the interrupted guest LR, not a return address
+        // through the host boundary.
+        if self.is_host_to_guest_stack_frame(fp) {
+            return None;
+        }
+        let caller_sp = libc::cxxabi::frame_record_caller_sp(&stack_range, fp)?;
+        let saved_fp = self.read_guest_u32_fallible(fp)?;
+        let saved_lr = self.read_guest_u32_fallible(fp.wrapping_add(4))?;
+
+        let saved_fp_is_valid = saved_fp == 0
+            || (saved_fp > fp
+                && libc::cxxabi::frame_record_caller_sp(&stack_range, saved_fp).is_some());
+        if !saved_fp_is_valid {
+            return None;
+        }
+        if !self.is_guest_code_address(saved_lr) {
+            return None;
+        }
+        Some(GuestFrameRecord {
+            fp,
+            saved_fp,
+            saved_lr,
+            caller_sp,
+        })
+    }
+
+    /// Decode the call instruction that produced the return address `lr`
+    /// and report whether its branch target is consistent with `lr` being
+    /// the return address *of the function that contains `fault_pc`*.
+    ///
+    /// Returns `Some(false)` when the call site definitely went somewhere
+    /// else — i.e. LR is a stale value left behind by an earlier call that
+    /// already returned, and "returning" to it would land in the middle of
+    /// the function that trapped. Returns `None` when the call was indirect
+    /// (`blx Rm`) or no call instruction precedes `lr`.
+    fn lr_is_consistent_with_fault(&self, lr: u32, fault_pc: u32) -> Option<bool> {
+        let (call_site, target) = decode_direct_call_before(
+            lr,
+            |addr| self.read_guest_u16_fallible(addr),
+            |addr| self.read_guest_u32_fallible(addr),
+        )?;
+        Some(direct_call_is_consistent_with_fault(
+            call_site, target, fault_pc,
+        ))
+    }
+
+    /// If `addr` is inside a symbol stub section, the name of the symbol the
+    /// stub jumps to (i.e. the dynamically linked function being called).
+    fn symbol_stub_name_at(&self, addr: u32) -> Option<&str> {
+        let addr = addr & !1;
+        self.bins.iter().find_map(|bin| {
+            bin.sections.iter().find_map(|section| {
+                if section.type_ != mach_o::SectionType::SymbolStubs
+                    || addr < section.addr
+                    || addr.wrapping_sub(section.addr) >= section.size
+                {
+                    return None;
+                }
+                let info = section.dyld_indirect_symbol_info.as_ref()?;
+                let index = (addr - section.addr) / info.entry_size;
+                info.indirect_undef_symbols
+                    .get(index as usize)?
+                    .as_deref()
+            })
+        })
+    }
+
+    /// Human-readable description of the call that produced the return
+    /// address `lr`, for trap diagnostics: where the call is, where it went,
+    /// and (if the target is a symbol stub) which linked function that is.
+    fn describe_call_site_before(&self, lr: u32) -> String {
+        match decode_direct_call_before(
+            lr,
+            |addr| self.read_guest_u16_fallible(addr),
+            |addr| self.read_guest_u32_fallible(addr),
+        ) {
+            Some((call_site, target)) => match self.symbol_stub_name_at(target) {
+                Some(name) => format!(
+                    "LR comes from a call at {call_site:#x} to {target:#x}, \
+                     which is the symbol stub for {name}"
+                ),
+                None => format!("LR comes from a call at {call_site:#x} to {target:#x}"),
+            },
+            None => "LR does not follow a direct bl/blx <label> (indirect call or not a \
+                     return address)"
+                .to_string(),
+        }
+    }
+
+    /// Hex dump of the guest halfwords around `pc` (Thumb) or words (ARM),
+    /// for trap diagnostics. The faulting location is marked with brackets.
+    fn dump_guest_code_around(&self, pc: u32, thumb: bool) -> String {
+        let mut out = String::new();
+        let start = if thumb {
+            pc.wrapping_sub(16) & !1
+        } else {
+            pc.wrapping_sub(16) & !3
+        };
+        if thumb {
+            for i in 0..16u32 {
+                let addr = start.wrapping_add(i * 2);
+                let text = match self.read_guest_u16_fallible(addr) {
+                    Some(hw) => format!("{hw:04x}"),
+                    None => "????".to_string(),
+                };
+                if addr == pc {
+                    out.push_str(&format!("[{text}] "));
+                } else {
+                    out.push_str(&text);
+                    out.push(' ');
+                }
+            }
+        } else {
+            for i in 0..8u32 {
+                let addr = start.wrapping_add(i * 4);
+                let text = match self.read_guest_u32_fallible(addr) {
+                    Some(word) => format!("{word:08x}"),
+                    None => "????????".to_string(),
+                };
+                if addr == pc {
+                    out.push_str(&format!("[{text}] "));
+                } else {
+                    out.push_str(&text);
+                    out.push(' ');
+                }
+            }
+        }
+        format!("bytes from {start:#x}: {}", out.trim_end())
+    }
+
+    /// Choose how to get the guest past a deliberate trap at `pc` (an
+    /// instruction inside a code section). `lr_bypass_is_not_progressing`
+    /// is set once branching to LR has already been tried several times for
+    /// this exact (PC, LR) pair without getting anywhere. This only inspects
+    /// state; [Self::apply_guest_trap_recovery] performs the change.
+    fn plan_guest_trap_recovery(
+        &self,
+        pc: u32,
+        lr: u32,
+        lr_bypass_is_not_progressing: bool,
+    ) -> GuestTrapRecovery {
+        let frame = self.validated_guest_frame_record();
+
+        // If the trapping function pushed its own `{r7, lr}` record and has
+        // not called anything since, the saved LR equals the live LR. Popping
+        // the record is then exactly a return from the trapping function —
+        // including restoring SP and r7, which a bare branch to LR does not.
+        let current_function_owns_frame = frame.is_some_and(|f| f.saved_lr == lr);
+
+        // LR is stale if it isn't a return address at all, or if the call that
+        // produced it targeted some other function (which has since returned).
+        // Branching to a stale LR re-executes the trapping function from the
+        // middle, which typically leads straight back to the same trap.
+        let lr_is_stale = !self.is_guest_code_address(lr)
+            || self.lr_is_consistent_with_fault(lr, pc) == Some(false);
+
+        if let Some(frame) = frame {
+            if current_function_owns_frame {
+                return GuestTrapRecovery::UnwindFrame {
+                    frame,
+                    reason: "the trapping function owns the frame record",
+                };
+            }
+            if lr_is_stale {
+                return GuestTrapRecovery::UnwindFrame {
+                    frame,
+                    reason: "LR is stale (not this function's return address)",
+                };
+            }
+            if lr_bypass_is_not_progressing {
+                return GuestTrapRecovery::UnwindFrame {
+                    frame,
+                    reason: "branching to LR keeps re-trapping at the same site",
+                };
+            }
+        }
+
+        if (lr & !1) == pc {
+            // Pathological self-loop: LR points right back at the trap we
+            // just hit (e.g. `bl noreturn_function` whose host stub returned,
+            // followed by a trap). Branching to LR would re-enter it.
+            return GuestTrapRecovery::SkipInstruction {
+                reason: "LR re-enters the same instruction",
+            };
+        }
+
+        GuestTrapRecovery::ReturnToLr
+    }
+
+    /// Perform the CPU-state change chosen by [Self::plan_guest_trap_recovery]
+    /// for a trap at `pc` of length `instruction_len`.
+    fn apply_guest_trap_recovery(
+        &mut self,
+        recovery: GuestTrapRecovery,
+        pc: u32,
+        instruction_len: u32,
+    ) {
+        match recovery {
+            GuestTrapRecovery::ReturnToLr => {
+                // Instead of skipping forward through garbage data, pretend
+                // the faulting function returned to its caller.
+                let lr = self.cpu.regs()[cpu::Cpu::LR];
+                self.cpu.branch(GuestFunction::from_addr_with_thumb_bit(lr));
+            }
+            GuestTrapRecovery::UnwindFrame { frame, .. } => {
+                // The resumed function's own return address is in the next
+                // record up the chain. Restore it into LR too (like
+                // `unwind_to_app_frame` does) so a `bx lr`-style epilogue
+                // can't jump back into the frame we just abandoned; if it
+                // can't be validated, thread exit is the safe terminal
+                // continuation.
+                let return_to_host = self.dyld.return_to_host_routine().addr_with_thumb_bit();
+                let thread_exit = self.dyld.thread_exit_routine().addr_with_thumb_bit();
+                let caller_lr = if frame.saved_fp == 0 {
+                    thread_exit
+                } else {
+                    match self.read_guest_u32_fallible(frame.saved_fp.wrapping_add(4)) {
+                        Some(candidate)
+                            if candidate == return_to_host
+                                || candidate == thread_exit
+                                || self.is_guest_code_address(candidate) =>
+                        {
+                            candidate
+                        }
+                        _ => thread_exit,
+                    }
+                };
+                let regs = self.cpu.regs_mut();
+                regs[abi::FRAME_POINTER] = frame.saved_fp;
+                regs[cpu::Cpu::SP] = frame.caller_sp;
+                regs[cpu::Cpu::LR] = caller_lr;
+                regs[0] = 0;
+                self.cpu
+                    .branch(GuestFunction::from_addr_with_thumb_bit(frame.saved_lr));
+            }
+            GuestTrapRecovery::SkipInstruction { .. } => {
+                // Advance past the faulting instruction so the guest makes
+                // forward progress, and clear the bypass counters since we're
+                // no longer bypassing the same site.
+                self.cpu.regs_mut()[cpu::Cpu::PC] = pc.wrapping_add(instruction_len);
+                self.cpu_error_bypass_last = None;
+                self.cpu_error_bypass_count = 0;
+                self.cpu_error_bypass_last_lr = None;
+                self.cpu_error_bypass_lr_count = 0;
+            }
+        }
+    }
+
     #[cold]
     /// Let the debugger handle a CPU error. Without one, use bounded
     /// best-effort recovery for guest traps; unhandled cases panic.
     fn debug_cpu_error(&mut self, error: cpu::CpuError) {
-        let instruction_len = if (self.cpu.cpsr() & cpu::Cpu::CPSR_THUMB) != 0 {
-            2
-        } else {
-            4
-        };
+        let is_thumb = (self.cpu.cpsr() & cpu::Cpu::CPSR_THUMB) != 0;
+        // The instruction length this code historically *assumed*: 2 bytes in
+        // Thumb state, 4 in ARM state. Thumb-2 instructions can be 4 bytes
+        // long though, so this is only a fallback (see below).
+        let assumed_instruction_len: u32 = if is_thumb { 2 } else { 4 };
 
         let is_undefined_instruction = matches!(error, cpu::CpuError::UndefinedInstruction);
-        if Self::is_recoverable_guest_cpu_error(&error) {
+        let is_recoverable = Self::is_recoverable_guest_cpu_error(&error);
+
+        // After an UndefinedInstruction/Breakpoint, dynarmic leaves PC on the
+        // *next* instruction. The legacy rewind (`next_pc - 2` in Thumb state)
+        // lands in the middle of a 32-bit Thumb-2 encoding; the Android
+        // workarounds below were tuned against that value, so keep it for
+        // them, but use dynarmic's exact fault address for everything else.
+        let next_pc = self.cpu.regs()[cpu::Cpu::PC];
+        let legacy_pc = next_pc.wrapping_sub(assumed_instruction_len);
+        let (fault_pc, instruction_len) = if is_recoverable {
+            let exact_pc = self.cpu.last_exception_pc();
+            match next_pc.wrapping_sub(exact_pc) {
+                len @ (2 | 4) if is_thumb || len == 4 => (exact_pc, len),
+                _ => (legacy_pc, assumed_instruction_len),
+            }
+        } else {
+            (next_pc, assumed_instruction_len)
+        };
+
+        if is_recoverable {
             // Rewind the PC so that it's at the instruction where the error
             // occurred, rather than the next instruction. This is necessary for
             // GDB to detect its software breakpoints. For some reason this
             // isn't correct for memory errors however.
-            self.cpu.regs_mut()[cpu::Cpu::PC] -= instruction_len;
+            self.cpu.regs_mut()[cpu::Cpu::PC] = fault_pc;
         }
 
         if self.gdb_server.is_none() {
@@ -2086,8 +2539,13 @@ impl Environment {
             // this indicates we are looping forever (LR itself points back
             // through an infinite chain of guest traps). In that case, the
             // recovery logic below skips the faulting instruction.
-            if Self::is_recoverable_guest_cpu_error(&error) {
-                let pc = self.cpu.regs()[cpu::Cpu::PC];
+            if is_recoverable {
+                // NOTE: `pc` here is the legacy rewind value the Android
+                // workarounds below expect (`next_pc - 2` in Thumb state,
+                // which may be the *second* halfword of a 32-bit Thumb-2
+                // instruction). The generic recovery further down uses the
+                // exact `fault_pc` instead.
+                let pc = legacy_pc;
                 let lr = self.cpu.regs()[cpu::Cpu::LR];
                 // Potato Story Android hard fallback applies only to UDFs:
                 //
@@ -2271,6 +2729,57 @@ impl Environment {
                     }
                 }
 
+                // ---- Generic guest-trap recovery ----
+                //
+                // From here on use dynarmic's exact fault address; the legacy
+                // `pc` above may point into the middle of a Thumb-2 encoding.
+                let pc = fault_pc;
+                let trap_kind = self.classify_guest_trap(pc, is_thumb, instruction_len);
+
+                // A real instruction in a code section that dynarmic simply
+                // could not decode (unsupported/unimplemented encoding) is
+                // not an abort: the function it sits in is meant to keep
+                // running. Step over it as a no-op. This is deliberately kept
+                // out of the bypass counters below: an unsupported
+                // instruction in a hot loop would otherwise trip the
+                // same-LR runaway panic even though the guest is making
+                // perfectly good progress.
+                if let GuestTrapKind::UndecodableInstruction { encoding } = trap_kind {
+                    let site_count = self
+                        .cpu_skipped_instruction_sites
+                        .entry(pc)
+                        .or_insert(0);
+                    *site_count = site_count.saturating_add(1);
+                    let site_count = *site_count;
+                    if site_count == 1 || site_count == 1024 || site_count == 1 << 20 {
+                        log_no_panic!(
+                            "Warning: {:?} at {:#x} (encoding {:#x}, thumb={}, {} bytes) \
+                             is inside a code section but is not a trap instruction, \
+                             so dynarmic could not decode it. Skipping it as a no-op \
+                             and continuing at {:#x}. LR={:#x}. (seen {} times at this \
+                             site)",
+                            error,
+                            pc,
+                            encoding,
+                            is_thumb,
+                            instruction_len,
+                            pc.wrapping_add(instruction_len),
+                            lr,
+                            site_count
+                        );
+                    }
+                    if site_count == 1 {
+                        log_no_panic!(
+                            "Undecodable instruction diagnostics: {}. {}.",
+                            self.dump_guest_code_around(pc, is_thumb),
+                            self.describe_call_site_before(lr)
+                        );
+                        self.stack_trace_current();
+                    }
+                    self.cpu.regs_mut()[cpu::Cpu::PC] = pc.wrapping_add(instruction_len);
+                    return;
+                }
+
                 // Track repeated occurrences of the same bypass site.
                 const BYPASS_LIMIT: u32 = 256;
                 const LOG_RATE: u32 = 32;
@@ -2327,24 +2836,128 @@ impl Environment {
                     );
                 }
 
-                // Log the first sight of each new bypass site, but keyed on
-                // the *total* count so guests that cycle through many distinct
+                // Decide how to recover *before* logging so the log says what
+                // actually happened.
+                //
+                // For a deliberate trap (`udf`/`trap`/`bkpt`) inside real
+                // code we can reason about the frame: the historical "branch
+                // to LR" is only correct if the trapping function has not
+                // pushed a frame and LR really is its return address. It is
+                // wrong in two common situations:
+                //
+                //  * LR is stale. Example (Asphalt 8 startup): a function
+                //    calls something at 0x1e3c2 (LR=0x1e3c7), that call
+                //    returns normally, and ~0x6b bytes later the *same*
+                //    function hits a `trap` at 0x1e432. LR still holds
+                //    0x1e3c7, so "returning" to it just re-runs the same
+                //    code and re-traps — 256 identical bypasses in a row,
+                //    then falling off the trap into whatever follows it.
+                //  * The trapping function has pushed `{r7, lr}`. Branching to
+                //    LR without restoring SP/r7 leaves the caller running on
+                //    the callee's frame; its epilogue then pops the callee's
+                //    record and "returns" into itself a second time.
+                //
+                // In both cases popping the validated frame record at r7
+                // (restore r7 and SP, return 0 to the saved LR) is the
+                // correct recovery, mirroring what `abort()`/`exit()`
+                // recovery already does in `libc::cxxabi::unwind_to_app_frame`.
+                //
+                // The static call-site analysis cannot see through indirect
+                // calls (`blx Rm`), so there is also a dynamic escalation:
+                // once the very same (PC, LR) pair has been bypassed
+                // `UNWIND_AFTER_REPEATS` times, branching to LR has evidently
+                // not moved the guest forward, and the frame is popped
+                // instead (if one can be validated) long before the
+                // `BYPASS_LIMIT` fall-through-the-trap last resort.
+                //
+                // Outside code sections (wild PC) the instruction bytes and
+                // call-site analysis are meaningless, so only the dynamic
+                // escalation applies on top of the legacy branch-to-LR.
+                const UNWIND_AFTER_REPEATS: u32 = 4;
+                let recovery = match trap_kind {
+                    GuestTrapKind::DeliberateTrap { .. }
+                    | GuestTrapKind::MisalignedInstruction { .. } => {
+                        self.plan_guest_trap_recovery(pc, lr, count >= UNWIND_AFTER_REPEATS)
+                    }
+                    GuestTrapKind::OutsideCode if (lr & !1) == pc => {
+                        GuestTrapRecovery::SkipInstruction {
+                            reason: "LR re-enters the same instruction",
+                        }
+                    }
+                    GuestTrapKind::OutsideCode if count >= UNWIND_AFTER_REPEATS => {
+                        match self.validated_guest_frame_record() {
+                            Some(frame) => GuestTrapRecovery::UnwindFrame {
+                                frame,
+                                reason: "branching to LR keeps re-trapping at the same site",
+                            },
+                            None => GuestTrapRecovery::ReturnToLr,
+                        }
+                    }
+                    _ => GuestTrapRecovery::ReturnToLr,
+                };
+
+                // Log the first sight of each new bypass site (and the point
+                // where the recovery strategy may escalate), but keyed on the
+                // *total* count so guests that cycle through many distinct
                 // (PC, LR) pairs stop flooding the log after LOG_RATE lines.
-                if total <= LOG_RATE && (count == 1 || count % LOG_RATE == 0) {
+                if total <= LOG_RATE
+                    && (count == 1 || count == UNWIND_AFTER_REPEATS || count % LOG_RATE == 0)
+                {
+                    let trap_description = match trap_kind {
+                        GuestTrapKind::DeliberateTrap { encoding } => {
+                            format!("deliberate trap instruction, encoding {encoding:#x}")
+                        }
+                        GuestTrapKind::UndecodableInstruction { encoding } => {
+                            format!("undecodable instruction, encoding {encoding:#x}")
+                        }
+                        GuestTrapKind::MisalignedInstruction { encoding } => format!(
+                            "PC is the second halfword of a bl/blx at {:#x}, execution is \
+                             misaligned with the instruction stream; encoding {encoding:#x}",
+                            pc.wrapping_sub(2)
+                        ),
+                        GuestTrapKind::OutsideCode => "PC is outside any code section".to_string(),
+                    };
+                    let recovery_description = match recovery {
+                        GuestTrapRecovery::ReturnToLr => {
+                            format!("Faking function return to LR ({lr:#x}) to bypass the guest trap.")
+                        }
+                        GuestTrapRecovery::UnwindFrame { frame, reason } => format!(
+                            "Unwinding the frame record at r7={:#x} (saved r7={:#x}, \
+                             saved LR={:#x}, caller SP={:#x}) and returning 0 to bypass \
+                             the guest trap, because {}.",
+                            frame.fp, frame.saved_fp, frame.saved_lr, frame.caller_sp, reason
+                        ),
+                        GuestTrapRecovery::SkipInstruction { reason } => format!(
+                            "Skipping the faulting instruction (continuing at {:#x}), because {}.",
+                            pc.wrapping_add(instruction_len),
+                            reason
+                        ),
+                    };
                     log_no_panic!(
-                        "Warning: Ignored {:?} at {:#x}. \
-                         Faking function return to LR ({:#x}) to bypass the guest trap. \
-                         cpsr={:#x} thumb={} instruction_len={} \
+                        "Warning: Ignored {:?} at {:#x} ({}). {} \
+                         LR={:#x} cpsr={:#x} thumb={} instruction_len={} \
                          (occurrence {} of at most {})",
                         error,
                         pc,
+                        trap_description,
+                        recovery_description,
                         lr,
                         self.cpu.cpsr(),
-                        (self.cpu.cpsr() & cpu::Cpu::CPSR_THUMB) != 0,
+                        is_thumb,
                         instruction_len,
                         count,
                         BYPASS_LIMIT
                     );
+                    if count == 1 {
+                        log_no_panic!(
+                            "Guest trap diagnostics: {}. {}.",
+                            self.dump_guest_code_around(pc, is_thumb),
+                            self.describe_call_site_before(lr)
+                        );
+                        if trap_kind != GuestTrapKind::OutsideCode {
+                            self.stack_trace_current();
+                        }
+                    }
                 } else if total == LOG_RATE + 1 {
                     log_no_panic!(
                         "Warning: Ignored guest-trap bypass still active \
@@ -2358,7 +2971,7 @@ impl Environment {
 
                 if count >= BYPASS_LIMIT {
                     // The same (PC, LR) pair has trapped BYPASS_LIMIT times.
-                    // Faking a return to LR clearly does not help — the caller
+                    // The chosen recovery clearly does not help — the caller
                     // keeps re-entering the faulting site (usually a framework
                     // stub that returned bogus data the guest re-calls into).
                     // Rather than killing the whole emulator, degrade
@@ -2372,7 +2985,7 @@ impl Environment {
                     if count == BYPASS_LIMIT || count % (BYPASS_LIMIT * 4) == 0 {
                         log_no_panic!(
                             "Warning: {:?} at {:#x} looped {} times with LR={:#x}. \
-                             Faking returns is not making progress, so skipping \
+                             Bypassing it is not making progress, so skipping \
                              the faulting instruction instead. This usually means \
                              a framework stub returned data the guest keeps \
                              re-trapping on.",
@@ -2390,32 +3003,7 @@ impl Environment {
                     return;
                 }
 
-                // Pathological self-loop: when LR (with Thumb bit cleared)
-                // points right back at the trap we just hit, branching to LR
-                // would re-enter it and burn through BYPASS_LIMIT. Skip past
-                // the faulting instruction instead so the guest makes forward
-                // progress, and clear the bypass counter since we're no
-                // longer bypassing the same site.
-                if (lr & !1) == pc {
-                    log_no_panic!(
-                        "Warning: {:?} self-loop at {:#x} (LR={:#x} re-enters the \
-                         same instruction). Advancing past it instead of \
-                         branching to LR.",
-                        error,
-                        pc,
-                        lr
-                    );
-                    self.cpu.regs_mut()[cpu::Cpu::PC] = pc.wrapping_add(instruction_len);
-                    self.cpu_error_bypass_last = None;
-                    self.cpu_error_bypass_count = 0;
-                    self.cpu_error_bypass_last_lr = None;
-                    self.cpu_error_bypass_lr_count = 0;
-                    return;
-                }
-
-                // Instead of skipping forward through garbage data, pretend the
-                // faulting function returned to its caller.
-                self.cpu.branch(GuestFunction::from_addr_with_thumb_bit(lr));
+                self.apply_guest_trap_recovery(recovery, pc, instruction_len);
                 return;
             }
 
@@ -3174,6 +3762,216 @@ impl Drop for Environment {
             *self = env;
         }
         ENVIRONMENT_INSTANCE_EXISTS.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Decode the direct call instruction (`bl`/`blx <label>`) that produced the
+/// return address `lr`, using the supplied fallible guest-memory readers.
+///
+/// Returns `(call_site, target)` with both addresses lacking the Thumb bit.
+/// Returns `None` for indirect calls (`blx Rm`), for return addresses not
+/// preceded by a call instruction, and for unreadable memory.
+fn decode_direct_call_before(
+    lr: u32,
+    read_u16: impl Fn(u32) -> Option<u16>,
+    read_u32: impl Fn(u32) -> Option<u32>,
+) -> Option<(u32, u32)> {
+    let return_addr = lr & !1;
+    let lr_is_thumb = (lr & 1) != 0;
+
+    if lr_is_thumb {
+        // 16-bit `blx Rm`: 0100 0111 1mmm m000
+        let last_hw = read_u16(return_addr.wrapping_sub(2))?;
+        if (last_hw & 0xff87) == 0x4780 {
+            return None;
+        }
+        // 32-bit BL / BLX <label>:
+        //   hw1 = 11110 S imm10, hw2 = 11 J1 1 J2 imm11 (BL)
+        //                        hw2 = 11 J1 0 J2 imm10H 0 (BLX)
+        let call_site = return_addr.wrapping_sub(4);
+        let hw1 = read_u16(call_site)?;
+        let hw2 = last_hw;
+        let is_bl_prefix = (hw1 & 0xf800) == 0xf000;
+        let is_bl_suffix = (hw2 & 0xd000) == 0xd000;
+        let is_blx_suffix = (hw2 & 0xd001) == 0xc000;
+        if !is_bl_prefix || !(is_bl_suffix || is_blx_suffix) {
+            return None;
+        }
+        let is_blx = (hw2 & 0x1000) == 0;
+        let s = ((hw1 >> 10) & 1) as u32;
+        let j1 = ((hw2 >> 13) & 1) as u32;
+        let j2 = ((hw2 >> 11) & 1) as u32;
+        let i1 = (!(j1 ^ s)) & 1;
+        let i2 = (!(j2 ^ s)) & 1;
+        let imm10 = (hw1 & 0x03ff) as u32;
+        let imm11 = (hw2 & 0x07ff) as u32;
+        let raw = (s << 24) | (i1 << 23) | (i2 << 22) | (imm10 << 12) | (imm11 << 1);
+        // Sign-extend from 25 bits.
+        let imm32 = (((raw << 7) as i32) >> 7) as u32;
+        let base = if is_blx {
+            call_site.wrapping_add(4) & !3
+        } else {
+            call_site.wrapping_add(4)
+        };
+        Some((call_site, base.wrapping_add(imm32)))
+    } else {
+        let call_site = return_addr.wrapping_sub(4);
+        let insn = read_u32(call_site)?;
+        // BLX Rm: cccc 0001 0010 1111 1111 1111 0011 mmmm
+        if (insn & 0x0fff_fff0) == 0x012f_ff30 {
+            return None;
+        }
+        let imm24 = insn & 0x00ff_ffff;
+        let offset = (((imm24 << 8) as i32) >> 6) as u32;
+        // The BLX check must come first: its "condition" field is 0b1111.
+        if (insn & 0xfe00_0000) == 0xfa00_0000 {
+            // BLX <label> (always switches to Thumb)
+            let h = (insn >> 24) & 1;
+            Some((
+                call_site,
+                call_site
+                    .wrapping_add(8)
+                    .wrapping_add(offset)
+                    .wrapping_add(h << 1),
+            ))
+        } else if (insn & 0x0f00_0000) == 0x0b00_0000 {
+            // BL <label>
+            Some((call_site, call_site.wrapping_add(8).wrapping_add(offset)))
+        } else {
+            None
+        }
+    }
+}
+
+/// Given a direct call at `call_site` to `target`, could the function that
+/// contains `fault_pc` be the callee? If not, the return address produced by
+/// that call is stale with respect to the trap at `fault_pc`.
+fn direct_call_is_consistent_with_fault(call_site: u32, target: u32, fault_pc: u32) -> bool {
+    // The function that trapped must start at or before `fault_pc`, so a
+    // call that branched *past* the trap can't have called it.
+    if target > fault_pc {
+        return false;
+    }
+    // When the call site precedes the trap, the callee must also start after
+    // the call site: functions are contiguous, so a target at or before the
+    // call site is either the caller itself (recursion, which is handled via
+    // the frame record) or some unrelated function that has since returned.
+    if call_site < fault_pc && target <= call_site {
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod guest_trap_call_site_tests {
+    use super::*;
+
+    fn readers(
+        code: &[(u32, u16)],
+    ) -> (
+        impl Fn(u32) -> Option<u16> + '_,
+        impl Fn(u32) -> Option<u32> + '_,
+    ) {
+        let read_u16 = move |addr: u32| {
+            code.iter()
+                .find(|(a, _)| *a == addr)
+                .map(|(_, v)| *v)
+        };
+        let read_u32 = move |addr: u32| {
+            let lo = code.iter().find(|(a, _)| *a == addr).map(|(_, v)| *v)?;
+            let hi = code
+                .iter()
+                .find(|(a, _)| *a == addr.wrapping_add(2))
+                .map(|(_, v)| *v)?;
+            Some((lo as u32) | ((hi as u32) << 16))
+        };
+        (read_u16, read_u32)
+    }
+
+    #[test]
+    fn decodes_thumb_bl_forward_and_backward() {
+        // 0x8000: f000 f802  bl 0x8008
+        let code = [(0x8000, 0xf000), (0x8002, 0xf802)];
+        let (r16, r32) = readers(&code);
+        assert_eq!(decode_direct_call_before(0x8005, r16, r32), Some((0x8000, 0x8008)));
+
+        // 0x8000: f7ff ff00  bl 0x7e04
+        let code = [(0x8000, 0xf7ff), (0x8002, 0xff00)];
+        let (r16, r32) = readers(&code);
+        assert_eq!(decode_direct_call_before(0x8005, r16, r32), Some((0x8000, 0x7e04)));
+
+        // 0x1000: f7ff fffe  bl . (offset -4)
+        let code = [(0x1000, 0xf7ff), (0x1002, 0xfffe)];
+        let (r16, r32) = readers(&code);
+        assert_eq!(decode_direct_call_before(0x1005, r16, r32), Some((0x1000, 0x1000)));
+    }
+
+    #[test]
+    fn decodes_thumb_blx_label_with_word_alignment() {
+        // 0x8002: f000 e800  blx 0x8004 (Align(PC, 4) + 0)
+        let code = [(0x8002, 0xf000), (0x8004, 0xe800)];
+        let (r16, r32) = readers(&code);
+        assert_eq!(decode_direct_call_before(0x8007, r16, r32), Some((0x8002, 0x8004)));
+    }
+
+    #[test]
+    fn indirect_thumb_calls_are_not_decoded() {
+        // 0x8002: 4798  blx r3
+        let code = [(0x8000, 0xf000), (0x8002, 0x4798)];
+        let (r16, r32) = readers(&code);
+        assert_eq!(decode_direct_call_before(0x8005, r16, r32), None);
+    }
+
+    #[test]
+    fn non_call_instructions_before_lr_are_not_decoded() {
+        // 0x8000: 2000 bx lr-ish garbage, 0x8002: 4770 bx lr
+        let code = [(0x8000, 0x2000), (0x8002, 0x4770)];
+        let (r16, r32) = readers(&code);
+        assert_eq!(decode_direct_call_before(0x8005, r16, r32), None);
+        // Unreadable memory.
+        let (r16, r32) = readers(&[]);
+        assert_eq!(decode_direct_call_before(0x8005, r16, r32), None);
+    }
+
+    #[test]
+    fn decodes_arm_bl_and_blx() {
+        // 0x1000: eb000000  bl 0x1008
+        let code = [(0x1000, 0x0000), (0x1002, 0xeb00)];
+        let (r16, r32) = readers(&code);
+        assert_eq!(decode_direct_call_before(0x1004, r16, r32), Some((0x1000, 0x1008)));
+
+        // 0x1000: ebfffffe  bl . (offset -8)
+        let code = [(0x1000, 0xfffe), (0x1002, 0xebff)];
+        let (r16, r32) = readers(&code);
+        assert_eq!(decode_direct_call_before(0x1004, r16, r32), Some((0x1000, 0x1000)));
+
+        // 0x1000: fb000000  blx 0x100a (H=1), must not be mistaken for BL
+        let code = [(0x1000, 0x0000), (0x1002, 0xfb00)];
+        let (r16, r32) = readers(&code);
+        assert_eq!(decode_direct_call_before(0x1004, r16, r32), Some((0x1000, 0x100a)));
+
+        // 0x1000: e12fff33  blx r3
+        let code = [(0x1000, 0xff33), (0x1002, 0xe12f)];
+        let (r16, r32) = readers(&code);
+        assert_eq!(decode_direct_call_before(0x1004, r16, r32), None);
+    }
+
+    #[test]
+    fn stale_lr_is_detected_from_the_call_target() {
+        // Asphalt 8 shape: `bl` at 0x1e3c2 (LR=0x1e3c7), trap at 0x1e432 in
+        // the same function. A call to anything outside (0x1e3c2, 0x1e432]
+        // can't have produced a return address for the trapping function.
+        assert!(!direct_call_is_consistent_with_fault(0x1e3c2, 0x1e000, 0x1e432));
+        assert!(!direct_call_is_consistent_with_fault(0x1e3c2, 0x1e3c2, 0x1e432));
+        assert!(!direct_call_is_consistent_with_fault(0x1e3c2, 0x2a000, 0x1e432));
+        // A leaf callee located between the call site and the trap is a
+        // plausible owner of the trap, so LR may be genuine.
+        assert!(direct_call_is_consistent_with_fault(0x1e3c2, 0x1e400, 0x1e432));
+        assert!(direct_call_is_consistent_with_fault(0x1e3c2, 0x1e432, 0x1e432));
+        // Callee located before the caller: can't tell, so assume genuine.
+        assert!(direct_call_is_consistent_with_fault(0x2000, 0x1000, 0x1010));
+        // ...unless the call went past the trap.
+        assert!(!direct_call_is_consistent_with_fault(0x2000, 0x3000, 0x1010));
     }
 }
 

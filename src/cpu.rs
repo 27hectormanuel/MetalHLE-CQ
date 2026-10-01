@@ -222,6 +222,21 @@ impl Cpu {
         unsafe { touchHLE_DynarmicWrapper_set_cpsr(self.dynarmic_wrapper, cpsr) }
     }
 
+    /// Start address of the instruction that raised the most recent
+    /// [CpuError::UndefinedInstruction] or [CpuError::Breakpoint].
+    ///
+    /// When dynarmic raises one of these exceptions it leaves the PC register
+    /// pointing at the *next* instruction, and because Thumb instructions can
+    /// be either 2 or 4 bytes long, the faulting address can't be recovered
+    /// from the register file alone. Dynarmic does pass the exact address to
+    /// the exception callback though, so the wrapper records it.
+    ///
+    /// Only meaningful immediately after [Self::run_or_step] returned one of
+    /// the errors above; the value is stale at any other time.
+    pub fn last_exception_pc(&self) -> VAddr {
+        unsafe { touchHLE_DynarmicWrapper_last_exception_pc(self.dynarmic_wrapper) }
+    }
+
     /// Swap the current state of the CPU (registers etc) with the state stored
     /// in the context object.
     pub fn swap_context(&mut self, context: &mut CpuContext) {
