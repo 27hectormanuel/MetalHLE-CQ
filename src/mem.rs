@@ -540,6 +540,29 @@ impl Mem {
             set.len(),
             MAX_UNIQUE_LOGS
         );
+        // For writes, the offending *guest* code is the real lead: print the
+        // most recent guest PCs (and LR) so the writing function can be
+        // identified instead of guessing which host stub returned nil.
+        if is_write {
+            use std::sync::atomic::Ordering;
+            let last_pc = crate::environment::LAST_GUEST_PC.load(Ordering::Relaxed);
+            let last_lr = crate::environment::LAST_GUEST_LR.load(Ordering::Relaxed);
+            let idx = crate::environment::GUEST_PC_RING_IDX.load(Ordering::Relaxed);
+            let mut recent = String::new();
+            for back in 0..8usize {
+                let slot = idx.wrapping_sub(1 + back) % 32;
+                let pc = crate::environment::GUEST_PC_RING[slot].load(Ordering::Relaxed);
+                if pc != 0 {
+                    recent.push_str(&format!(" {:#x}", pc));
+                }
+            }
+            log!(
+                "touchHLE::mem:   last guest PC={:#x} LR={:#x} recent PCs:{}",
+                last_pc,
+                last_lr,
+                recent
+            );
+        }
     }
 
     /// Special version of [Self::bytes_at] that returns [None] rather than
