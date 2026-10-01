@@ -1638,6 +1638,19 @@ impl Dyld {
                     return None;
                 };
                 log_dbg!("Call to host function, already linked: {}", symbol);
+                // Record the symbol for nil-page-write diagnostics (see
+                // mem::null_check_fail), which otherwise only know that the
+                // write came from the generic bytes_at_mut accessor.
+                std::sync::atomic::AtomicUsize::store(
+                    &crate::environment::LAST_HOST_CALL_SYMBOL_PTR,
+                    symbol.as_ptr() as usize,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                std::sync::atomic::AtomicUsize::store(
+                    &crate::environment::LAST_HOST_CALL_SYMBOL_LEN,
+                    symbol.len(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 if TRACE_HOST_CALLS.load(std::sync::atomic::Ordering::Relaxed) > 0 {
                     TRACE_HOST_CALLS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     log!("HOSTCALL {} lr={:#x}", symbol, cpu.regs()[14]);

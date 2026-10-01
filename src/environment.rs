@@ -102,6 +102,33 @@ pub static GUEST_PC_RING: [std::sync::atomic::AtomicU32; 32] = {
 pub static GUEST_PC_RING_IDX: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Guest r0-r7 as of the most recent host-function dispatch, for crash
+/// diagnostics. r0-r3 are the AAPCS argument registers; r4-r7 are included
+/// because a guest loop that repeatedly calls one host function usually keeps
+/// the (nil) destination base in a callee-saved register rather than
+/// reloading it into r0-r3 every iteration.
+pub static LAST_HOST_CALL_REGS: [std::sync::atomic::AtomicU32; 8] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    [ZERO; 8]
+};
+
+/// Thread id as of the most recent host-function dispatch, for crash
+/// diagnostics (the guest PC alone does not say which thread hit it).
+pub static LAST_HOST_CALL_THREAD: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Symbol name of the most recent host-function dispatch, stored as the
+/// (pointer, length) of a `&'static str`, for crash diagnostics. Diagnostics
+/// only: both halves always come from dyld's static symbol table (or a name
+/// that dyld deliberately leaks), so the bytes stay mapped for the whole
+/// process lifetime. Readers must still clamp the length and validate UTF-8,
+/// since the two halves are not stored atomically together.
+pub static LAST_HOST_CALL_SYMBOL_PTR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub static LAST_HOST_CALL_SYMBOL_LEN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// The struct containing the entire emulator state. Methods are provided for
 /// execution and management of threads.
 pub struct Environment {
@@ -3153,6 +3180,26 @@ impl Environment {
                             // bypass runaway counter (see `debug_cpu_error`).
                             self.cpu_error_bypass_last_lr = None;
                             self.cpu_error_bypass_lr_count = 0;
+                            // Snapshot r0-r7 before the host function runs, so
+                            // a nil-page write inside it can report the guest
+                            // arguments that produced the nil pointer.
+                            {
+                                std::sync::atomic::AtomicU32::store(
+                                    &crate::environment::LAST_HOST_CALL_THREAD,
+                                    self.current_thread as u32,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                let regs = self.cpu.regs();
+                                for (slot, reg) in
+                                    crate::environment::LAST_HOST_CALL_REGS.iter().enumerate()
+                                {
+                                    std::sync::atomic::AtomicU32::store(
+                                        reg,
+                                        regs[slot],
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                }
+                            }
                             f.call_from_guest(self);
 
                             let guest_control_flow_redirected =

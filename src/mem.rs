@@ -485,7 +485,7 @@ impl Mem {
     // further occurrences are silently counted. This prevents the log from
     // being flooded when the game repeatedly probes null-page addresses.
     #[cold]
-    fn null_check_fail(at: VAddr, size: GuestUSize, is_write: bool, caller: &str) {
+    fn null_check_fail(at: VAddr, size: GuestUSize, is_write: bool, caller: &str, mem: &Mem) {
         use std::collections::HashSet;
         use std::sync::Mutex;
         static SEEN: Mutex<Option<HashSet<(VAddr, bool)>>> = Mutex::new(None);
@@ -540,29 +540,83 @@ impl Mem {
             set.len(),
             MAX_UNIQUE_LOGS
         );
-        // For writes, the offending *guest* code is the real lead: print the
-        // most recent guest PCs (and LR) so the writing function can be
-        // identified instead of guessing which host stub returned nil.
-        if is_write {
-            use std::sync::atomic::Ordering;
-            let last_pc = crate::environment::LAST_GUEST_PC.load(Ordering::Relaxed);
-            let last_lr = crate::environment::LAST_GUEST_LR.load(Ordering::Relaxed);
-            let idx = crate::environment::GUEST_PC_RING_IDX.load(Ordering::Relaxed);
-            let mut recent = String::new();
-            for back in 0..8usize {
-                let slot = idx.wrapping_sub(1 + back) % 32;
-                let pc = crate::environment::GUEST_PC_RING[slot].load(Ordering::Relaxed);
-                if pc != 0 {
-                    recent.push_str(&format!(" {:#x}", pc));
-                }
-            }
-            log!(
-                "touchHLE::mem:   last guest PC={:#x} LR={:#x} recent PCs:{}",
-                last_pc,
-                last_lr,
-                recent
-            );
+        if !is_write {
+            return;
         }
+        // For writes, the useful question is *who* dereferenced the nil
+        // pointer. Print the guest side (PC/LR, the r0-r7 snapshot taken at
+        // the host-function dispatch, and the raw code at both addresses)
+        // plus a host backtrace naming the Rust stub that wrote through nil.
+        // Emit all of it once per distinct guest PC: one host call filling a
+        // buffer produces dozens of nil writes from a single site, and
+        // repeating the full context for each one drowns the log.
+        use std::sync::atomic::Ordering;
+        let guest_pc = crate::environment::LAST_GUEST_PC.load(Ordering::Relaxed);
+        let guest_lr = crate::environment::LAST_GUEST_LR.load(Ordering::Relaxed);
+        static LAST_DIAG_GUEST_PC: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(u32::MAX);
+        if LAST_DIAG_GUEST_PC.swap(guest_pc, Ordering::Relaxed) == guest_pc {
+            return;
+        }
+        let mut regs = String::new();
+        for (i, reg) in crate::environment::LAST_HOST_CALL_REGS.iter().enumerate() {
+            regs.push_str(&format!(" r{}={:#x}", i, reg.load(Ordering::Relaxed)));
+        }
+        let thread = crate::environment::LAST_HOST_CALL_THREAD.load(Ordering::Relaxed);
+        let symbol = Self::last_host_call_symbol();
+        log!(
+            "touchHLE::mem:   guest PC={:#x} LR={:#x} (thread {}); host fn \
+             {} called with:{}; code at PC: [{}]; code at LR: [{}]",
+            guest_pc,
+            guest_lr,
+            thread,
+            symbol,
+            regs,
+            Self::guest_code_dump(mem, guest_pc),
+            Self::guest_code_dump(mem, guest_lr)
+        );
+        log!(
+            "touchHLE::mem:   host backtrace:\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+    }
+
+    /// Recover the symbol name recorded at the most recent host-function
+    /// dispatch. The length is clamped and the bytes validated because the
+    /// pointer and length are stored by two separate relaxed stores, so a
+    /// concurrent dispatch can leave them mismatched.
+    fn last_host_call_symbol() -> String {
+        use std::sync::atomic::Ordering;
+        let ptr = crate::environment::LAST_HOST_CALL_SYMBOL_PTR.load(Ordering::Relaxed);
+        let len = crate::environment::LAST_HOST_CALL_SYMBOL_LEN.load(Ordering::Relaxed);
+        const MAX_SYMBOL_LEN: usize = 512;
+        if ptr == 0 || len == 0 || len > MAX_SYMBOL_LEN {
+            return "<unknown>".to_string();
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+        match std::str::from_utf8(bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => "<unparsable>".to_string(),
+        }
+    }
+
+    /// Dump 8 words of guest memory at `addr` as little-endian hex words, for
+    /// logging the code around a fault. Unmapped words read as `????????`.
+    /// Reads the backing array directly, so it cannot re-enter the null-page
+    /// handler that calls it.
+    fn guest_code_dump(mem: &Mem, addr: VAddr) -> String {
+        let mut out = String::new();
+        for word in 0..8u32 {
+            let at = addr.wrapping_add(word * 4) as usize;
+            match mem.bytes().get(at..).and_then(|s| s.get(..4)) {
+                Some(b) => out.push_str(&format!(
+                    "{:02x}{:02x}{:02x}{:02x} ",
+                    b[0], b[1], b[2], b[3]
+                )),
+                None => out.push_str("???????? "),
+            }
+        }
+        out
     }
 
     /// Special version of [Self::bytes_at] that returns [None] rather than
@@ -614,7 +668,7 @@ impl Mem {
     pub fn bytes_at<const MUT: bool>(&self, ptr: Ptr<u8, MUT>, count: GuestUSize) -> &[u8] {
         // ХАК: Вместо паники логируем и возвращаем данные из stub-страницы
         if ptr.to_bits() < self.null_segment_size {
-            Self::null_check_fail(ptr.to_bits(), count, false, "bytes_at");
+            Self::null_check_fail(ptr.to_bits(), count, false, "bytes_at", self);
             // Возвращаем данные из stub-страницы вместо реальной памяти
             // Это предотвращает UndefinedInstruction когда игра использует
             // прочитанные значения как указатели на функции
@@ -633,7 +687,7 @@ impl Mem {
         let addr = ptr.to_bits() as usize;
         let end = addr.saturating_add(count as usize);
         if end > self.bytes().len() || end < addr {
-            Self::null_check_fail(ptr.to_bits(), count, false, "bytes_at(OOB)");
+            Self::null_check_fail(ptr.to_bits(), count, false, "bytes_at(OOB)", self);
             let offset = (ptr.to_bits() % PAGE_SIZE) as usize;
             let count_usize = count as usize;
             let available = PAGE_SIZE as usize - offset;
@@ -657,7 +711,7 @@ impl Mem {
         let addr = ptr.to_bits() as usize;
         let end = addr.saturating_add(count as usize);
         if end > self.bytes().len() || end < addr {
-            Self::null_check_fail(ptr.to_bits(), count, false, "unchecked_bytes_at(OOB)");
+            Self::null_check_fail(ptr.to_bits(), count, false, "unchecked_bytes_at(OOB)", self);
             let offset = (ptr.to_bits() % PAGE_SIZE) as usize;
             let count_usize = count as usize;
             let available = PAGE_SIZE as usize - offset;
@@ -680,7 +734,7 @@ impl Mem {
     pub fn bytes_at_mut(&mut self, ptr: MutPtr<u8>, count: GuestUSize) -> &mut [u8] {
         // ХАК: Вместо паники логируем и возвращаем данные из stub-страницы
         if ptr.to_bits() < self.null_segment_size {
-            Self::null_check_fail(ptr.to_bits(), count, true, "bytes_at_mut");
+            Self::null_check_fail(ptr.to_bits(), count, true, "bytes_at_mut", self);
             // For writes to null-page, return the write-sink page so that
             // writes are silently absorbed without corrupting the read stub
             // page's zeros.
@@ -697,7 +751,7 @@ impl Mem {
         let addr = ptr.to_bits() as usize;
         let end = addr.saturating_add(count as usize);
         if end > self.bytes().len() || end < addr {
-            Self::null_check_fail(ptr.to_bits(), count, true, "bytes_at_mut(OOB)");
+            Self::null_check_fail(ptr.to_bits(), count, true, "bytes_at_mut(OOB)", self);
             let offset = (ptr.to_bits() % PAGE_SIZE) as usize;
             let count_usize = count as usize;
             let available = PAGE_SIZE as usize - offset;
