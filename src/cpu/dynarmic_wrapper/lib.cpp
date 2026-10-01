@@ -44,6 +44,14 @@ public:
   touchHLE_Mem *mem = nullptr;
   std::uint64_t ticks_remaining;
   uint32_t halting_svc;
+  // Start address of the instruction that most recently raised an
+  // UndefinedInstruction/Breakpoint exception. Dynarmic's RaiseException()
+  // leaves the guest PC pointing *after* the faulting instruction (start +
+  // 2 or + 4 depending on whether it was a 16-bit or 32-bit Thumb
+  // encoding), so the Rust side cannot reliably recover the fault address or
+  // the instruction length from the register file alone. See
+  // `touchHLE_DynarmicWrapper_last_exception_pc`.
+  std::uint32_t last_exception_pc = 0;
 
 private:
   std::uint8_t MemoryRead8(VAddr vaddr) override {
@@ -155,8 +163,10 @@ private:
     if (exception == Dynarmic::A32::Exception::NoExecuteFault) {
       cpu->HaltExecution(Dynarmic::HaltReason::MemoryAbort);
     } else if (exception == Dynarmic::A32::Exception::UndefinedInstruction) {
+      last_exception_pc = pc;
       cpu->HaltExecution(HaltReasonUndefinedInstruction);
     } else if (exception == Dynarmic::A32::Exception::Breakpoint) {
+      last_exception_pc = pc;
       cpu->HaltExecution(HaltReasonBreakpoint);
     } else if (exception == Dynarmic::A32::Exception::Yield ||
                exception == Dynarmic::A32::Exception::WaitForEvent ||
@@ -180,6 +190,7 @@ private:
       // aborting the whole host process.
       std::fprintf(stderr, "ExceptionRaised: unexpected exception %u at %x\n",
                    unsigned(exception), pc);
+      last_exception_pc = pc;
       cpu->HaltExecution(HaltReasonUndefinedInstruction);
     }
   }
@@ -316,6 +327,8 @@ public:
   std::uint32_t cpsr() const { return cpu->Cpsr(); }
   void set_cpsr(std::uint32_t cpsr) { cpu->SetCpsr(cpsr); }
 
+  std::uint32_t last_exception_pc() const { return env.last_exception_pc; }
+
   void invalidate_cache_range(VAddr start, std::uint32_t size) {
     cpu->InvalidateCacheRange(start, size);
   }
@@ -384,6 +397,11 @@ std::uint32_t touchHLE_DynarmicWrapper_cpsr(const DynarmicWrapper *cpu) {
 void touchHLE_DynarmicWrapper_set_cpsr(DynarmicWrapper *cpu,
                                        std::uint32_t cpsr) {
   cpu->set_cpsr(cpsr);
+}
+
+std::uint32_t
+touchHLE_DynarmicWrapper_last_exception_pc(const DynarmicWrapper *cpu) {
+  return cpu->last_exception_pc();
 }
 
 void touchHLE_DynarmicWrapper_swap_context(DynarmicWrapper *cpu,
