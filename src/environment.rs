@@ -197,6 +197,13 @@ enum GuestTrapKind {
     /// surrounding code is still meaningful, so the right thing to do is to
     /// step over it, not to abandon the function.
     UndecodableInstruction { encoding: u32 },
+    /// The PC is in a code section but points at the *second* halfword of a
+    /// 32-bit `bl`/`blx <label>` (the halfword before it is a valid first
+    /// half and the "instruction" at PC is a valid second half). Execution
+    /// is misaligned with the real instruction stream, e.g. after a jump
+    /// table was indexed with a value the game never expected. Nothing
+    /// sensible can be executed from here, so this is treated like a trap.
+    MisalignedInstruction { encoding: u32 },
     /// The PC is not inside any code section (wild jump through a bad
     /// function pointer, execution ran off the end of a function into data,
     /// …) or the instruction bytes could not be read.
@@ -2190,6 +2197,18 @@ impl Environment {
             if (hw1 & 0xfff0) == 0xf7f0 && (hw2 & 0xf000) == 0xa000 {
                 return GuestTrapKind::DeliberateTrap { encoding };
             }
+            // Is `pc` actually the second halfword of a `bl`/`blx <label>`
+            // starting at `pc - 2`? (Seen in Asphalt 8: 0xfbea at 0x196cc,
+            // which is not a valid long-multiply encoding but is a perfectly
+            // good BL suffix.)
+            if let Some(previous_hw) = self.read_guest_u16_fallible(pc.wrapping_sub(2)) {
+                let is_bl_prefix = (previous_hw & 0xf800) == 0xf000;
+                let is_bl_suffix = (hw1 & 0xd000) == 0xd000;
+                let is_blx_suffix = (hw1 & 0xd001) == 0xc000;
+                if is_bl_prefix && (is_bl_suffix || is_blx_suffix) {
+                    return GuestTrapKind::MisalignedInstruction { encoding };
+                }
+            }
             GuestTrapKind::UndecodableInstruction { encoding }
         } else {
             let Some(encoding) = self.read_guest_u32_fallible(pc) else {
@@ -2268,6 +2287,90 @@ impl Environment {
         Some(direct_call_is_consistent_with_fault(
             call_site, target, fault_pc,
         ))
+    }
+
+    /// If `addr` is inside a symbol stub section, the name of the symbol the
+    /// stub jumps to (i.e. the dynamically linked function being called).
+    fn symbol_stub_name_at(&self, addr: u32) -> Option<&str> {
+        let addr = addr & !1;
+        self.bins.iter().find_map(|bin| {
+            bin.sections.iter().find_map(|section| {
+                if section.type_ != mach_o::SectionType::SymbolStubs
+                    || addr < section.addr
+                    || addr.wrapping_sub(section.addr) >= section.size
+                {
+                    return None;
+                }
+                let info = section.dyld_indirect_symbol_info.as_ref()?;
+                let index = (addr - section.addr) / info.entry_size;
+                info.indirect_undef_symbols
+                    .get(index as usize)?
+                    .as_deref()
+            })
+        })
+    }
+
+    /// Human-readable description of the call that produced the return
+    /// address `lr`, for trap diagnostics: where the call is, where it went,
+    /// and (if the target is a symbol stub) which linked function that is.
+    fn describe_call_site_before(&self, lr: u32) -> String {
+        match decode_direct_call_before(
+            lr,
+            |addr| self.read_guest_u16_fallible(addr),
+            |addr| self.read_guest_u32_fallible(addr),
+        ) {
+            Some((call_site, target)) => match self.symbol_stub_name_at(target) {
+                Some(name) => format!(
+                    "LR comes from a call at {call_site:#x} to {target:#x}, \
+                     which is the symbol stub for {name}"
+                ),
+                None => format!("LR comes from a call at {call_site:#x} to {target:#x}"),
+            },
+            None => "LR does not follow a direct bl/blx <label> (indirect call or not a \
+                     return address)"
+                .to_string(),
+        }
+    }
+
+    /// Hex dump of the guest halfwords around `pc` (Thumb) or words (ARM),
+    /// for trap diagnostics. The faulting location is marked with brackets.
+    fn dump_guest_code_around(&self, pc: u32, thumb: bool) -> String {
+        let mut out = String::new();
+        let start = if thumb {
+            pc.wrapping_sub(16) & !1
+        } else {
+            pc.wrapping_sub(16) & !3
+        };
+        if thumb {
+            for i in 0..16u32 {
+                let addr = start.wrapping_add(i * 2);
+                let text = match self.read_guest_u16_fallible(addr) {
+                    Some(hw) => format!("{hw:04x}"),
+                    None => "????".to_string(),
+                };
+                if addr == pc {
+                    out.push_str(&format!("[{text}] "));
+                } else {
+                    out.push_str(&text);
+                    out.push(' ');
+                }
+            }
+        } else {
+            for i in 0..8u32 {
+                let addr = start.wrapping_add(i * 4);
+                let text = match self.read_guest_u32_fallible(addr) {
+                    Some(word) => format!("{word:08x}"),
+                    None => "????????".to_string(),
+                };
+                if addr == pc {
+                    out.push_str(&format!("[{text}] "));
+                } else {
+                    out.push_str(&text);
+                    out.push(' ');
+                }
+            }
+        }
+        format!("bytes from {start:#x}: {}", out.trim_end())
     }
 
     /// Choose how to get the guest past a deliberate trap at `pc` (an
@@ -2665,6 +2768,14 @@ impl Environment {
                             site_count
                         );
                     }
+                    if site_count == 1 {
+                        log_no_panic!(
+                            "Undecodable instruction diagnostics: {}. {}.",
+                            self.dump_guest_code_around(pc, is_thumb),
+                            self.describe_call_site_before(lr)
+                        );
+                        self.stack_trace_current();
+                    }
                     self.cpu.regs_mut()[cpu::Cpu::PC] = pc.wrapping_add(instruction_len);
                     return;
                 }
@@ -2764,7 +2875,8 @@ impl Environment {
                 // escalation applies on top of the legacy branch-to-LR.
                 const UNWIND_AFTER_REPEATS: u32 = 4;
                 let recovery = match trap_kind {
-                    GuestTrapKind::DeliberateTrap { .. } => {
+                    GuestTrapKind::DeliberateTrap { .. }
+                    | GuestTrapKind::MisalignedInstruction { .. } => {
                         self.plan_guest_trap_recovery(pc, lr, count >= UNWIND_AFTER_REPEATS)
                     }
                     GuestTrapKind::OutsideCode if (lr & !1) == pc => {
@@ -2798,6 +2910,11 @@ impl Environment {
                         GuestTrapKind::UndecodableInstruction { encoding } => {
                             format!("undecodable instruction, encoding {encoding:#x}")
                         }
+                        GuestTrapKind::MisalignedInstruction { encoding } => format!(
+                            "PC is the second halfword of a bl/blx at {:#x}, execution is \
+                             misaligned with the instruction stream; encoding {encoding:#x}",
+                            pc.wrapping_sub(2)
+                        ),
                         GuestTrapKind::OutsideCode => "PC is outside any code section".to_string(),
                     };
                     let recovery_description = match recovery {
@@ -2831,6 +2948,16 @@ impl Environment {
                         count,
                         BYPASS_LIMIT
                     );
+                    if count == 1 {
+                        log_no_panic!(
+                            "Guest trap diagnostics: {}. {}.",
+                            self.dump_guest_code_around(pc, is_thumb),
+                            self.describe_call_site_before(lr)
+                        );
+                        if trap_kind != GuestTrapKind::OutsideCode {
+                            self.stack_trace_current();
+                        }
+                    }
                 } else if total == LOG_RATE + 1 {
                     log_no_panic!(
                         "Warning: Ignored guest-trap bypass still active \
