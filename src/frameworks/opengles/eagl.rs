@@ -1109,12 +1109,42 @@ pub const CLASSES: ClassExports = objc_classes! {
             // it, there's no point in presenting the output because it won't be
             // seen. Using a noisy log because it's a weird scenario and might
             // indicate a bug.
-            log!(
-                "Layer {:?} is not the fullscreen layer {:?}, skipping presentation of renderbuffer {:?}!",
-                drawable,
-                fullscreen_layer,
-                renderbuffer,
-            );
+            static LAYER_MISMATCH_DIAGNOSTIC_LOGGED: std::sync::Once = std::sync::Once::new();
+            LAYER_MISMATCH_DIAGNOSTIC_LOGGED.call_once(|| {
+                let drawable_view: id = msg![env; drawable delegate];
+                let fullscreen_view: id = msg![env; fullscreen_layer delegate];
+                let drawable_view_class = if drawable_view == nil {
+                    "(nil)".to_string()
+                } else {
+                    let class: crate::objc::Class = msg![env; drawable_view class];
+                    env.objc.get_class_name(class).to_owned()
+                };
+                let fullscreen_view_class = if fullscreen_view == nil {
+                    "(nil)".to_string()
+                } else {
+                    let class: crate::objc::Class = msg![env; fullscreen_view class];
+                    env.objc.get_class_name(class).to_owned()
+                };
+                let drawable_view_hidden = if drawable_view == nil {
+                    false
+                } else {
+                    msg![env; drawable_view isHidden]
+                };
+                let fullscreen_view_hidden = if fullscreen_view == nil {
+                    false
+                } else {
+                    msg![env; fullscreen_view isHidden]
+                };
+                log!(
+                    "EAGL layer mismatch: drawable {:?} owner={} hidden={}, selected fullscreen layer {:?} owner={} hidden={}",
+                    drawable,
+                    drawable_view_class,
+                    drawable_view_hidden,
+                    fullscreen_layer,
+                    fullscreen_view_class,
+                    fullscreen_view_hidden
+                );
+            });
             if let Some(frame_due) = frame_due {
                 pace_frame(env, frame_due);
             }
