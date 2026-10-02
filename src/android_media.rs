@@ -69,28 +69,52 @@ mod imp {
             }
         }
 
-        fn slot<F>(&self, index: usize) -> F {
-            unsafe {
-                let table = self.env as *mut *mut c_void;
-                std::mem::transmute_copy::<*mut c_void, F>(&*table.add(index))
-            }
+        /// Resolve a JNI function pointer from the function table reachable
+        /// from `self.env`.
+        ///
+        /// This MUST go through `crate::android_jni`, which dereferences the
+        /// `JNIEnv*` to reach `struct JNINativeInterface_`. Indexing `env`
+        /// itself reads bytes that follow the 8-byte `JNIEnv` struct and
+        /// returns them as "function pointers", so the very first call jumps
+        /// to garbage — usually 0, killing the host process with
+        /// `SIGSEGV at address 0x0`.
+        ///
+        /// [None] means the slot could not be resolved; every caller treats
+        /// that as "host hardware unavailable" and returns its no-hardware
+        /// answer, which is what these bridges return on other platforms too.
+        fn slot<F>(&self, index: usize) -> Option<F> {
+            // SAFETY: `self.env` came from SDL_AndroidGetJNIEnv() and was
+            // checked for null in `attach()`; `index` is one of the `slots`
+            // constants, whose numbers are taken from jni.h.
+            unsafe { crate::android_jni::table_fn(self.env, index) }
         }
 
         fn exception_pending(&self) -> bool {
-            let f: unsafe extern "C" fn(*mut c_void) -> *mut c_void =
-                self.slot(slots::EXCEPTION_OCCURRED);
+            let Some(f): Option<unsafe extern "C" fn(*mut c_void) -> *mut c_void> =
+                self.slot(slots::EXCEPTION_OCCURRED)
+            else {
+                return false;
+            };
             !unsafe { f(self.env) }.is_null()
         }
 
         fn clear_exception(&self) {
-            let f: unsafe extern "C" fn(*mut c_void) = self.slot(slots::EXCEPTION_CLEAR);
+            let Some(f): Option<unsafe extern "C" fn(*mut c_void)> =
+                self.slot(slots::EXCEPTION_CLEAR)
+            else {
+                return;
+            };
             unsafe { f(self.env) }
         }
 
         fn find_host_media_class(&self) -> Option<*mut c_void> {
             let name = CString::new("org/touchhle/android/HostMedia").ok()?;
-            let f: unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void =
-                self.slot(slots::FIND_CLASS);
+            let Some(f): Option<
+                unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void,
+            > = self.slot(slots::FIND_CLASS)
+            else {
+                return None;
+            };
             let class = unsafe { f(self.env, name.as_ptr()) };
             if class.is_null() {
                 self.clear_exception();
@@ -107,12 +131,17 @@ mod imp {
         ) -> Option<*mut c_void> {
             let name = CString::new(name).ok()?;
             let sig = CString::new(sig).ok()?;
-            let f: unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *const c_char,
-                *const c_char,
-            ) -> *mut c_void = self.slot(slots::GET_STATIC_METHOD_ID);
+            let Some(f): Option<
+                unsafe extern "C" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    *const c_char,
+                    *const c_char,
+                ) -> *mut c_void,
+            > = self.slot(slots::GET_STATIC_METHOD_ID)
+            else {
+                return None;
+            };
             let method = unsafe { f(self.env, class, name.as_ptr(), sig.as_ptr()) };
             if method.is_null() {
                 self.clear_exception();
@@ -127,12 +156,17 @@ mod imp {
             method: *mut c_void,
             args: &[JValue],
         ) -> bool {
-            let f: unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *const JValue,
-            ) -> u8 = self.slot(slots::CALL_STATIC_BOOLEAN_METHOD_A);
+            let Some(f): Option<
+                unsafe extern "C" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    *mut c_void,
+                    *const JValue,
+                ) -> u8,
+            > = self.slot(slots::CALL_STATIC_BOOLEAN_METHOD_A)
+            else {
+                return false;
+            };
             let r = unsafe { f(self.env, class, method, args.as_ptr()) };
             if self.exception_pending() {
                 self.clear_exception();
@@ -141,12 +175,12 @@ mod imp {
         }
 
         fn call_static_void(&self, class: *mut c_void, method: *mut c_void, args: &[JValue]) {
-            let f: unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *const JValue,
-            ) = self.slot(slots::CALL_STATIC_VOID_METHOD_A);
+            let Some(f): Option<
+                unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *const JValue),
+            > = self.slot(slots::CALL_STATIC_VOID_METHOD_A)
+            else {
+                return;
+            };
             unsafe { f(self.env, class, method, args.as_ptr()) };
             if self.exception_pending() {
                 self.clear_exception();
@@ -159,12 +193,17 @@ mod imp {
             method: *mut c_void,
             args: &[JValue],
         ) -> *mut c_void {
-            let f: unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *const JValue,
-            ) -> *mut c_void = self.slot(slots::CALL_STATIC_OBJECT_METHOD_A);
+            let Some(f): Option<
+                unsafe extern "C" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    *mut c_void,
+                    *const JValue,
+                ) -> *mut c_void,
+            > = self.slot(slots::CALL_STATIC_OBJECT_METHOD_A)
+            else {
+                return std::ptr::null_mut();
+            };
             let r = unsafe { f(self.env, class, method, args.as_ptr()) };
             if self.exception_pending() {
                 self.clear_exception();
@@ -176,8 +215,11 @@ mod imp {
             if obj.is_null() {
                 return;
             }
-            let f: unsafe extern "C" fn(*mut c_void, *mut c_void) =
-                self.slot(slots::DELETE_LOCAL_REF);
+            let Some(f): Option<unsafe extern "C" fn(*mut c_void, *mut c_void)> =
+                self.slot(slots::DELETE_LOCAL_REF)
+            else {
+                return;
+            };
             unsafe { f(self.env, obj) }
         }
 
@@ -211,31 +253,41 @@ mod imp {
         let jni = Jni::attach()?;
         jni.with_class(|jni, class| {
             let method = jni.get_static_method(class, "takePhoto", "(Z)[B")?;
-            let arr = jni.call_static_object(class, method, &[bool_arg(front)]);
-            if arr.is_null() {
-                return None;
-            }
+            // Resolve every function pointer up front, so a slot that cannot
+            // be resolved bails out before any JNI local reference exists.
             let len_f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int =
-                jni.slot(slots::GET_ARRAY_LENGTH);
+                jni.slot(slots::GET_ARRAY_LENGTH)?;
+            // GetByteArrayElements(env, array, &isCopy) — the third argument
+            // is an *out* parameter for "did JNI copy the bytes?", not a
+            // destination buffer.
             let get_f: unsafe extern "C" fn(
                 *mut c_void,
                 *mut c_void,
                 *mut u8,
-            ) -> *mut u8 = jni.slot(slots::GET_BYTE_ARRAY_ELEMENTS);
+            ) -> *mut u8 = jni.slot(slots::GET_BYTE_ARRAY_ELEMENTS)?;
             let rel_f: unsafe extern "C" fn(
                 *mut c_void,
                 *mut c_void,
                 *mut u8,
                 c_int,
-            ) = jni.slot(slots::RELEASE_BYTE_ARRAY_ELEMENTS);
+            ) = jni.slot(slots::RELEASE_BYTE_ARRAY_ELEMENTS)?;
+            let arr = jni.call_static_object(class, method, &[bool_arg(front)]);
+            if arr.is_null() {
+                return None;
+            }
             let len = unsafe { len_f(jni.env, arr) };
             if len <= 0 {
                 jni.delete_local_ref(arr);
                 return None;
             }
             let mut bytes = vec![0u8; len as usize];
-            let ptr = unsafe { get_f(jni.env, arr, bytes.as_mut_ptr()) };
-            if !ptr.is_null() && ptr != bytes.as_mut_ptr() {
+            let mut is_copy: u8 = 0;
+            let ptr = unsafe { get_f(jni.env, arr, &mut is_copy) };
+            if ptr.is_null() {
+                jni.delete_local_ref(arr);
+                return None;
+            }
+            if ptr != bytes.as_mut_ptr() {
                 unsafe {
                     std::ptr::copy_nonoverlapping(ptr, bytes.as_mut_ptr(), len as usize);
                 }
@@ -293,19 +345,23 @@ mod imp {
         if bytes.is_null() {
             return Vec::new();
         }
-        let len_f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int =
-            jni.slot(slots::GET_ARRAY_LENGTH);
-        // short[] elements via GetShortArrayElements (slot 186) — but we can
-        // reuse the critical-free path: Get<Primitive>ArrayRegion for shorts
-        // is slot 189. Read into a Vec<i16> directly.
-        const GET_SHORT_ARRAY_REGION: usize = 202; // 4 + ordinal 198 (GetShortArrayRegion)
-        let region_f: unsafe extern "C" fn(
-            *mut c_void,
-            *mut c_void,
-            c_int,
-            c_int,
-            *mut i16,
-        ) = jni.slot(GET_SHORT_ARRAY_REGION);
+        let Some(len_f): Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int> =
+            jni.slot(slots::GET_ARRAY_LENGTH)
+        else {
+            jni.delete_local_ref(bytes);
+            return Vec::new();
+        };
+        // GetShortArrayRegion(env, array, start, len, buf) copies a short[]
+        // region straight into our buffer; index 202 in
+        // `struct JNINativeInterface_` (see jni.h).
+        const GET_SHORT_ARRAY_REGION: usize = 202;
+        let Some(region_f): Option<
+            unsafe extern "C" fn(*mut c_void, *mut c_void, c_int, c_int, *mut i16),
+        > = jni.slot(GET_SHORT_ARRAY_REGION)
+        else {
+            jni.delete_local_ref(bytes);
+            return Vec::new();
+        };
         let len = unsafe { len_f(jni.env, bytes) };
         let mut out = Vec::new();
         if len > 0 {
