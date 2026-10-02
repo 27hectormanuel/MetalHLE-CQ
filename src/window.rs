@@ -1416,6 +1416,9 @@ impl Window {
                     }
                     let coords = transform_input_coords(self, abs_coords, false);
                     log_dbg!("MouseButtonDown x {}, y {}, coords {:?}", x, y, coords);
+                    if crate::env_flag_cached!("TOUCHHLE_TRACE_TOUCHES") {
+                        log!("SDL mouse-down delivered at ({}, {}) -> {:?}", x, y, coords);
+                    }
                     Event::TouchesDown(HashMap::from([(FingerId::Mouse, coords)]))
                 }
                 E::MouseMotion {
