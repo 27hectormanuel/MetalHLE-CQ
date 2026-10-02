@@ -115,6 +115,8 @@ Compatibility:
 
 Quality and performance:
 
+- Native crash reports now name the instruction that actually died. `backtrace()` on bionic cannot unwind past the signal frame, so every frame a FATAL SIGNAL report printed belonged to the crash handler itself (libc, the handler, libsigchain, the vdso trampoline) — accurate, but it identified nothing. The handler now also reads the interrupted thread's PC/LR/SP from the `ucontext_t` the kernel hands a `SA_SIGINFO` handler, calls out the case where PC is 0 ("control was transferred through a NULL function pointer — not a data access"), and feeds both addresses into the existing `/proc/self/maps` attribution so they can be symbolized against the reported `libtouchHLE.so` load base. (@KlugKlugTG)
+
 - Debug builds now use an optimized Dynarmic CPU backend while retaining Rust debug assertions and the wrapper's memory-access abort checks; release builds are unchanged. This reduces guest CPU initialization time during game launches. (@j92580498-max)
 - Large PVRTC textures are now decompressed in parallel (up to four workers) on hosts without native PVRTC support, reducing game texture-load time without retaining decoded textures. (@j92580498-max)
 - The main emulation loop now skips trainer setup and app-ID allocation when the optional trainer is disabled; enabled-trainer behavior is unchanged. (@j92580498-max)
