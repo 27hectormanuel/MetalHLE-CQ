@@ -1,4 +1,4 @@
-"""FastAPI server for the HyperHLE app compatibility database."""
+"""FastAPI server for the MetalHLE 2.0 app compatibility database."""
 from __future__ import annotations
 
 import os
@@ -97,7 +97,7 @@ templates.env.filters["fmt_dt"] = _format_dt
 templates.env.filters["iso_utc"] = _iso_utc
 
 
-app = FastAPI(title="HyperHLE app compatibility database")
+app = FastAPI(title="MetalHLE 2.0 app compatibility database")
 # Trust X-Forwarded-* headers when running behind a TLS-terminating proxy
 # (e.g. Fly). Without this, ``request.url`` reports ``http://`` and any
 # absolute URLs we emit are blocked by browsers as mixed content.
@@ -440,7 +440,7 @@ async def submit_parse_log(
     db: Annotated[Session, Depends(get_db)] = None,
     user: CurrentUserDep = None,
 ):
-    """Parse an uploaded HyperHLE / touchHLE log and re-render the submit form
+    """Parse an uploaded MetalHLE 2.0 / touchHLE log and re-render the submit form
     with the extracted fields pre-filled."""
     if user is None:
         return _render_login_required(request, db, status_code=401)
@@ -635,7 +635,7 @@ async def submit_post(
     if not _clean(version_number):
         return _err("Version number is required.")
     if not _clean(touchhle_version):
-        return _err("HyperHLE version is required.")
+        return _err("MetalHLE 2.0 version is required.")
     if not _clean(operating_system):
         return _err("Operating system is required.")
     try:

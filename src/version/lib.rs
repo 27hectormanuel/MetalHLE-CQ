@@ -29,7 +29,7 @@ pub fn branding() -> &'static str {
     {
         return "";
     }
-    if (GITHUB_REPOSITORY, GITHUB_REF_NAME) == (Some("touchHLE/touchHLE"), Some("trunk")) {
+    if (GITHUB_REPOSITORY, GITHUB_REF_NAME) == (Some("RadekParek/MetalHLE"), Some("trunk")) {
         "PREVIEW"
     } else {
         "UNOFFICIAL"

@@ -92,7 +92,7 @@ Device options:
         auto-detection.
     --ios-version=MAJOR.MINOR[.PATCH]
         Select the iOS version reported to the game. The default is "Latest",
-        currently the highest compatibility version exposed by HyperHLE.
+        currently the highest compatibility version exposed by MetalHLE 2.0.
 
 
 Game controller options:
@@ -340,7 +340,7 @@ Other options:
 
         'auto' (default): present on the GPU (the renderbuffer is copied to a
         texture and drawn into the window). If the first frames come out
-        black while the renderbuffer clearly has content, HyperHLE assumes the
+        black while the renderbuffer clearly has content, MetalHLE 2.0 assumes the
         host driver mishandles this path and switches to 'readback' for the
         rest of the session (a message is logged).
 
@@ -368,7 +368,7 @@ Other options:
         Whether presenting a frame waits for the display's vertical refresh.
         One of:
 
-        'auto' (default): on Android, off — HyperHLE paces frames itself (see
+        'auto' (default): on Android, off — MetalHLE 2.0 paces frames itself (see
         --fps-limit) and the Android compositor is synchronised to the display
         anyway, so a blocking swap can only stall the emulator (a frame that
         takes slightly longer than one refresh then costs two, i.e. 60 FPS
@@ -416,15 +416,21 @@ Other options:
         and nothing else. Should be enabled only for apps which really
         need this behaviour.
 
-    --trace-gl-errors
-        For diagnostic builds. After every guest GL call dispatched through
-        the GLES wrapper, also log the host driver's glGetError() value when
-        non-zero. The log line includes the name of the offending entry
-        point so that constant 0x500 (GL_INVALID_ENUM) / 0x501
-        (GL_INVALID_VALUE) noise can be traced back to a specific call.
-        This option exists for debugging black-screen / wrong-render bugs
-        and adds a glGetError() round-trip per call, so it should not be
-        left on for normal use.
+    --trace-gl-errors / --no-trace-gl-errors
+        After every guest GL call dispatched through the GLES wrapper, log
+        the host driver's glGetError() value when non-zero. The log line
+        names the offending entry point so GL_INVALID_ENUM / GL_INVALID_VALUE
+        errors can be traced to a specific call. Enabled by default in
+        MetalHLE 2.0; --no-trace-gl-errors disables the diagnostic. It adds
+        a glGetError() round-trip per call and clears the host error queue,
+        so guest glGetError() calls will not see those errors.
+
+    --shader-compatibility-fixes / --no-shader-compatibility-fixes
+        Native GLES 2.0 only. Enabled by default to preserve the existing
+        shader normalization fixes (extension placement, texture*LodEXT
+        fallback, and missing fragment float precision). Disable to pass
+        guest shader source through unchanged. The legacy
+        --disable-shader-compatibility-fixes spelling is also accepted.
 
     --gles-native / --no-gles-native
         Android only. OFF by default (and exposed as the "GLES Native" switch
@@ -439,7 +445,7 @@ Other options:
         Workaround for apps that rely on the default ES 1.1
         GL_TEXTURE_MIN_FILTER (GL_NEAREST_MIPMAP_LINEAR) being usable
         on a level-0-only texture. With this flag, after every
-        glTexImage2D(level=0) call HyperHLE issues an extra
+        glTexImage2D(level=0) call MetalHLE 2.0 issues an extra
         glTexParameteri(GL_TEXTURE_MIN_FILTER, GL_LINEAR) so that
         strict drivers (notably Qualcomm Adreno's native ES 1.1 path)
         don't sample the texture as opaque black just because no
@@ -478,7 +484,7 @@ Other options:
         and entertaining crashes. Only memory the guest has actually
         allocated is targeted, so the game keeps running (and glitching)
         instead of instantly crashing. This is implemented natively in Rust
-        and therefore works on every platform HyperHLE runs on, including
+        and therefore works on every platform MetalHLE 2.0 runs on, including
         Android. Use --no-corrupt-game to disable it.
 
     --no-corrupt-game

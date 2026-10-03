@@ -5,7 +5,9 @@ from bot.request import (
     FixRequest,
     LogFile,
     MediaAttachment,
+    extract_build_info,
     has_log_header,
+
 )
 from bot.sanitize import GITHUB_MAX_ISSUE_BODY, TELEGRAM_MAX_MESSAGE
 
@@ -23,11 +25,23 @@ def _basic_request(**overrides):
 
 def test_has_log_header():
     assert has_log_header(REAL_HEADER)
+    assert has_log_header("MetalHLE 2.0 PREVIEW v1.0.35 (8d65eca)")
     assert has_log_header("HyperHLE v1.0.2 — https://touchhle.org/")
     assert has_log_header("HyperHLE v1.0.2")
     assert has_log_header("touchHLE UNOFFICIAL 8d65eca")
     assert not has_log_header("just some text without a header")
     assert not has_log_header("")
+
+
+def test_extracts_build_identity_from_metalhle_header():
+    log = """MetalHLE 2.0 PREVIEW v1.0.35 (8d65eca-dirty)
+Built from branch "trunk" of "RadekParek/MetalHLE" by GitHub Actions workflow run https://github.com/RadekParek/MetalHLE/actions/runs/123."""
+
+    info = extract_build_info(log)
+    assert info.version == "v1.0.35"
+    assert info.commit == "8d65eca"
+    assert info.branch == "trunk"
+    assert info.run_url.endswith("/actions/runs/123")
 
 
 def test_issue_body_fences_all_user_values():

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Package HyperHLE release zips and write release notes for action-gh-release.
+# Package MetalHLE 2.0 release zips and write release notes for action-gh-release.
 set -eu
 
 VERSION="$1"
@@ -37,6 +37,7 @@ done
 
 macos_dmg=""
 for candidate in \
+    artifacts/macos/MetalHLE-2.0.dmg \
     artifacts/macos/HyperHLE.dmg \
     artifacts/macos/touchHLE.dmg
 do
@@ -48,6 +49,7 @@ done
 
 android_apk=""
 for candidate in \
+    artifacts/android/MetalHLE-2.0.apk \
     artifacts/android/HyperHLE-Fork.apk \
     artifacts/android/touchHLE.apk
 do
@@ -85,7 +87,7 @@ rm -rf release
 mkdir -p release
 
 {
-    printf '%s\n\n' "HyperHLE ${VERSION}"
+    printf '%s\n\n' "MetalHLE 2.0 ${VERSION}"
     if [ "${FORCE_HYPERHLE_RELEASE:-}" = "true" ]; then
         printf '%s\n\n' "_Manual release — changelog shows the latest 5 commits._"
     fi
@@ -124,7 +126,7 @@ mkdir -p release
 cd "$ROOT/dev-scripts"
 ./prepare-release.sh --prepare-files
 
-prefix="HyperHLE"
+prefix="MetalHLE-2.0"
 
 ./prepare-release.sh --create-zip-macos "$ROOT/$macos_dmg" \
     -o "$ROOT/release/${prefix}_macOS_x86_64.zip"

@@ -1270,6 +1270,11 @@ impl GLES for GLES2Native<'_> {
         string: *const *const GLchar,
         length: *const GLint,
     ) {
+        if !crate::gles::shader_compatibility_fixes_enabled() {
+            gles2::ShaderSource(shader, count, string, length);
+            return;
+        }
+
         // Even on a native ES 2.0 driver we may need to patch shaders:
         // - Hoist #extension directives before non-preprocessor tokens
         //   (Mali drivers reject them otherwise).

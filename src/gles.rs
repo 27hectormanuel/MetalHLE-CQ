@@ -1425,9 +1425,18 @@ impl<'a> GLES for LoggingGLES<'a> {
 // Actually, I can't partially implement a trait. I must implement ALL methods.
 // This is the problem.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+static SHADER_COMPATIBILITY_FIXES: AtomicBool = AtomicBool::new(true);
 static TRANSLATOR_TRACE_EVENTS: AtomicU32 = AtomicU32::new(0);
+
+pub(crate) fn configure_shader_compatibility_fixes(enabled: bool) {
+    SHADER_COMPATIBILITY_FIXES.store(enabled, Ordering::Relaxed);
+}
+
+pub(crate) fn shader_compatibility_fixes_enabled() -> bool {
+    SHADER_COMPATIBILITY_FIXES.load(Ordering::Relaxed)
+}
 
 pub(crate) fn configure_translator_tracing(_enabled: bool) {}
 

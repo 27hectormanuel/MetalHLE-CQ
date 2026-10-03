@@ -1,5 +1,5 @@
 #!/bin/sh
-# Decide whether to publish a HyperHLE release and which v1.0.x tag to use.
+# Decide whether to publish a MetalHLE 2.0 release and which v1.0.x tag to use.
 # A release is due every 5 commits on HEAD since the latest v1.0.* tag, or since
 # the commit that introduced hyperhle release automation when no tag exists yet.
 set -eu
@@ -28,7 +28,7 @@ version="v1.0.${next_patch}"
 if [ "${FORCE_HYPERHLE_RELEASE:-}" = "true" ]; then
     should_release=true
 elif [ "${GITHUB_EVENT_NAME:-}" = "workflow_dispatch" ]; then
-    # Manual "Build HyperHLE" runs must never publish files to Releases;
+    # Manual "Build MetalHLE 2.0" runs must never publish files to Releases;
     # they only produce build artifacts.
     should_release=false
 elif [ "$commits_since" -lt "$RELEASE_EVERY" ]; then

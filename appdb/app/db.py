@@ -1,4 +1,4 @@
-"""SQLAlchemy models and DB init for the HyperHLE app compatibility database."""
+"""SQLAlchemy models and DB init for the MetalHLE 2.0 app compatibility database."""
 from __future__ import annotations
 
 import os

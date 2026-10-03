@@ -49,7 +49,7 @@ def main() -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     application = build_application()
-    logging.getLogger(__name__).info("HyperHLE fix bot starting (polling)…")
+    logging.getLogger(__name__).info("MetalHLE 2.0 fix bot starting (polling)…")
     application.run_polling(allowed_updates=None)
 
 

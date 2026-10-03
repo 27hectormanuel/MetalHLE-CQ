@@ -216,6 +216,10 @@ pub struct Options {
     /// `glGetError()` clears the error queue, so guest `glGetError()` calls
     /// will see 0 instead of the real error. Diagnostic only.
     pub trace_gl_errors: bool,
+    /// Apply the existing native GLES shader normalisation and compatibility
+    /// rewrites. The default preserves the fixes that were previously always
+    /// applied by the native ES 2.0 backend.
+    pub shader_compatibility_fixes: bool,
     /// Log every GLES call made by the guest (via the LoggingGLES wrapper).
     /// Much noisier than `trace_gl_errors`. Diagnostic only.
     pub verbose_gles: bool,
@@ -314,7 +318,8 @@ impl Default for Options {
             dumping_options: Default::default(),
             dumping_file: crate::paths::user_data_base_path().join("DUMP.txt"),
             ignore_gl_errors: false,
-            trace_gl_errors: false,
+            trace_gl_errors: true,
+            shader_compatibility_fixes: true,
             verbose_gles: false,
             gles_native: false,
             // On Android the host GLES driver is essentially always
@@ -581,6 +586,14 @@ impl Options {
             self.ignore_gl_errors = true;
         } else if arg == "--trace-gl-errors" {
             self.trace_gl_errors = true;
+        } else if arg == "--no-trace-gl-errors" {
+            self.trace_gl_errors = false;
+        } else if arg == "--shader-compatibility-fixes" {
+            self.shader_compatibility_fixes = true;
+        } else if arg == "--no-shader-compatibility-fixes"
+            || arg == "--disable-shader-compatibility-fixes"
+        {
+            self.shader_compatibility_fixes = false;
         } else if arg == "--verbose-gles" {
             self.verbose_gles = true;
         } else if arg == "--gles-native" {
@@ -715,4 +728,33 @@ fn parse_dump_options(options: &str) -> Result<DumpingOptions, String> {
         }
     }
     Ok(dumping_options)
+}
+
+#[cfg(test)]
+mod gl_compatibility_option_tests {
+    use super::Options;
+
+    #[test]
+    fn diagnostic_and_shader_compatibility_defaults_are_enabled() {
+        let options = Options::default();
+        assert!(options.trace_gl_errors);
+        assert!(options.shader_compatibility_fixes);
+    }
+
+    #[test]
+    fn diagnostic_and_shader_compatibility_options_can_be_toggled() {
+        let mut options = Options::default();
+        assert!(options.parse_argument("--no-trace-gl-errors").unwrap());
+        assert!(!options.trace_gl_errors);
+        assert!(options.parse_argument("--trace-gl-errors").unwrap());
+        assert!(options.trace_gl_errors);
+        assert!(options
+            .parse_argument("--disable-shader-compatibility-fixes")
+            .unwrap());
+        assert!(!options.shader_compatibility_fixes);
+        assert!(options
+            .parse_argument("--shader-compatibility-fixes")
+            .unwrap());
+        assert!(options.shader_compatibility_fixes);
+    }
 }

@@ -1,4 +1,4 @@
-"""Parser for HyperHLE / touchHLE log output.
+"""Parser for MetalHLE 2.0 and legacy HyperHLE / touchHLE log output.
 
 Given a raw log file uploaded by a user, extract the fields that match the
 columns on the submit form (app name, version, bundle id, minimum iOS, GPU,
@@ -23,12 +23,12 @@ class ParsedLog:
     remarks: str | None = None  # auto-extracted error/panic line if present
 
 
-# Header line is the first line of every HyperHLE / touchHLE log.
+# Header line is the first line of every MetalHLE 2.0, HyperHLE or touchHLE log.
 #   touchHLE UNOFFICIAL 9424a29c
 #   touchHLE v0.2.3
 #   HyperHLE v0.1.0 — ...
 _HEADER_RE = re.compile(
-    r"^(?:touchHLE|HyperHLE)\s+(?P<ver>[^\n—–-]+?)(?:\s+[—–-][^\n]*)?$",
+    r"^(?:MetalHLE\s+2\.0|touchHLE|HyperHLE)\s+(?P<ver>[^\n—–-]+?)(?:\s+[—–-][^\n]*)?$",
     re.MULTILINE | re.IGNORECASE,
 )
 
@@ -41,7 +41,7 @@ _MIN_OS_RE = re.compile(r"^-\s*Minimum OS version:\s*(?P<v>.+?)\s*$", re.MULTILI
 # "Driver info:" line, e.g.
 #   touchHLE::window: Driver info: OpenGL ES-CM 1.1 v1.r32p1-... / ARM / Mali-G57 MC2
 _DRIVER_INFO_RE = re.compile(
-    r"(?:touchHLE|HyperHLE)::window:\s*Driver info:\s*(?P<v>.+?)\s*$",
+    r"(?:MetalHLE|touchHLE|HyperHLE)::window:\s*Driver info:\s*(?P<v>.+?)\s*$",
     re.MULTILINE | re.IGNORECASE,
 )
 

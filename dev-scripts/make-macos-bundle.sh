@@ -11,10 +11,10 @@ if [[ $# == 3 ]]; then
     shift 3
 
     if [[ "x$BRANDING" == "x" ]]; then
-        APP_NAME=touchHLE
+        APP_NAME="MetalHLE 2.0"
         ICON_NAME=icon
     else
-        APP_NAME="touchHLE $BRANDING"
+        APP_NAME="MetalHLE 2.0 $BRANDING"
         ICON_NAME="icon_$(echo "$BRANDING" | tr 'A-Z' 'a-z')"
         VERSION="$VERSION $BRANDING"
     fi
@@ -33,6 +33,8 @@ if [[ $# == 3 ]]; then
     cp -r ../touchHLE_fonts "$APP_NAME.app"/Contents/Resources/
     cp -r ../touchHLE_default_options.txt "$APP_NAME.app"/Contents/Resources/
     cp ../touchHLE_wallpaper.png "$APP_NAME.app"/Contents/Resources/
+    cp ../MetalHLE_wallpaper.png "$APP_NAME.app"/Contents/Resources/
+
     cp "$ICON_NAME.icns" "$APP_NAME.app"/Contents/Resources/
 
     plutil -create xml1 "$APP_NAME.app"/Contents/Info.plist

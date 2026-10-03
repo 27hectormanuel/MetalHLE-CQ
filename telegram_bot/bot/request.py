@@ -23,7 +23,7 @@ _URL_RE = re.compile(r"https?://\S+")
 #   touchHLE UNOFFICIAL 8d65eca
 #   HyperHLE v1.0.2
 _LOG_HEADER_RE = re.compile(
-    r"^(?:touchHLE|HyperHLE)\s+(?:UNOFFICIAL\s+)?(?P<ver>[\w.]+)(?:\s+[—–-][^\n]*)?",
+    r"^(?:MetalHLE\s+2\.0|touchHLE|HyperHLE)\s+(?:(?:UNOFFICIAL|PREVIEW)\s+)?(?P<ver>[\w.]+)(?:\s+\([0-9a-fA-F]{7,40}(?:-[\w]+)?\))?(?:\s+[—–-][^\n]*)?",
     re.MULTILINE | re.IGNORECASE,
 )
 # Second line on Actions-built binaries, e.g.
@@ -61,8 +61,8 @@ def extract_build_info(text: str) -> LogBuildInfo:
     version = commit = branch = run_url = ""
     if (m := _LOG_HEADER_RE.search(text)):
         version = m.group("ver").strip()
-        if _HEX_RE.fullmatch(version):
-            commit = version.lower()
+        if (commit_match := _HEX_RE.search(m.group(0))):
+            commit = commit_match.group(0).lower()
     if (m := _BUILT_FROM_RE.search(text)):
         branch = m.group("branch").strip()
         run_url = m.group("url").strip()
@@ -218,7 +218,7 @@ class FixRequest:
         if self.app_version:
             lines.append(f"**App version:** {gh_inline_code(self.app_version)}")
         lines.append(
-            f"**HyperHLE build (from the log):** {self._version_line()}",
+            f"**MetalHLE 2.0 build (from the log):** {self._version_line()}",
         )
         if self.operating_system:
             lines.append(f"**Operating system:** {gh_inline_code(self.operating_system)}")
@@ -243,7 +243,7 @@ class FixRequest:
         reporter = f" by {gh_inline_code(self.reporter)}" if self.reporter else ""
         footer = (
             "\n\n---\n"
-            f"_Filed via the HyperHLE Telegram fix bot._{reporter}"
+            f"_Filed via the MetalHLE 2.0 Telegram fix bot._{reporter}"
         )
 
         marker = "\n\n### Log file(s)\n"
@@ -271,7 +271,7 @@ class FixRequest:
         out.append(f"From: {self.reporter or 'unknown'}")
         out += [
             f"App: {self.app_name}" + (f" {self.app_version}" if self.app_version else ""),
-            f"HyperHLE build (from log): {self.hyperhle_version or 'unknown'}{build_status}",
+            f"MetalHLE 2.0 build (from log): {self.hyperhle_version or 'unknown'}{build_status}",
         ]
         if self.operating_system:
             out.append(f"OS: {self.operating_system}")

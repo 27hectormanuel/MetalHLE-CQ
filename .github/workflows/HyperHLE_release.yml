@@ -1,10 +1,10 @@
-name: Build HyperHLE
+name: Build MetalHLE 2.0
 
 on:
   workflow_dispatch:
     inputs:
       publish_hyperhle_release:
-        description: Publish a HyperHLE release (after all builds succeed)
+        description: Publish a MetalHLE 2.0 release (after all builds succeed)
         type: boolean
         default: false
   push:
@@ -25,7 +25,7 @@ jobs:
     runs-on: macos-latest  
 
     steps:  
-      - name: Checkout touchHLE
+      - name: Checkout MetalHLE 2.0
         uses: actions/checkout@main
         with:
           submodules: recursive
@@ -64,9 +64,9 @@ jobs:
       - name: Create .app bundle and DMG
         # `hdiutil create` periodically fails on the `macos-15-arm64` GitHub
         # Actions runners with `hdiutil: create failed - Resource busy` when
-        # Spotlight (`mds`/`mds_stores`) decides to index `touchHLE-dmg-src`
-        # at the same moment hdiutil tries to snapshot it, or when a stale
-        # `/Volumes/touchHLE` from a previous run hasn't fully detached.
+        # Spotlight (`mds`/`mds_stores`) decides to index `MetalHLE-2.0-dmg-src`
+        # at the same moment hdiutil tries to snapshot it, or when a previous-run
+        # volume mount hasn't fully detached.
         # Mirror the workaround Apple documents in TN2065 / `hdiutil(1)` —
         # detach any stray attachment, pass `-ov` so an existing image is
         # overwritten cleanly, and retry a few times. See
@@ -78,44 +78,50 @@ jobs:
             ../target/x86_64-apple-darwin/release/touchHLE \
             "`cargo run --package touchHLE_version`" \
             "`cargo run --package touchHLE_version -- --branding`"
-          mkdir touchHLE-dmg-src
-          mv *.app touchHLE-dmg-src/
+          mkdir MetalHLE-2.0-dmg-src
+          mv *.app MetalHLE-2.0-dmg-src/
           # Forbid Spotlight from indexing the staging folder so it can't
           # race with hdiutil for an exclusive handle.
-          touch touchHLE-dmg-src/.metadata_never_index || true
+          touch MetalHLE-2.0-dmg-src/.metadata_never_index || true
           # Tear down any stale mount left over from a previous run.
+          if [ -d "/Volumes/MetalHLE 2.0" ]; then
+            hdiutil detach -force "/Volumes/MetalHLE 2.0" || true
+          fi
           if [ -d "/Volumes/touchHLE" ]; then
             hdiutil detach -force "/Volumes/touchHLE" || true
           fi
           # Retry hdiutil up to 5 times with growing back-off.
           attempt=1
           max_attempts=5
-          until hdiutil create -ov -volname touchHLE \
-              -srcfolder touchHLE-dmg-src touchHLE.dmg; do
+          until hdiutil create -ov -volname "MetalHLE 2.0" \
+              -srcfolder MetalHLE-2.0-dmg-src MetalHLE-2.0.dmg; do
             if [ "$attempt" -ge "$max_attempts" ]; then
               echo "hdiutil create still failed after $max_attempts attempts" >&2
               exit 1
             fi
             sleep_secs=$((attempt * 5))
             echo "hdiutil create failed (attempt $attempt); retrying in ${sleep_secs}s" >&2
+            if [ -d "/Volumes/MetalHLE 2.0" ]; then
+              hdiutil detach -force "/Volumes/MetalHLE 2.0" || true
+            fi
             if [ -d "/Volumes/touchHLE" ]; then
               hdiutil detach -force "/Volumes/touchHLE" || true
             fi
             sleep "$sleep_secs"
             attempt=$((attempt + 1))
           done
-          mv touchHLE.dmg ..
+          mv MetalHLE-2.0.dmg ..
           
       - uses: actions/upload-artifact@main
         with:
-          name: HyperHLE_macOS_x86_64
-          path: touchHLE.dmg
+          name: MetalHLE-2.0_macOS_x86_64
+          path: MetalHLE-2.0.dmg
 
   build-linux:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout touchHLE
+      - name: Checkout MetalHLE 2.0
         uses: actions/checkout@main
         with:
           submodules: recursive
@@ -180,14 +186,14 @@ jobs:
 
       - uses: actions/upload-artifact@main
         with:
-          name: HyperHLE_Linux_x86_64
+          name: MetalHLE-2.0_Linux_x86_64
           path: touchHLE_linux_bundle/
 
   build-android:
     runs-on: ubuntu-latest  
 
     steps:  
-    - name: Checkout touchHLE
+    - name: Checkout MetalHLE 2.0
       uses: actions/checkout@main
       with:
         submodules: recursive
@@ -278,7 +284,7 @@ jobs:
       run: echo 'sdk.dir='$ANDROID_SDK_ROOT > android/local.properties  
 
     - name: Build for Android  
-      run: cd android && ../gradle/gradle-8.11.1/bin/gradle assembleRelease && mv app/build/outputs/apk/release/HyperHLE-Fork-release.apk ../HyperHLE-Fork.apk  
+      run: cd android && ../gradle/gradle-8.11.1/bin/gradle assembleRelease && mv app/build/outputs/apk/release/MetalHLE-2.0-release.apk ../MetalHLE-2.0.apk
       env:  
         HYPERHLE_KEYSTORE_B64: ${{ secrets.HYPERHLE_KEYSTORE_B64 }}
         HYPERHLE_KEYSTORE_PASSWORD: ${{ secrets.HYPERHLE_KEYSTORE_PASSWORD }}
@@ -288,14 +294,14 @@ jobs:
 
     - uses: actions/upload-artifact@main
       with:  
-        name: HyperHLE_Android_AArch64  
-        path: HyperHLE-Fork.apk
+        name: MetalHLE-2.0_Android_AArch64
+        path: MetalHLE-2.0.apk
 
   build-win:
     runs-on: windows-2022  
 
     steps:  
-    - name: Checkout touchHLE
+    - name: Checkout MetalHLE 2.0
       uses: actions/checkout@main
       with:
         submodules: recursive
@@ -332,7 +338,7 @@ jobs:
       
     - uses: actions/upload-artifact@main
       with:  
-        name: HyperHLE_Windows_x86_64  
+        name: MetalHLE-2.0_Windows_x86_64
         path: touchHLE_windows_bundle/
 
   check-hyperhle-release:
@@ -346,12 +352,12 @@ jobs:
       changelog_from: ${{ steps.check.outputs.changelog_from }}
       changelog_limit: ${{ steps.check.outputs.changelog_limit }}
     steps:
-      - name: Checkout touchHLE
+      - name: Checkout MetalHLE 2.0
         uses: actions/checkout@main
         with:
           fetch-depth: 0
           fetch-tags: true
-      - name: Check whether a HyperHLE release is due
+      - name: Check whether a MetalHLE 2.0 release is due
         id: check
         env:
           FORCE_HYPERHLE_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_hyperhle_release && 'true' || '' }}
@@ -370,7 +376,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Checkout touchHLE
+      - name: Checkout MetalHLE 2.0
         uses: actions/checkout@main
         with:
           submodules: recursive
@@ -379,26 +385,26 @@ jobs:
       - name: Download macOS artifact
         uses: actions/download-artifact@main
         with:
-          name: HyperHLE_macOS_x86_64
+          name: MetalHLE-2.0_macOS_x86_64
           path: artifacts/macos
       - name: Download Android artifact
         uses: actions/download-artifact@main
         with:
-          name: HyperHLE_Android_AArch64
+          name: MetalHLE-2.0_Android_AArch64
           path: artifacts/android
       - name: Download Windows artifact
         uses: actions/download-artifact@main
         with:
-          name: HyperHLE_Windows_x86_64
+          name: MetalHLE-2.0_Windows_x86_64
           path: artifacts/windows
       - name: Download Linux artifact
         uses: actions/download-artifact@main
         with:
-          name: HyperHLE_Linux_x86_64
+          name: MetalHLE-2.0_Linux_x86_64
           path: artifacts/linux
       - name: Install packaging tools
         run: sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pandoc zip
-      - name: Package HyperHLE release files
+      - name: Package MetalHLE 2.0 release files
         env:
           GITHUB_SERVER_URL: ${{ github.server_url }}
           FORCE_HYPERHLE_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_hyperhle_release && 'true' || '' }}
@@ -406,12 +412,12 @@ jobs:
           CHANGELOG_FROM: ${{ needs.check-hyperhle-release.outputs.changelog_from }}
           CHANGELOG_LIMIT: ${{ needs.check-hyperhle-release.outputs.changelog_limit }}
         run: ./dev-scripts/package-hyperhle-release.sh "$VERSION" "$CHANGELOG_FROM"
-      - name: Publish HyperHLE release
+      - name: Publish MetalHLE 2.0 release
         uses: softprops/action-gh-release@master
         with:
           tag_name: ${{ needs.check-hyperhle-release.outputs.version }}
-          name: HyperHLE ${{ needs.check-hyperhle-release.outputs.version }}
+          name: MetalHLE 2.0 ${{ needs.check-hyperhle-release.outputs.version }}
           body_path: release/RELEASE_NOTES.md
           files: |
-            release/HyperHLE_*.zip
+            release/MetalHLE-2.0_*.zip
           fail_on_unmatched_files: true

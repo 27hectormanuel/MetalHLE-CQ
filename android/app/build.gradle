@@ -84,8 +84,8 @@ android {
         def branding = getTouchHLEBranding()
         applicationId 'org.hyperhle.fork'
         applicationIdSuffix(branding.isEmpty() ? null : '.' + branding.toLowerCase())
-        resValue 'string', 'app_name', join('HyperHLE-Fork', ' ', branding)
-        buildConfigField 'String', 'APP_NAME', ('"' + join('HyperHLE-Fork', ' ', branding) + '"')
+        resValue 'string', 'app_name', join('MetalHLE 2.0', ' ', branding)
+        buildConfigField 'String', 'APP_NAME', ('"' + join('MetalHLE 2.0', ' ', branding) + '"')
         manifestPlaceholders = [
                 icon: join('@drawable/icon', '_', branding.toLowerCase())
         ]
@@ -142,7 +142,7 @@ android {
         tasks["merge${variant.name.capitalize()}Assets"]
                 .dependsOn("externalNativeBuild${variant.name.capitalize()}")
         variant.outputs.all { output ->
-            outputFileName = "HyperHLE-Fork-${variant.name}.apk"
+            outputFileName = "MetalHLE-2.0-${variant.name}.apk"
         }
     }
 

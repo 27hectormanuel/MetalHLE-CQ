@@ -15,6 +15,11 @@ Changes are categorised as follows:
 
 ## NEXT
 
+Usability:
+
+- Rebranded the app and release artefacts as MetalHLE 2.0 and added the supplied logo and wallpaper. The app picker now has working Games, Settings, About and GitHub tiles, plus a refresh action for copied game bundles.
+- Exposed the already-implemented GLES Native, shader compatibility, texture-filter and GL-error controls in Settings. GLES Native remains above Fix Shader Compatibility; GL-error tracing is enabled by default and can be disabled. Legacy-only options and guest ARM64 features were not imported.
+
 Compatibility:
 
 - Android: the host camera and microphone bridge is no longer silently unavailable. `android_media` resolved its JNI class and method IDs lazily, i.e. from guest code — and guest code runs on a coroutine stack, where ART cannot find the app class loader, so `FindClass("org/touchhle/android/HostMedia")` returned NULL and every probe (`+[UIImagePickerController isSourceTypeAvailable:…Camera]`, `isCameraDeviceAvailable:`, `availableMediaTypesForSourceType:`, `AVCaptureDevice`, `-[AVAudioSession inputIsAvailable]`, `AVAudioRecorder`, RemoteIO input) answered "this device has no camera / no microphone" without a single log line. The lookups now happen once at startup on the real SDL thread and are cached (global class reference + method IDs), exactly like the WebView bridge already did; calling the resolved methods from a coroutine stack is fine. Any failure now says why, `HostMedia` reports at startup what the device actually exposes (per-facing camera count, microphone feature, permission state) and logs every reason it returns "unavailable", and `hasCamera` falls back to the system camera feature flag when the Camera2 service throws instead of reporting "no camera". (@KlugKlugTG)

@@ -3,7 +3,7 @@
 Two responsibilities:
 
 * Look up the **latest commit** on a branch, so the build hash found in the
-  user's log can be checked against the newest code (HyperHLE logs start with
+      user's log can be checked against the newest code (MetalHLE 2.0 logs start with
   ``touchHLE UNOFFICIAL <shortsha> — …`` and name the branch they were built
   from).
 * Open an issue from a collected fix request.

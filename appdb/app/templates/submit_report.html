@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Submit a report — HyperHLE app compatibility database{% endblock %}
+{% block title %}Submit a report — MetalHLE 2.0 app compatibility database{% endblock %}
 {% block content %}
 <p><a href="/">← All apps</a></p>
 
@@ -19,10 +19,10 @@
 </p>
 
 <section class="autofill">
-  <h2>Quick autofill from a HyperHLE log</h2>
+  <h2>Quick autofill from a MetalHLE 2.0 log</h2>
   <p class="muted">
     Upload your <code>log.txt</code> (Android: <code>log.txt</code> in the
-    HyperHLE files folder; desktop: redirect the terminal output to a file)
+    MetalHLE 2.0 files folder; desktop: redirect the terminal output to a file)
     and we'll fill in app name, version, bundle ID, GPU, OS and emulator
     version automatically. You can edit any field afterwards.
   </p>
@@ -74,7 +74,7 @@
 
   <fieldset>
     <legend>Test environment</legend>
-    <label>HyperHLE version <span class="req">*</span>
+    <label>MetalHLE 2.0 version <span class="req">*</span>
       <input type="text" name="touchhle_version" required value="{{ form.get('touchhle_version', '') }}" placeholder="UNOFFICIAL 9424a29c / v0.2.3" />
     </label>
     <label>Operating system <span class="req">*</span>
