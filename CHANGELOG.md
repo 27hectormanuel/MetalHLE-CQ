@@ -18,6 +18,7 @@ Changes are categorised as follows:
 Usability:
 
 - Rebranded the app and release artefacts as MetalHLE 2.0 and added the supplied logo and wallpaper. The app picker now has working Games, Settings, About and GitHub tiles, plus a refresh action for copied game bundles.
+- Corrected the package/launcher icon variants to use the supplied MetalHLE logo; the wallpaper remains separate and is not used as an icon.
 - Exposed the already-implemented GLES Native, shader compatibility, texture-filter and GL-error controls in Settings. GLES Native remains above Fix Shader Compatibility; GL-error tracing is enabled by default and can be disabled, while verbose per-call GLES logging remains separately opt-in. Legacy-only options and guest ARM64 features were not imported.
 
 Compatibility:
