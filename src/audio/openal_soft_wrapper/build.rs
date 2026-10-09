@@ -93,6 +93,9 @@ fn main() {
             // which makes Pulse/ALSA impossible to use at runtime.
             build.define("ALSOFT_BACKEND_PULSEAUDIO", "ON");
             build.define("ALSOFT_BACKEND_ALSA", "ON");
+            // Don't build the sndio backend: libsndio isn't available on all
+            // Linux distros (e.g. SteamOS), and we don't need it.
+            build.define("ALSOFT_BACKEND_SNDIO", "OFF");
 
             // Fail the build if the common Linux audio backends are missing,
             // instead of producing a no-sound binary.
@@ -114,14 +117,8 @@ fn main() {
             println!("cargo:rustc-link-lib=dylib=pulse");
             println!("cargo:rustc-link-lib=dylib=asound");
 
-            // sndio is optional: OpenAL Soft only builds its sndio backend when
-            // the library is present at configure time. Unconditionally
-            // emitting `-lsndio` breaks the final link on the many Linux
-            // distributions that don't ship it (e.g. Amazon Linux, RHEL).
-            // Only request it when we can actually find the shared object.
-            if linux_has_lib("sndio") {
-                println!("cargo:rustc-link-lib=dylib=sndio");
-            }
+            // sndio backend is disabled above (ALSOFT_BACKEND_SNDIO=OFF), so
+            // never link it. SteamOS and other distros don't ship libsndio.
         }
         if os.eq_ignore_ascii_case("android") {
             println!("cargo:rustc-link-lib=dylib=OpenSLES");
