@@ -569,6 +569,14 @@ impl Environment {
         let default_phone = DeviceFamily::iPhone3GS;
         let default_ipad = DeviceFamily::iPad2;
 
+        // Costume Quest (Double Fine): try iPad 2 (4:3) for wider layout.
+        let device_family_override = if bundle.bundle_identifier().contains("cqios") {
+            log!("Costume Quest detected: using iPad 2 device family.");
+            Some(DeviceFamily::iPad2)
+        } else {
+            device_family_override
+        };
+
         let device_family = if let Some(dfo) = device_family_override {
             let override_is_ipad = dfo.is_ipad();
             if override_is_ipad && bundle_supports_ipad {
