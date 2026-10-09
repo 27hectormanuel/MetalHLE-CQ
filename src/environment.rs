@@ -569,11 +569,11 @@ impl Environment {
         let default_phone = DeviceFamily::iPhone3GS;
         let default_ipad = DeviceFamily::iPad2;
 
-        // Costume Quest (Double Fine): use iPhone 5 (16:9) for widescreen layout.
-        // TODO: Verify the bundle ID matches; if not, the override won't apply.
+        // Costume Quest (Double Fine): use iPad 2 (4:3) — taller than 16:9,
+        // prevents top clipping. Was "better" per user testing.
         let device_family_override = if bundle.bundle_identifier().contains("cqios") {
-            log!("Costume Quest detected: using iPhone 5 device family for 16:9 layout. Bundle ID: {}", bundle.bundle_identifier());
-            Some(DeviceFamily::iPhone5)
+            log!("Costume Quest detected: using iPad 2 device family.");
+            Some(DeviceFamily::iPad2)
         } else {
             device_family_override
         };
