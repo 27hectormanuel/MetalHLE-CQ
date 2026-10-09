@@ -569,11 +569,10 @@ impl Environment {
         let default_phone = DeviceFamily::iPhone3GS;
         let default_ipad = DeviceFamily::iPad2;
 
-        // Costume Quest (Double Fine) lays out cutscenes for a wider canvas
-        // than 3:2; run it as iPhone 5 (16:9) so speech bubbles aren't clipped.
+        // Costume Quest (Double Fine): try iPad 2 (4:3) for wider layout.
         let device_family_override = if bundle.bundle_identifier().contains("cqios") {
-            log!("Costume Quest detected: using iPhone 5 device family for 16:9 layout.");
-            Some(DeviceFamily::iPhone5)
+            log!("Costume Quest detected: using iPad 2 device family.");
+            Some(DeviceFamily::iPad2)
         } else {
             device_family_override
         };
