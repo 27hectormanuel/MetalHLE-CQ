@@ -82,8 +82,9 @@ android {
     }
     defaultConfig {
         def branding = getTouchHLEBranding()
-        applicationId 'org.hyperhle.fork'
-        applicationIdSuffix(branding.isEmpty() ? null : '.' + branding.toLowerCase())
+        // Side-by-side install: unique package ID for the aspect-ratio-fix build
+        applicationId 'org.metalhle.cqfix'
+        //applicationIdSuffix(branding.isEmpty() ? null : '.' + branding.toLowerCase())
         resValue 'string', 'app_name', join('MetalHLE 2.0', ' ', branding)
         buildConfigField 'String', 'APP_NAME', ('"' + join('MetalHLE 2.0', ' ', branding) + '"')
         manifestPlaceholders = [
