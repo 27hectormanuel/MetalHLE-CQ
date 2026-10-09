@@ -571,7 +571,7 @@ impl Environment {
 
         // Costume Quest (Double Fine) lays out cutscenes for a wider canvas
         // than 3:2; run it as iPhone 5 (16:9) so speech bubbles aren't clipped.
-        let device_family_override = if bundle.bundle_identifier() == "com.doublefine.cqios" {
+        let device_family_override = if bundle.bundle_identifier().contains("cqios") {
             log!("Costume Quest detected: using iPhone 5 device family for 16:9 layout.");
             Some(DeviceFamily::iPhone5)
         } else {
