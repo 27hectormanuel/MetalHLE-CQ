@@ -569,6 +569,10 @@ impl Environment {
         let default_phone = DeviceFamily::iPhone3GS;
         let default_ipad = DeviceFamily::iPad2;
 
+        // Costume Quest: no device override for now — the iPhone 5/iPad overrides
+        // make UI elements too big. Need a different approach.
+        let device_family_override = device_family_override;
+
         let device_family = if let Some(dfo) = device_family_override {
             let override_is_ipad = dfo.is_ipad();
             if override_is_ipad && bundle_supports_ipad {
