@@ -569,6 +569,22 @@ impl Environment {
         let default_phone = DeviceFamily::iPhone3GS;
         let default_ipad = DeviceFamily::iPad2;
 
+        // Costume Quest is a universal bundle, so it would get the iPhone 3GS
+        // default — a device below the game's minimum spec (iPad 2 /
+        // iPhone 4S) that renders at 480x320. Its port was "Designed for
+        // iPad", so default to the iPad 2 profile (1024x768, 4:3). An
+        // explicit device choice (quick options, --device-family=…) still
+        // wins.
+        let device_family_override = if device_family_override.is_none()
+            && crate::is_costume_quest(bundle.bundle_identifier())
+            && bundle_supports_ipad
+        {
+            log!("Costume Quest: defaulting to the iPad 2 device family.");
+            Some(DeviceFamily::iPad2)
+        } else {
+            device_family_override
+        };
+
         let device_family = if let Some(dfo) = device_family_override {
             let override_is_ipad = dfo.is_ipad();
             if override_is_ipad && bundle_supports_ipad {

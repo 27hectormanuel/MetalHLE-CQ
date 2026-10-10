@@ -14,8 +14,8 @@ use crate::dyld::{ConstantExports, HostConstant};
 use crate::frameworks::core_graphics::cg_affine_transform::{
     CGAffineTransform, CGAffineTransformIdentity,
 };
-use crate::frameworks::core_graphics::{CGPoint, CGRect};
-use crate::frameworks::foundation::ns_string;
+use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
+use crate::frameworks::foundation::{ns_string, NSUInteger};
 use crate::frameworks::uikit::ui_application::{
     UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight,
     UIInterfaceOrientationPortraitUpsideDown,
@@ -27,6 +27,7 @@ use crate::frameworks::uikit::ui_device::{
 use crate::objc::{
     id, msg, msg_class, msg_super, nil, objc_classes, release, retain, ClassExports,
 };
+use crate::Environment;
 use std::collections::HashMap;
 
 #[derive(Default)]
@@ -458,6 +459,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
             let window_frame: CGRect = msg![env; this frame];
             log_dbg!("Window frame: {window_frame:?}");
+            let old_root_bounds: CGRect = msg![env; view bounds];
             let view_frame: CGRect = msg![env; view frame];
             log_dbg!("Old view frame: {view_frame:?}");
 
@@ -475,6 +477,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 
             let view_frame: CGRect = msg![env; view frame];
             log_dbg!("New view frame after re-applying old view frame: {view_frame:?}");
+
+            if crate::wants_landscape_root_view_resize(env.bundle.bundle_identifier()) {
+                propagate_root_view_rotation(env, vc, view, old_root_bounds.size);
+            }
         }
     }
 }
@@ -516,6 +522,321 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+
+// MARK: - Landscape root view resizing
+// (see crate::wants_landscape_root_view_resize)
+
+const UI_VIEW_AUTORESIZING_FLEXIBLE_LEFT_MARGIN: NSUInteger = 1 << 0;
+const UI_VIEW_AUTORESIZING_FLEXIBLE_WIDTH: NSUInteger = 1 << 1;
+const UI_VIEW_AUTORESIZING_FLEXIBLE_RIGHT_MARGIN: NSUInteger = 1 << 2;
+const UI_VIEW_AUTORESIZING_FLEXIBLE_TOP_MARGIN: NSUInteger = 1 << 3;
+const UI_VIEW_AUTORESIZING_FLEXIBLE_HEIGHT: NSUInteger = 1 << 4;
+const UI_VIEW_AUTORESIZING_FLEXIBLE_BOTTOM_MARGIN: NSUInteger = 1 << 5;
+
+/// Bound on how deep [resize_subviews_for_rotation] descends, so a
+/// pathological (or cyclic, through a guest bug) view tree can't hang us.
+const MAX_ROTATION_RESIZE_DEPTH: u32 = 16;
+
+/// Distribute a change in the superview's extent along one axis between the
+/// flexible parts (leading margin, size, trailing margin) of a subview, the
+/// way UIKit's autoresizing does: proportionally to the current length of
+/// each flexible part, or evenly when they are all zero.
+///
+/// Returns the new `(origin, size)` along that axis.
+fn autoresize_axis(
+    origin: CGFloat,
+    size: CGFloat,
+    old_extent: CGFloat,
+    new_extent: CGFloat,
+    flexible_leading: bool,
+    flexible_size: bool,
+    flexible_trailing: bool,
+) -> (CGFloat, CGFloat) {
+    let delta = new_extent - old_extent;
+    let flexible_count =
+        flexible_leading as u32 + flexible_size as u32 + flexible_trailing as u32;
+    if delta == 0.0 || flexible_count == 0 {
+        return (origin, size);
+    }
+
+    let leading = origin;
+    let trailing = old_extent - origin - size;
+    let flexible_total = if flexible_leading { leading.max(0.0) } else { 0.0 }
+        + if flexible_size { size.max(0.0) } else { 0.0 }
+        + if flexible_trailing { trailing.max(0.0) } else { 0.0 };
+
+    let share = |part: CGFloat, flexible: bool| -> CGFloat {
+        if !flexible {
+            0.0
+        } else if flexible_total > 0.0 {
+            delta * part.max(0.0) / flexible_total
+        } else {
+            delta / flexible_count as CGFloat
+        }
+    };
+
+    let new_origin = origin + share(leading, flexible_leading);
+    let new_size = (size + share(size, flexible_size)).max(0.0);
+    (new_origin, new_size)
+}
+
+/// UIKit's autoresizing of one subview when its superview's bounds size
+/// changes from `old_parent` to `new_parent`.
+fn autoresized_frame(
+    frame: CGRect,
+    mask: NSUInteger,
+    old_parent: CGSize,
+    new_parent: CGSize,
+) -> CGRect {
+    let (x, width) = autoresize_axis(
+        frame.origin.x,
+        frame.size.width,
+        old_parent.width,
+        new_parent.width,
+        mask & UI_VIEW_AUTORESIZING_FLEXIBLE_LEFT_MARGIN != 0,
+        mask & UI_VIEW_AUTORESIZING_FLEXIBLE_WIDTH != 0,
+        mask & UI_VIEW_AUTORESIZING_FLEXIBLE_RIGHT_MARGIN != 0,
+    );
+    let (y, height) = autoresize_axis(
+        frame.origin.y,
+        frame.size.height,
+        old_parent.height,
+        new_parent.height,
+        mask & UI_VIEW_AUTORESIZING_FLEXIBLE_TOP_MARGIN != 0,
+        mask & UI_VIEW_AUTORESIZING_FLEXIBLE_HEIGHT != 0,
+        mask & UI_VIEW_AUTORESIZING_FLEXIBLE_BOTTOM_MARGIN != 0,
+    );
+    CGRect {
+        origin: CGPoint { x, y },
+        size: CGSize { width, height },
+    }
+}
+
+fn nearly(a: CGFloat, b: CGFloat) -> bool {
+    (a - b).abs() < 0.5
+}
+
+/// Whether `frame` exactly covers a superview whose bounds size is `parent`.
+fn frame_covers(frame: CGRect, parent: CGSize) -> bool {
+    nearly(frame.origin.x, 0.0)
+        && nearly(frame.origin.y, 0.0)
+        && nearly(frame.size.width, parent.width)
+        && nearly(frame.size.height, parent.height)
+}
+
+fn view_has_eagl_layer(env: &mut Environment, view: id) -> bool {
+    let layer: id = msg![env; view layer];
+    if layer == nil {
+        return false;
+    }
+    let eagl_layer_class: id = msg_class![env; CAEAGLLayer class];
+    msg![env; layer isKindOfClass:eagl_layer_class]
+}
+
+/// Resize the subviews of `view` after its bounds size changed from
+/// `old_size` to `new_size`, following their `autoresizingMask`. This is what
+/// UIKit does inside `-[UIView setBounds:]`/`-setFrame:`; touchHLE's
+/// setters don't, so without this the subviews of an autorotated root view
+/// keep their portrait frames.
+///
+/// A `CAEAGLLayer`-backed subview that exactly covered the old bounds is
+/// treated as full-size even without a mask: its drawable size decides the
+/// shape of everything the game renders, and on a device it would be
+/// landscape by the time the game first sizes its renderbuffer.
+///
+/// Every view whose size changed is appended to `resized`.
+fn resize_subviews_for_rotation(
+    env: &mut Environment,
+    view: id,
+    old_size: CGSize,
+    new_size: CGSize,
+    depth: u32,
+    resized: &mut Vec<id>,
+) {
+    if depth > MAX_ROTATION_RESIZE_DEPTH {
+        return;
+    }
+    if nearly(old_size.width, new_size.width) && nearly(old_size.height, new_size.height) {
+        return;
+    }
+    let autoresizes: bool = msg![env; view autoresizesSubviews];
+    let subviews = env.objc.borrow::<UIViewHostObject>(view).subviews.clone();
+    for subview in subviews {
+        let frame: CGRect = msg![env; subview frame];
+        let mask: NSUInteger = msg![env; subview autoresizingMask];
+
+        let new_frame = if view_has_eagl_layer(env, subview) && frame_covers(frame, old_size) {
+            CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: new_size,
+            }
+        } else if autoresizes && mask != 0 {
+            autoresized_frame(frame, mask, old_size, new_size)
+        } else {
+            continue;
+        };
+        if new_frame == frame {
+            continue;
+        }
+
+        log!(
+            "Landscape root view resize: {:?} frame {:?} -> {:?} (autoresizingMask {:#x})",
+            subview,
+            frame,
+            new_frame,
+            mask
+        );
+        () = msg![env; subview setFrame:new_frame];
+        resized.push(subview);
+
+        let subview_old_size = frame.size;
+        let subview_new_size: CGRect = msg![env; subview bounds];
+        resize_subviews_for_rotation(
+            env,
+            subview,
+            subview_old_size,
+            subview_new_size.size,
+            depth + 1,
+            resized,
+        );
+    }
+}
+
+/// Finish the iOS 6-style autorotation of a root view controller's view whose
+/// bounds just changed from `old_root_size` (portrait) to its rotated size:
+/// resize its subviews as UIKit would, then run the layout pass the game would
+/// get on a device, so engines that (re)create their GL framebuffer in
+/// `-layoutSubviews` or `-viewWillLayoutSubviews` pick up the landscape size.
+fn propagate_root_view_rotation(env: &mut Environment, vc: id, view: id, old_root_size: CGSize) {
+    let new_root_bounds: CGRect = msg![env; view bounds];
+    let new_root_size = new_root_bounds.size;
+    log!(
+        "Landscape root view resize: root view {:?} bounds {:?} -> {:?}",
+        view,
+        old_root_size,
+        new_root_size
+    );
+
+    let mut resized = Vec::new();
+    resize_subviews_for_rotation(env, view, old_root_size, new_root_size, 0, &mut resized);
+
+    if vc != nil {
+        () = msg![env; vc viewWillLayoutSubviews];
+    }
+    () = msg![env; view layoutSubviews];
+    for resized_view in resized {
+        () = msg![env; resized_view layoutSubviews];
+    }
+    if vc != nil {
+        () = msg![env; vc viewDidLayoutSubviews];
+    }
+}
+
+/// `-[EAGLContext renderbufferStorage:fromDrawable:]` hook, used when
+/// [crate::wants_landscape_root_view_resize]: if the drawable's view still
+/// has the portrait size of the screen while its superview is the
+/// (autorotated) landscape root view, resize it to fill the superview before
+/// the renderbuffer size is taken from it. This covers EAGL views that are
+/// created after autorotation from `-[UIScreen bounds]`, which stays portrait
+/// on iOS 6.
+pub fn fit_eagl_view_to_landscape_superview(env: &mut Environment, drawable: id) {
+    let view: id = msg![env; drawable delegate];
+    if view == nil {
+        return;
+    }
+    let superview: id = msg![env; view superview];
+    if superview == nil {
+        return;
+    }
+    let transform: CGAffineTransform = msg![env; view transform];
+    if transform != CGAffineTransformIdentity {
+        return;
+    }
+    let view_bounds: CGRect = msg![env; view bounds];
+    let superview_bounds: CGRect = msg![env; superview bounds];
+    let (view_w, view_h) = (view_bounds.size.width, view_bounds.size.height);
+    let (super_w, super_h) = (superview_bounds.size.width, superview_bounds.size.height);
+    let view_is_portrait_screen =
+        view_h > view_w && nearly(view_w, super_h) && nearly(view_h, super_w);
+    if !(super_w > super_h && view_is_portrait_screen) {
+        return;
+    }
+    let new_frame = CGRect {
+        origin: CGPoint { x: 0.0, y: 0.0 },
+        size: CGSize {
+            width: super_w,
+            height: super_h,
+        },
+    };
+    log!(
+        "Landscape root view resize: EAGL view {:?} is {}x{} inside a {}x{} landscape superview; \
+         resizing it to fill the superview before allocating its renderbuffer.",
+        view,
+        view_w,
+        view_h,
+        super_w,
+        super_h
+    );
+    () = msg![env; view setFrame:new_frame];
+}
+
+#[cfg(test)]
+mod landscape_root_view_tests {
+    use super::*;
+
+    fn rect(x: CGFloat, y: CGFloat, width: CGFloat, height: CGFloat) -> CGRect {
+        CGRect {
+            origin: CGPoint { x, y },
+            size: CGSize { width, height },
+        }
+    }
+
+    const PORTRAIT: CGSize = CGSize {
+        width: 768.0,
+        height: 1024.0,
+    };
+    const LANDSCAPE: CGSize = CGSize {
+        width: 1024.0,
+        height: 768.0,
+    };
+
+    #[test]
+    fn flexible_size_fills_rotated_parent() {
+        let mask = UI_VIEW_AUTORESIZING_FLEXIBLE_WIDTH | UI_VIEW_AUTORESIZING_FLEXIBLE_HEIGHT;
+        let new = autoresized_frame(rect(0.0, 0.0, 768.0, 1024.0), mask, PORTRAIT, LANDSCAPE);
+        assert_eq!(new, rect(0.0, 0.0, 1024.0, 768.0));
+    }
+
+    #[test]
+    fn fixed_margins_are_kept() {
+        let mask = UI_VIEW_AUTORESIZING_FLEXIBLE_WIDTH | UI_VIEW_AUTORESIZING_FLEXIBLE_HEIGHT;
+        let new = autoresized_frame(rect(10.0, 20.0, 748.0, 984.0), mask, PORTRAIT, LANDSCAPE);
+        assert_eq!(new, rect(10.0, 20.0, 1004.0, 728.0));
+    }
+
+    #[test]
+    fn flexible_margins_keep_a_view_centred() {
+        let mask = UI_VIEW_AUTORESIZING_FLEXIBLE_LEFT_MARGIN
+            | UI_VIEW_AUTORESIZING_FLEXIBLE_RIGHT_MARGIN
+            | UI_VIEW_AUTORESIZING_FLEXIBLE_TOP_MARGIN
+            | UI_VIEW_AUTORESIZING_FLEXIBLE_BOTTOM_MARGIN;
+        let new = autoresized_frame(rect(284.0, 412.0, 200.0, 200.0), mask, PORTRAIT, LANDSCAPE);
+        assert_eq!(new, rect(412.0, 284.0, 200.0, 200.0));
+    }
+
+    #[test]
+    fn no_mask_means_no_change() {
+        let frame = rect(0.0, 0.0, 768.0, 1024.0);
+        assert_eq!(autoresized_frame(frame, 0, PORTRAIT, LANDSCAPE), frame);
+    }
+
+    #[test]
+    fn covers_detects_full_screen_frames_only() {
+        assert!(frame_covers(rect(0.0, 0.0, 768.0, 1024.0), PORTRAIT));
+        assert!(!frame_covers(rect(0.0, 20.0, 768.0, 1004.0), PORTRAIT));
+        assert!(!frame_covers(rect(0.0, 0.0, 1024.0, 768.0), PORTRAIT));
+    }
+}
 
 /// Window life-cycle notifications.
 ///

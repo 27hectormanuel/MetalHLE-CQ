@@ -126,6 +126,28 @@ Special options:
     --info
         Print basic information about the app bundle without running the app.
 ";
+/// Costume Quest (Double Fine, iOS port). The App Store build is
+/// `com.doublefine.cqios`; match the prefix so regional/updated builds that
+/// append a suffix are covered too.
+pub(crate) fn is_costume_quest(bundle_id: &str) -> bool {
+    bundle_id.starts_with("com.doublefine.cqios")
+}
+
+/// Whether the launched app gets the iOS 6-style landscape root view handling
+/// (see `ui_window.rs` and `eagl.rs`): when the root view controller's view is
+/// autorotated to landscape, its subviews are resized to match and the
+/// landscape EAGL renderbuffer that results is presented without rotation.
+///
+/// Costume Quest (iOS 6.1, landscape only) builds its EAGL view from the
+/// portrait screen size and relies on that resize. Without it the game
+/// renders a portrait-shaped frame which is stretched onto the landscape
+/// display, lays out cut-scenes and speech bubbles for a narrow screen, gets
+/// touches in the wrong place, and is presented via the slow, low-resolution
+/// readback path.
+pub(crate) fn wants_landscape_root_view_resize(bundle_id: &str) -> bool {
+    is_costume_quest(bundle_id)
+}
+
 pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     crash_handler::install();
     crash_handler::install_panic_hook();

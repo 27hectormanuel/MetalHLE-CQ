@@ -606,6 +606,9 @@ pub const CLASSES: ClassExports = objc_classes! {
             log!("UltraHLE MinionJump: forcing EAGL renderbuffer storage to 1024x768");
             (1024, 768)
         } else {
+            if crate::wants_landscape_root_view_resize(env.bundle.bundle_identifier()) {
+                uikit::ui_view::ui_window::fit_eagl_view_to_landscape_superview(env, drawable);
+            }
             let bounds: CGRect = msg![env; drawable bounds];
             let CGSize { width, height } = bounds.size;
 
@@ -2392,7 +2395,7 @@ unsafe fn ensure_present_objects(gles: &mut dyn GLES) -> PresentObjects {
 unsafe fn present_renderbuffer(
     env: &mut Environment,
     renderbuffer: GLuint,
-    _drawable: id,
+    drawable: id,
     options: &crate::options::Options,
     context_token: usize,
 ) {
@@ -2424,8 +2427,32 @@ unsafe fn present_renderbuffer(
             device_orientation,
             crate::window::DeviceOrientation::Portrait
         );
+    // crate::wants_landscape_root_view_resize: the EAGL view was resized to the
+    // landscape bounds of the autorotated root view, so the app renders an
+    // upright landscape frame into a landscape renderbuffer. The root view's
+    // rotation exactly cancels the device rotation, so (as Core Animation
+    // composition would) the frame goes onto the landscape viewport as is.
+    // Rotating it like a portrait framebuffer would turn it sideways and
+    // stretch it.
+    let drawable_is_landscape_root_view_child =
+        crate::wants_landscape_root_view_resize(env.bundle.bundle_identifier())
+            && matches!(
+                device_orientation,
+                crate::window::DeviceOrientation::LandscapeLeft
+                    | crate::window::DeviceOrientation::LandscapeRight
+            )
+            && {
+                let bounds: CGRect = msg![env; drawable bounds];
+                let (width, height) = (bounds.size.width, bounds.size.height);
+                width > height
+            };
     // PERF: cached read-once flag; present_renderbuffer runs every frame.
-    let rotation_matrix = if crate::env_flag_cached!("TOUCHHLE_DISABLE_PRESENT_ROTATION") {
+    let rotation_matrix = if drawable_is_landscape_root_view_child {
+        log_once!(
+            "Landscape root view resize: presenting the landscape EAGL renderbuffer without rotation"
+        );
+        crate::matrix::Matrix::<2>::identity()
+    } else if crate::env_flag_cached!("TOUCHHLE_DISABLE_PRESENT_ROTATION") {
         log_once!(
             "TOUCHHLE_DISABLE_PRESENT_ROTATION=1: presenting EAGL renderbuffer without texture rotation"
         );
