@@ -166,6 +166,7 @@ struct AppPickerDelegateHostObject {
     about_hide: bool,
     open_apps_folder: bool,
     apps_refresh_requested: bool,
+    edit_options_file: bool,
     scale_hack_default: bool,
     scale_hack1: bool,
     scale_hack2: bool,
@@ -243,6 +244,11 @@ const CLASSES: ClassExports = objc_classes! {
     env.objc
         .borrow_mut::<AppPickerDelegateHostObject>(this)
         .apps_refresh_requested = true;
+}
+- (())editOptionsFile {
+    env.objc
+        .borrow_mut::<AppPickerDelegateHostObject>(this)
+        .edit_options_file = true;
 }
 - (())scaleHackDefault {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).scale_hack_default = true;
@@ -737,6 +743,13 @@ fn app_picker_inner(
                     awaited_ipa = None;
                     echo!("Couldn't open games folder: {}", e);
                 }
+            }
+        } else if std::mem::take(&mut host_obj.edit_options_file) {
+            // Open touchHLE_options.txt in an external editor (Android) or
+            // the default text editor (other platforms), so the user can
+            // edit per-app options without digging into app storage.
+            if let Err(e) = crate::window::launch_options_editor(env) {
+                echo!("Couldn't open options file editor: {}", e);
             }
         } else if std::mem::take(&mut host_obj.apps_refresh_requested) {
             match enumerate_apps(&apps_dir) {
@@ -1847,6 +1860,8 @@ fn setup_quick_options(
         RowKind::DeviceDropdown,
         RowKind::Label("Games folder"),
         RowKind::Buttons(&[("Refresh app list", "refreshApps")]),
+        RowKind::Label("Options file"),
+        RowKind::Buttons(&[("Edit touchHLE_options.txt", "editOptionsFile")]),
         RowKind::Label("Cheat Engine"),
         RowKind::Switch("cheatEngine:", cheat_engine_enabled, true),
         RowKind::Label("Network access"),

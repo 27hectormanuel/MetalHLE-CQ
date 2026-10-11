@@ -9,6 +9,7 @@
 package org.touchhle.android;
 
 import android.app.Activity;
+import android.content.ActivityNotFoundException;
 import android.content.ContentResolver;
 import android.content.Intent;
 import android.net.wifi.WifiManager;
@@ -84,8 +85,13 @@ public class MainActivity extends SDLActivity {
     // .ipa file picker. Must match window.rs ADD_IPA_COMMAND.
     private static final int MSG_ADD_IPA = 0x8000;
 
-    // Message ID sent from the Rust WebView bridge (see android_web_view.rs)
-    // to notify the emulated app that a page finished loading in a real
+    // Message ID sent from the Rust app picker (see window.rs) to open
+    // touchHLE_options.txt in an external text editor. Must match window.rs
+    // EDIT_OPTIONS_COMMAND.
+    private static final int MSG_EDIT_OPTIONS = 0x8002;
+
+    // 0x8001 is reserved for the Rust WebView bridge (see android_web_view.rs):
+    // it notifies the emulated app that a page finished loading in a real
     // WebView overlay. Payload packs (overlay id, action) into one long.
 
     // Request code for the system file picker started by this activity.
@@ -386,10 +392,66 @@ public class MainActivity extends SDLActivity {
             });
             return true;
         }
-        // MSG_WEB_OVERLAY (0x8001) is reserved: native code notifies the
-        // emulated app about page loads itself (via NSTimer), so there is
-        // nothing to handle here yet.
+        if (message == MSG_EDIT_OPTIONS) {
+            // Same threading requirement as the .ipa picker above.
+            runOnUiThread(new Runnable() {
+                public void run() {
+                    openOptionsEditor();
+                }
+            });
+            return true;
+        }
+        // 0x8001 is reserved (see above): native code notifies the emulated
+        // app about page loads itself (via NSTimer), so there is nothing to
+        // handle here yet.
         return super.onUnhandledMessage(message, data);
+    }
+
+    // Open touchHLE_options.txt in an external text editor. The file lives in
+    // getExternalFilesDir() (unreachable to file managers on Android 11+),
+    // so it is served through our DocumentsProvider, which supports both
+    // reading and writing (see DocumentsProvider.openDocument). The URI
+    // permission grant lets the editor read and save the file in place.
+    private void openOptionsEditor() {
+        File dir = getExternalFilesDir(null);
+        if (dir == null) {
+            Log.e(TAG, "Couldn't get external files dir for options editor");
+            return;
+        }
+        File optionsFile = new File(dir, "touchHLE_options.txt");
+        try {
+            // The native side pre-creates this file at startup, but make sure
+            // it exists so the provider can open it.
+            if (!optionsFile.exists() && !optionsFile.createNewFile()) {
+                Log.e(TAG, "Couldn't create " + optionsFile);
+                return;
+            }
+        } catch (IOException | SecurityException e) {
+            Log.e(TAG, "Couldn't create options file: " + optionsFile, e);
+            return;
+        }
+        // Document ID scheme must match DocumentsProvider: "root/<path>".
+        Uri uri = Uri.parse("content://" + getPackageName() + ".provider"
+                + "/root/root/touchHLE_options.txt");
+        Intent edit = new Intent(Intent.ACTION_EDIT);
+        edit.setDataAndType(uri, "text/plain");
+        edit.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        try {
+            startActivity(Intent.createChooser(edit, "Edit touchHLE_options.txt"));
+            return;
+        } catch (ActivityNotFoundException e) {
+            Log.w(TAG, "No editor for ACTION_EDIT, falling back to ACTION_VIEW", e);
+        }
+        Intent view = new Intent(Intent.ACTION_VIEW);
+        view.setDataAndType(uri, "text/plain");
+        view.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        try {
+            startActivity(Intent.createChooser(view, "Open touchHLE_options.txt"));
+        } catch (ActivityNotFoundException e) {
+            Log.e(TAG, "No app can open the options file", e);
+        }
     }
 
     private void openIpaPicker() {

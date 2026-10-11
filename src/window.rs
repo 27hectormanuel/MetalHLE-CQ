@@ -2727,6 +2727,12 @@ pub fn open_url(env: &mut Environment, url: &str) -> Result<(), String> {
 #[cfg(target_os = "android")]
 const ADD_IPA_COMMAND: u32 = 0x8000;
 
+/// SDL COMMAND_USER value used to ask MainActivity to open touchHLE_options.txt
+/// in an external text editor. Must be >= 0x8000 (see SDLActivity.java).
+/// Note: 0x8001 is reserved (see MainActivity.java).
+#[cfg(target_os = "android")]
+const EDIT_OPTIONS_COMMAND: u32 = 0x8002;
+
 // SDL_AndroidSendMessage is only available in SDL builds for Android.
 #[cfg(target_os = "android")]
 extern "C" {
@@ -2765,6 +2771,44 @@ pub fn launch_ipa_picker(env: &mut Environment) -> Result<(), String> {
              apps directory failed too: {e}"
         )),
     }
+}
+
+/// Ask the Java side to open touchHLE_options.txt in an external text editor
+/// (see MainActivity.onUnhandledMessage). On other platforms, fall back to
+/// opening the file itself, so the OS default text editor handles it.
+///
+/// Like [launch_ipa_picker], this is safe to call from the app picker.
+pub fn launch_options_editor(env: &mut Environment) -> Result<(), String> {
+    // Like other SDL calls from the app picker, this must run on the main
+    // stack (see on_parent_stack_in_coroutine), otherwise Android can
+    // misbehave or crash.
+    let result = env.on_parent_stack_in_coroutine(|_, _| {
+        #[cfg(target_os = "android")]
+        {
+            unsafe { SDL_AndroidSendMessage(EDIT_OPTIONS_COMMAND, 0) }
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            -1
+        }
+    });
+    if result == 0 {
+        return Ok(());
+    }
+    // Fall back to opening the options file directly, so the OS default
+    // handler (usually a text editor) opens it.
+    let path = crate::paths::user_data_base_path().join(crate::paths::USER_OPTIONS_FILE);
+    let path = path
+        .to_str()
+        .ok_or_else(|| "Options file path is not UTF-8".to_string())?;
+    let url = if std::env::consts::OS == "windows" {
+        format!("file://{}", path.strip_prefix("\\\\?\\").unwrap_or(path))
+    } else {
+        format!("file://{path}")
+    };
+    open_url(env, &url).map_err(|e| {
+        format!("SDL_AndroidSendMessage returned {result}, and opening the options file failed too: {e}")
+    })
 }
 
 /// Show an SDL messagebox for an error (typically after a panic).
