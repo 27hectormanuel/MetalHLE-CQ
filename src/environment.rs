@@ -569,9 +569,16 @@ impl Environment {
         let default_phone = DeviceFamily::iPhone3GS;
         let default_ipad = DeviceFamily::iPad2;
 
-        // Costume Quest: no device override for now — the iPhone 5/iPad overrides
-        // make UI elements too big. Need a different approach.
-        let device_family_override = device_family_override;
+        // Costume Quest: use iPhone 5 (16:9) for wider layout to avoid
+        // speech bubble clipping. Also force landscape UIScreen bounds so
+        // the game gets 568x320 instead of 320x568 in landscape.
+        let device_family_override = if bundle.bundle_identifier().contains("cqios") {
+            log!("Costume Quest detected: using iPhone 5 with landscape bounds.");
+            std::env::set_var("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS", "1");
+            Some(DeviceFamily::iPhone5)
+        } else {
+            device_family_override
+        };
 
         let device_family = if let Some(dfo) = device_family_override {
             let override_is_ipad = dfo.is_ipad();
