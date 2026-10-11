@@ -183,6 +183,7 @@ struct AppPickerDelegateHostObject {
     trace_gl_errors: Option<bool>,
     shader_compatibility_fixes: Option<bool>,
     fix_texture_min_filter: Option<bool>,
+    force_composition: Option<bool>,
     gles_native: Option<bool>,
     fullscreen: Option<bool>,
     device_model_tag: Option<i32>,
@@ -300,6 +301,10 @@ const CLASSES: ClassExports = objc_classes! {
 - (())fixTextureMinFilter:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).fix_texture_min_filter = Some(switch_state);
+}
+- (())forceComposition:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).force_composition = Some(switch_state);
 }
 - (())showFPS:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
@@ -597,6 +602,7 @@ fn app_picker_inner(
         quick_options_initial_options.shader_compatibility_fixes;
     let mut quick_options_fix_texture_min_filter =
         quick_options_initial_options.fix_texture_min_filter;
+    let mut quick_options_force_composition = quick_options_initial_options.force_composition;
     let mut quick_options_device_tag: Option<i32> = None;
     let mut quick_options_device_model_open = false;
     let mut quick_options_device_model_scroll: isize = 0;
@@ -921,6 +927,8 @@ fn app_picker_inner(
             quick_options_shader_compatibility_fixes = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.fix_texture_min_filter) {
             quick_options_fix_texture_min_filter = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.force_composition) {
+            quick_options_force_composition = enabled;
         } else if let Some(fullscreen) = std::mem::take(&mut host_obj.fullscreen) {
             quick_options_fullscreen = match fullscreen {
                 false => None,
@@ -1018,6 +1026,11 @@ fn app_picker_inner(
         }
         .to_string(),
     );
+    if quick_options_force_composition {
+        // No --no-force-composition flag exists; omitting it keeps the
+        // default (off) or whatever the options file says.
+        option_args.push("--force-composition".to_string());
+    }
     // Always passed explicitly (like `--trainer`/`--no-trainer`): the base
     // default is now OFF, so the switch has to be able to turn the native
     // driver back on, and the picker's choice should win over any
@@ -1884,6 +1897,8 @@ fn setup_quick_options(
         RowKind::Switch("traceGLErrors:", options.trace_gl_errors, true),
         RowKind::Label("Fix texture mipmap filter"),
         RowKind::Switch("fixTextureMinFilter:", options.fix_texture_min_filter, true),
+        RowKind::Label("Force composition"),
+        RowKind::Switch("forceComposition:", options.force_composition, true),
         RowKind::Label("Use analog sticks for tilt controls"),
         RowKind::Switch(
             "analogStickTiltControls:",
