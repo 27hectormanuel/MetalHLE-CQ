@@ -37,16 +37,17 @@ fn screen_size_for_current_orientation(env: &mut crate::Environment) -> (u32, u3
 fn screen_size_for_orientation(
     portrait_size: (u32, u32),
     orientation: crate::window::DeviceOrientation,
-    landscape_bounds: bool,
+    _landscape_bounds: bool,
 ) -> (u32, u32) {
     let (portrait_width, portrait_height) = portrait_size;
-    if landscape_bounds
-        && matches!(
-            orientation,
-            crate::window::DeviceOrientation::LandscapeLeft
-                | crate::window::DeviceOrientation::LandscapeRight
-        )
-    {
+    // Always report landscape dimensions in landscape orientation.
+    // This is the correct iOS behavior; the old flag-gated behavior
+    // caused games to get portrait size in landscape.
+    if matches!(
+        orientation,
+        crate::window::DeviceOrientation::LandscapeLeft
+            | crate::window::DeviceOrientation::LandscapeRight
+    ) {
         (portrait_height, portrait_width)
     } else {
         (portrait_width, portrait_height)
