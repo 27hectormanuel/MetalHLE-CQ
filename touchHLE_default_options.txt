@@ -352,3 +352,8 @@ com.lego.ninjago.thefinalbattle: --landscape-left --fix-texture-min-filter
 # Render through the composition path; can also be toggled per-launch in
 # the app picker's Settings panel.
 com.doublefine.cqios: --force-composition
+
+# Tapper World Tour (Warner Bros., iPhone and HD/iPad versions)
+# Same composition-path rendering fix as above.
+com.wb.Tapper.WT: --force-composition
+com.wb.Tapper.WTHD: --force-composition
